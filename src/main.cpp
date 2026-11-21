@@ -2,11 +2,10 @@
 // WGC -> persistent D3D11 NvOFA inputs -> FAST 4x4 flow -> edge-aware extrapolation -> flip discard.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define UNICODE
-#define _UNICODE
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -138,7 +137,7 @@ struct D3D {
   UINT flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL obtained{};
   Check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,flags,nullptr,0,D3D11_SDK_VERSION,&dev,&obtained,&ctx),"D3D11CreateDevice");
-  ComPtr<ID3D11Multithread> multi;Check(dev.As(&multi),"Get ID3D11Multithread");multi->SetMultithreadProtected(TRUE);
+  ComPtr<ID3D11Multithread> multi;Check(ctx.As(&multi),"Get ID3D11Multithread");multi->SetMultithreadProtected(TRUE);
   Check(dev.As(&dxgi),"Get IDXGIDevice1");dxgi->SetMaximumFrameLatency(1);
   ComPtr<IDXGIAdapter> adapter;Check(dxgi->GetAdapter(&adapter),"DXGI GetAdapter");
   ComPtr<IDXGIFactory2> factory;Check(adapter->GetParent(IID_PPV_ARGS(&factory)),"DXGI GetFactory");
