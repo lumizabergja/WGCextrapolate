@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Reconstruct exact capture-only C++ source from the committed, checked payload."""
+from pathlib import Path
+import hashlib
+import base64
+import zlib
+
+root = Path(__file__).resolve().parent
+payload = root / "src" / "capture_source.zlib.b64"
+target = root / "src" / "main.cpp"
+
+def checksum(data):
+    return hashlib.sha256(data).hexdigest()
+
+try:
+    data = zlib.decompress(base64.b64decode(payload.read_text(encoding="ascii").strip(), validate=True))
+except Exception as exc:
+    raise SystemExit(f"Invalid capture-only source payload: {exc}")
+
+base = "a0da13a7ef576ce945f12a9710790ceb3466b1b235ab9e0d58cb27281c4a561a"
+if checksum(data) != base:
+    raise SystemExit("STOP: unexpected original capture source SHA256 " + checksum(data))
+# Repair the compile-time HLSL length: sizeof(pointer) is not the source length.
+old = b'const char* const kShader = R"HLSL('
+new = b'const char kShader[] = R"HLSL('
+if data.count(old) != 1:
+    raise SystemExit("STOP: expected HLSL declaration not found exactly once")
+data = data.replace(old, new)
+expected = "2685a236945b88e75e46de5dc20063929d9456fb99367b6af940c8f54eaeb9f1"
+if checksum(data) != expected:
+    raise SystemExit("STOP: final capture-only C++ source SHA256 mismatch " + checksum(data))
+target.write_bytes(data)
+print("Verified standalone Looking Glass DXGI capture-only source:", expected)

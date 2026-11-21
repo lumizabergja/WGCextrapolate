@@ -1,29 +1,28 @@
-# WGC Extrapolate — visible motion v3 (D3D11 / Windows)
+# Looking Glass-style DXGI Desktop Duplication — Capture ONLY v1
 
-Experimental **Windows Graphics Capture → D3D11 → NVIDIA Optical Flow (FAST 4x4) → extrapolation shader → DXGI flip presentation**, with Off, Dynamic, and fixed x2–x6.
+**Isolated, experimental, no FG.** Purpose: verify live desktop capture and presentation stability on Windows 10 22H2 with an NVIDIA RTX 5060 Ti **before** adding NvOFA FAST 4x4 or extrapolation.
 
-## Why the previous version looked like native frames
+This is NOT the official Looking Glass host or its B7 default D12 capture backend. It adapts the DXGI D3D11 Desktop Duplication design, for same-PC presentation only.
 
-Two different failure modes were possible:
+Pipeline: `Desktop output → DXGI Output5::DuplicateOutput1 (or standard DuplicateOutput) → one D3D11 GPU CopyResource → shader preview`.
 
-- The scheduler previously prioritized new native frames so aggressively that it could starve generated slots at high source FPS.
-- Even when it submitted an FG frame, the shader's scene-cut/residual/confidence checks could reject the optical-flow warp and return a copy of the real frame, particularly during camera movement.
+- No NvOFA, confidence costs, generated frames, x4 scheduling, NVIDIA NvFBC, WGC, CUDA, cross-API copies, IVSHMEM, CPU readback or game injection.
+- Single DX11 device, one thread, no locks, bounded non-blocking `AcquireNextFrame(0)`, no CPU/GPU fence wait, `Present(0, DO_NOT_WAIT)` with frame latency 1.
+- Small 960x540 preview with live capture and preview frame-rate counters. Uses the primary attached monitor by default and ignores mouse-only updates.
+- Windows display-affinity exclusion before showing preview to prevent recursive same-monitor screen capture. Fails explicitly if exclusion is unsupported. Optional DDA-specific exclusion is nonfatal.
+- Automatic duplication retry on access loss/display mode transitions. Escape or window X exits.
 
-**v3** removes that overaggressive shader gate and uses a cheaper single-flow-warp prediction shader. Fixed x2–x6 modes reserve at most one imminent generated presentation opportunity before accepting the latest waiting native frame. Off and Dynamic retain a real-frame-first path. There are no additional CPU pixel copies or D3D11-to-DX12 conversions.
+## Run
 
-## Identify your build
+1. Open the public [AppVeyor build](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) on branch `lookingglass-dxgi-capture-only`; download `FG-LookingGlass-CaptureOnly-Windows-x64.zip` from Artifacts **only after a successful build**.
+2. Run `FG-LG-Capture.exe`. Move content behind the preview and confirm the picture moves and **Captured/s** continues changing. The preview itself may be excluded from capture, which is expected.
+3. To capture another display: run `FG-LG-Capture.exe --monitor=2` (1-based physical outputs).
+4. Test CS2 **borderless/windowed** before exclusive fullscreen; exclusive mode can interrupt desktop duplication. The title says `RETRYING DXGI` while duplication cannot start.
 
-The v3 executable window title is `FG WGC v3`. Its status line reads:
-`v3 WGC .../s  Real .../s  FG .../s  OF .../s`
+**Important:** counters are source updates and successful Preview `Present()` calls, **not** measured click-to-photon latency or confirmed scanout. This is source code, not Windows/GPU runtime verified yet.
 
-- `OF=0` while real captures update in fixed x4: the optical-flow engine is not executing, so check mode/initialization/errors.
-- `OF>0, FG=0`: a scheduler/flip-slot timing problem remains.
-- `OF>0, FG>0` but still no visible motion: the shader may be receiving zero or invalid motion vectors. The FG number counts submitted draws, not actual scanout or changed pixels.
+## Build locally
 
-## Build in AppVeyor
+MSVC 2022+ x64 Developer Command Prompt: `python prepare_source.py`, then `Build.cmd`. No Python packages, NVIDIA headers or SDK dependencies. Source reconstruction is SHA256-checked. User's complete readable `src/main.cpp` is included in the source ZIP; GitHub branch stores its verified compressed text to avoid duplicating large source contents.
 
-The public repo's `appveyor.yml` calls `python reconstruct.py` to produce the SHA256-verified v3 source from three small patch stages (base, pacing v2, motion v3). Then it downloads Nvidia optical-flow headers, compiles on Visual Studio 2022, and should publish `FG-WGC-D3D11-LowLatency-Windows-x64.zip` in Artifacts **if successful**.
-
-For local builds use x64 Visual Studio Developer Command Prompt, then `python reconstruct.py` and `Build-And-Pack.cmd`.
-
-**Important:** This is an unverified source-level fix. It has passed deterministic source-reconstruction validation, not Windows compilation or actual GPU runtime tests. At 240 Hz the display can show at most 240 total frames/s; adding FG frames at 240 native FPS replaces some native display opportunities. To see stronger extrapolation, first try fixed x4 at 60 native FPS on a moving scene.
+Next, after stable capture is confirmed: add **NvOFA 4x4 FAST, confidence cost OFF** in a *separate* build; only then test extrapolation shaders.

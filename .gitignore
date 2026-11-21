@@ -1,7 +1,5 @@
 bin/
 artifacts/
 build.log
-vendor/
-*.obj
-*.pdb
+src/main.cpp
 __pycache__/
