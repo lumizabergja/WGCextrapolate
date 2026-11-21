@@ -47,8 +47,8 @@ using Clock = LARGE_INTEGER;
 namespace {
 constexpr UINT kMsgStatus = WM_APP+21;
 constexpr UINT kHotkey = 0x7001;
-constexpr UINT kIdWindow = 1001, kIdRefresh = 1002, kIdMode = 1003, kIdStart = 1004, kIdStop = 1005, kIdFullscreen=1006;
-HWND gUi{},gWindowCombo{},gModeCombo{},gStart{},gStop{},gFull{};
+constexpr UINT kIdWindow = 1001, kIdRefresh = 1002, kIdMode = 1003, kIdStart = 1004, kIdStop = 1005, kIdFullscreen=1006, kIdDebug=1007;
+HWND gUi{},gWindowCombo{},gModeCombo{},gStart{},gStop{},gFull{},gDebugCombo{};
 std::atomic<bool> gRunning{false},gStopRequested{false};
 std::thread gThread;
 std::mutex gStatusMutex;
@@ -56,6 +56,7 @@ std::wstring gStatus=L"Select a window and press Start.";
 struct Target {HWND hwnd;DWORD pid;std::wstring title;};
 std::vector<Target> gTargets;
 std::atomic<int> gMode{2}; // 1 off, 2=x2, 3=x3, 4=x4
+std::atomic<int> gDebugMode{1}; // 0 normal, 1 magenta FG-only marker, 2 flow vectors
 std::atomic<bool> gFullScreen{true};
 
 void Check(HRESULT hr,const char* context) { if(FAILED(hr)) {char s[200]; std::snprintf(s,sizeof(s),"%s (HRESULT 0x%08X)",context,(unsigned)hr);throw std::runtime_error(s);} }
@@ -72,7 +73,7 @@ void Refresh(){SendMessageW(gWindowCombo,CB_RESETCONTENT,0,0);gTargets.clear();E
 // Edge-aware interpolation uses four grid vectors and luma-guided weighting.
 // Occlusion fallback compares previous warped appearance against current pixel to reject unreliable flow.
 static const char kShader[] = R"HLSL(
-cbuffer Params:register(b0) { float2 dimensions; float2 flowDims; float extrapolate; float hasFlow; float2 pad0; };
+cbuffer Params:register(b0) { float2 dimensions; float2 flowDims; float extrapolate; float hasFlow; float debugMode; float pad0; };
 Texture2D<float4> latestTex:register(t0);
 Texture2D<float4> previousTex:register(t1);
 Texture2D<int2> vectors:register(t2);
@@ -98,9 +99,15 @@ float2 EdgeAwareFlow(float2 pixel, float centerLuma){
 }
 float4 PSMain(VSOut i):SV_Target{
  float2 uv=saturate(i.uv);float4 current=latestTex.SampleLevel(smoothSample,uv,0);
- // Both real and generated frames run the same optical-flow-backed shader.
-  // Real frames use extrapolate == 0 and keep their original pixel positions.
-  if(hasFlow<0.5) return float4(current.rgb,1.0);
+ // Flow diagnostic applies to BOTH real and generated frames; this confirms vectors reach PSMain.
+ if(debugMode>1.5 && hasFlow>0.5){
+   float2 mv=EdgeAwareFlow(uv*dimensions,Luma(current.rgb));
+   return float4(saturate(0.5+mv.x/64.0),saturate(0.5+mv.y/64.0),saturate(length(mv)/32.0),1.0);
+ }
+ // Magenta bar is only written by the generated-frame shader path.
+ if(debugMode>0.5 && extrapolate>0.001 && uv.x<0.22 && uv.y<0.042) return float4(1.0,0.0,1.0,1.0);
+ // Real frames run the same shader, using extrapolation factor zero.
+ if(hasFlow<0.5) return float4(current.rgb,1.0);
  float2 pixels=uv*dimensions;
  float2 vec=EdgeAwareFlow(pixels,Luma(current.rgb));
  // A second fixed-point step approximates flow defined at the backward-warped source.
@@ -134,7 +141,7 @@ struct D3D {
  ComPtr<IDXGIDevice1> dxgi;
  UINT sourceW{},sourceH{},outputW{},outputH{};
  bool tearing{};
- struct CB {float dimensions[2],flowDims[2],extrapolate,hasFlow,pad[2];};
+ struct CB {float dimensions[2],flowDims[2],extrapolate,hasFlow,debugMode,pad0;};
  explicit D3D(HWND presenter, UINT w,UINT h,UINT outW,UINT outH) : sourceW(w),sourceH(h),outputW(outW),outputH(outH) {
   UINT flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL obtained{};
@@ -198,7 +205,7 @@ struct D3D {
   ctx->PSSetSamplers(0,1,sampler.GetAddressOf());
   CB cb{};cb.dimensions[0]=(float)sourceW;cb.dimensions[1]=(float)sourceH;
   cb.flowDims[0]=(float)((sourceW+3)/4);cb.flowDims[1]=(float)((sourceH+3)/4);
-  cb.extrapolate=extrapolate;cb.hasFlow=flowValid?1.0f:0.0f;
+  cb.extrapolate=extrapolate;cb.hasFlow=flowValid?1.0f:0.0f;cb.debugMode=(float)gDebugMode.load();
   ctx->UpdateSubresource(constants.Get(),0,nullptr,&cb,0,0);
   ctx->PSSetConstantBuffers(0,1,constants.GetAddressOf());
   ID3D11ShaderResourceView* views[3]={latest,previous?previous:latest,flow};ctx->PSSetShaderResources(0,3,views);
@@ -321,9 +328,21 @@ void Engine(Target target){
   // Shared real/generated path: initialize NvOFA even for Off mode. First capture primes history.
   int current=-1,prior=-1,nextSlot=0,outSlot=0,pending=0;bool validFlow=false;
   LONGLONG freq=Frequency(),lastReal=0,baseInterval=freq/60,nextGen=0;
-  size_t realCount=0,genCount=0;
+  size_t realCount=0,genCount=0,ofCount=0;
+  size_t lastStatReal=0,lastStatGen=0,lastStatOF=0;
+  LONGLONG lastStats=Ticks();
   session.StartCapture();Report(L"Running: WGC native D3D11 capture");
   while(!gStopRequested.load() && IsWindow(target.hwnd)){
+   // Diagnostic rates count submitted frames, not actual physical scanout.
+   const LONGLONG statNow=Ticks();
+   if(statNow-lastStats>=freq/2){
+    const double sec=double(statNow-lastStats)/double(freq);
+    wchar_t status[240]{};
+    swprintf_s(status,L"WGC %.1f/s | FG submitted %.1f/s | NvOFA %.1f/s",
+     double(realCount-lastStatReal)/sec,double(genCount-lastStatGen)/sec,double(ofCount-lastStatOF)/sec);
+    Report(status);
+    lastStats=statNow;lastStatReal=realCount;lastStatGen=genCount;lastStatOF=ofCount;
+   }
    // Drain the pool to newest unique available source frame, never queue stale images.
    capture::Direct3D11CaptureFrame newest{nullptr};
    for(int n=0;n<8;n++){auto f=pool.TryGetNextFrame();if(!f)break;if(newest)newest.Close();newest=std::move(f);}
@@ -351,7 +370,7 @@ void Engine(Target target){
     // A complete frame pair is required; the first real frame primes the flow history.
     if(prior>=0){
       outSlot=(outSlot+1)%3;
-      optical->Execute(prior,current,outSlot);
+      optical->Execute(prior,current,outSlot);++ofCount;
       validFlow=true;
       // A real frame has zero extrapolation, but still consumes the current OF output
       // and executes the same edge-aware PSMain as generated frames.
@@ -377,7 +396,7 @@ void Engine(Target target){
    d3d.Present(optical->frameViews[current].Get(),optical->frameViews[prior].Get(),optical->outputViews[outSlot].Get(),alpha,true);
    genCount++;pending++;nextGen=lastReal+baseInterval*pending/mode;
    if(pending>=mode)pending=0;
-   if((realCount+genCount)%500==0){wchar_t s[200];swprintf_s(s,L"WGC real: %zu  generated: %zu  NvOFA FAST 4x4 / cost OFF",realCount,genCount);Report(s);}
+   // Frame counters are reported regularly in the status title.
   }
   pool.FrameArrived(token);session.Close();pool.Close();CloseHandle(event);
  }catch(std::exception const& ex){Report(L"Error: "+ToWide(ex.what()));}
@@ -401,12 +420,20 @@ LRESULT CALLBACK UiWndProc(HWND h,UINT msg,WPARAM wp,LPARAM lp){
    gStop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,150,168,120,36,h,(HMENU)kIdStop,nullptr,nullptr);
    CreateWindowW(L"STATIC",L"Ctrl + Alt + F8: emergency Stop",WS_CHILD|WS_VISIBLE,18,216,400,22,h,nullptr,nullptr,nullptr);
    CreateWindowW(L"STATIC",L"Low latency: WGC / D3D11 / NvOFA FAST 4x4",WS_CHILD|WS_VISIBLE,18,246,460,20,h,nullptr,nullptr,nullptr);
+   CreateWindowW(L"STATIC",L"Diagnostic view (live)",WS_CHILD|WS_VISIBLE,18,272,300,22,h,nullptr,nullptr,nullptr);
+   gDebugCombo=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,18,300,350,100,h,(HMENU)(UINT_PTR)kIdDebug,nullptr,nullptr);
+   for(const wchar_t* t:{L"Magenta marker on generated frames",L"Normal image",L"Visualize NvOFA motion vectors"})SendMessageW(gDebugCombo,CB_ADDSTRING,0,(LPARAM)t);
+   SendMessageW(gDebugCombo,CB_SETCURSEL,0,0);
    Refresh();RegisterHotKey(h,kHotkey,MOD_CONTROL|MOD_ALT,VK_F8);return 0;
  }
  case WM_HOTKEY:if(wp==kHotkey){gStopRequested=true;return 0;}break;
  case WM_COMMAND:{const UINT id=LOWORD(wp);
    if(id==kIdRefresh){if(!gRunning)Refresh();return 0;}
    if(id==kIdMode&&HIWORD(wp)==CBN_SELCHANGE){gMode=1+(int)SendMessageW(gModeCombo,CB_GETCURSEL,0,0);return 0;}
+   if(id==kIdDebug&&HIWORD(wp)==CBN_SELCHANGE){
+     int selected=(int)SendMessageW(gDebugCombo,CB_GETCURSEL,0,0);
+     gDebugMode=(selected==0?1:(selected==2?2:0));return 0;
+   }
    if(id==kIdStart&&!gRunning){int ix=(int)SendMessageW(gWindowCombo,CB_GETCURSEL,0,0);
     if(ix<0||ix>=(int)gTargets.size()){MessageBoxW(h,L"Select a window first.",L"WGC Extrapolation",MB_OK);return 0;}
     if(gThread.joinable())gThread.join();gStopRequested=false;gRunning=true;
@@ -431,7 +458,7 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR,int show){
   WNDCLASSW wc{};wc.lpfnWndProc=UiWndProc;wc.hInstance=inst;wc.lpszClassName=L"FreshWGCNVOFAControl";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
   RegisterClassW(&wc);
   gUi=CreateWindowExW(0,wc.lpszClassName,L"WGC NvOFA Extrapolation - Fresh",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_VISIBLE,
-    CW_USEDEFAULT,CW_USEDEFAULT,488,330,nullptr,nullptr,inst,nullptr);
+    CW_USEDEFAULT,CW_USEDEFAULT,488,385,nullptr,nullptr,inst,nullptr);
   if(!gUi)throw std::runtime_error("Failed to create main window");ShowWindow(gUi,show);
   MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}
   if(gThread.joinable())gThread.join();return (int)m.wParam;
