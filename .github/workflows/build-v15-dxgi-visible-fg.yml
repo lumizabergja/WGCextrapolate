@@ -1,0 +1,90 @@
+name: Build DXGI Visible Synthetic Probe
+on:
+  push:
+    branches: [v15-dxgi-visible-fg-probe]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic-windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct exact V15 DXGI and apply diagnostic instrumentation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check brotli==1.1.0
+          if($LASTEXITCODE -ne 0){throw 'Brotli installation failed'}
+          python prepare_source.py
+          if($LASTEXITCODE -ne 0){throw 'V15 source reconstruction failed'}
+          python patch_freeze.py
+          if($LASTEXITCODE -ne 0){throw 'DXGI freeze-fix reconstruction failed'}
+          python -c "import pathlib,base64,gzip; p=pathlib.Path('diagnostics/diag_min.py.gz.b64'); pathlib.Path('diag_min.py').write_bytes(gzip.decompress(base64.b64decode(p.read_text())))"
+          if($LASTEXITCODE -ne 0){throw 'Diagnostic script decoding failed'}
+          python diag_min.py
+          if($LASTEXITCODE -ne 0){throw 'Diagnostic patch rejected source'}
+          python -c "import pathlib,base64,gzip; p=pathlib.Path('diagnostics/focus_fix.py.gz.b64'); pathlib.Path('focus_fix.py').write_bytes(gzip.decompress(base64.b64decode(p.read_text())))"
+          if($LASTEXITCODE -ne 0){throw 'Focus patch decoding failed'}
+          python focus_fix.py
+          if($LASTEXITCODE -ne 0){throw 'Focus patch rejected source'}
+          python -c "import pathlib,base64,gzip; p=pathlib.Path('diagnostics/visible_test.py.gz.b64'); pathlib.Path('visible_test.py').write_bytes(gzip.decompress(base64.b64decode(p.read_text())))"
+          if($LASTEXITCODE -ne 0){throw 'Visible probe decoding failed'}
+          python visible_test.py
+          if($LASTEXITCODE -ne 0){throw 'Visible probe failed integrity test'}
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+          if($LASTEXITCODE -ne 0){throw 'Optical Flow SDK headers unavailable'}
+      - name: Compile MSVC optimized diagnostic EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $programFilesX86=[Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhere=Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs=(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if(!$vs){throw 'MSVC x64 not installed'}
+          $vcvars=Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd > build.log 2>&1')
+          $status=$LASTEXITCODE
+          if(Test-Path build.log){Get-Content build.log}
+          if($status -ne 0){throw "MSVC failed with $status"}
+          if(!(Test-Path 'bin/FG-LG-DXGI-FreezeFix.exe')){throw 'Diagnostic EXE not produced'}
+      - name: Make ready-to-run test archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force 'artifacts' | Out-Null
+          Copy-Item bin/FG-LG-DXGI-FreezeFix.exe artifacts/FG-DXGI-Visible-FG-Test.exe
+          @'
+          FG V15 Clean V16 - Looking Glass DXGI Freeze Diagnostic
+          1. Extract this ZIP to a normal writable folder, e.g. Desktop\FG-Diagnostic.
+          2. Close any other FG build first.
+          3. Run FG-DXGI-Visible-FG-Test.exe and select CS2. Start.
+          4. Synthetic frames appear MAGENTA by default. Press Ctrl+Shift+F9 to cycle MAGENTA -> UNMASKED MOTION -> ORIGINAL SHADER -> MAGENTA.
+          5. Test x4 and 240 Target FPS in the app. Note whether magenta ever appears on the monitor.
+          6. Stop and send back FG-DXGI-Freeze-Report.txt from beside the EXE.
+          7. If that file is missing, inspect %TEMP%\FG-DXGI-Freeze-Report.txt.
+          New logs track focus PID, capture frame age and reason for stopping.
+          This is a visibility test, not a gaming build; synthetic frames are deliberately magenta by default.
+          The log contains stage names and counters, not screenshot pixels.
+          Diagnostic instrumentation may alter timing; this is NOT a latency benchmark.
+          '@ | Set-Content -Encoding UTF8 artifacts/INSTRUCTIONS.txt
+          Compress-Archive -Path artifacts/FG-DXGI-Visible-FG-Test.exe, artifacts/INSTRUCTIONS.txt -DestinationPath artifacts/FG-DXGI-Visible-FG-Test-Windows-x64.zip -Force
+          Compress-Archive -Path src,diag_min.py,focus_fix.py,visible_test.py,Build.cmd,prepare_source.py,patch_freeze.py,README.md -DestinationPath artifacts/FG-DXGI-Visible-FG-Test-Source.zip -Force
+          if(!(Test-Path artifacts/FG-DXGI-Visible-FG-Test-Windows-x64.zip)){throw 'No diagnostic ZIP'}
+      - name: Upload diagnostic packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-DXGI-Visible-FG-ZIPs
+          path: artifacts/*.zip
+          if-no-files-found: error
+      - name: Upload compile output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-DXGI-Diagnostic-BuildLog
+          path: build.log
+          if-no-files-found: ignore
