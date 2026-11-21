@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild verified low-latency WGC source and real/FG pacing fix."""
+"""Reconstruct the exact v3 WGC D3D11 source from verified successive deltas."""
 from pathlib import Path
 import hashlib
 import json
@@ -7,37 +7,40 @@ import base64
 import zlib
 
 root = Path(__file__).resolve().parent
-src = root / "src" / "main.cpp"
-baseline_sha = "d3cf8bef18450fece42fa9e4500030ee8f3f4a744a15a6fa6653598953fcc900"
-optimized_sha = "70828e2e2e0ad03630513d76c9dc3a41cd45d5d29b413b2cabc34cbb8dc5b67a"
-fixed_sha = "2b78156a17e8789dba158d8c9bc265ba330343dfe388e097d36952b9ee3e44a0"
+source = root / "src" / "main.cpp"
+BASE_SHA = "d3cf8bef18450fece42fa9e4500030ee8f3f4a744a15a6fa6653598953fcc900"
+OPT_SHA = "70828e2e2e0ad03630513d76c9dc3a41cd45d5d29b413b2cabc34cbb8dc5b67a"
+V2_SHA = "2b78156a17e8789dba158d8c9bc265ba330343dfe388e097d36952b9ee3e44a0"
+V3_SHA = "b52023fae6eeed1792e3a0a24b1946b9f00ddcb7cf3213e77539f5f6175ac366"
 
-def digest(data):
+def hash_of(data):
     return hashlib.sha256(data).hexdigest()
 
-def apply_delta(data, delta_path):
-    operations = json.loads(zlib.decompress(base64.b64decode(delta_path.read_text(encoding="ascii"))))
+def apply(data, filename):
+    instructions = json.loads(zlib.decompress(base64.b64decode((root / "src" / filename).read_text(encoding="ascii"))))
     lines = data.decode("utf-8").splitlines(keepends=True)
-    for begin, end, replacement in sorted(operations, key=lambda op: op[0], reverse=True):
-        lines[begin:end] = [replacement] if replacement else []
+    for start, end, replacement in sorted(instructions, key=lambda item: item[0], reverse=True):
+        lines[start:end] = [replacement] if replacement else []
     return "".join(lines).encode("utf-8")
 
-original = src.read_bytes()
-actual = digest(original)
-if actual == fixed_sha:
-    print("Already patched and verified:", actual)
-    raise SystemExit(0)
-if actual == baseline_sha:
-    intermediate = apply_delta(original, root / "src" / "ops.b64")
-    if digest(intermediate) != optimized_sha:
-        raise SystemExit("STOP: original optimization delta failed integrity check")
-elif actual == optimized_sha:
-    intermediate = original
-else:
-    raise SystemExit("STOP: unknown source SHA256 " + actual)
+def checked(data, expected, stage):
+    actual = hash_of(data)
+    if actual != expected:
+        raise SystemExit(f"STOP: {stage}: SHA256 mismatch {actual}, expected {expected}")
+    return data
 
-fixed = apply_delta(intermediate, root / "src" / "pacing_fix.b64")
-if digest(fixed) != fixed_sha:
-    raise SystemExit("STOP: frame generation pacing fix SHA256 mismatch " + digest(fixed))
-src.write_bytes(fixed)
-print("Verified WGC D3D11 generated-frame fix:", fixed_sha)
+code = source.read_bytes()
+current = hash_of(code)
+if current == BASE_SHA:
+    code = checked(apply(code, "ops.b64"), OPT_SHA, "baseline optimization")
+    current = OPT_SHA
+if current == OPT_SHA:
+    code = checked(apply(code, "pacing_fix.b64"), V2_SHA, "visible-FG scheduler")
+    current = V2_SHA
+if current == V2_SHA:
+    code = checked(apply(code, "motion_fix.b64"), V3_SHA, "motion shader and pacing v3")
+    current = V3_SHA
+if current != V3_SHA:
+    raise SystemExit(f"STOP: unrecognized input C++ source SHA256 {current}")
+source.write_bytes(code)
+print("WGC visible-motion v3 source verified:", V3_SHA)
