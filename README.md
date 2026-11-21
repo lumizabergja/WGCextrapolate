@@ -1,28 +1,17 @@
-# Looking Glass-style DXGI Desktop Duplication — Capture ONLY v1
+# Looking Glass-style DXGI capture-only v2 — fullscreen + click-through
 
-**Isolated, experimental, no FG.** Purpose: verify live desktop capture and presentation stability on Windows 10 22H2 with an NVIDIA RTX 5060 Ti **before** adding NvOFA FAST 4x4 or extrapolation.
+This branch is based on the **working capture-only v1**. It changes the window and output presentation **only**. No optical flow, interpolation, motion vectors, NvFBC, DLL injection, API capture fallback, or game frame generation.
 
-This is NOT the official Looking Glass host or its B7 default D12 capture backend. It adapts the DXGI D3D11 Desktop Duplication design, for same-PC presentation only.
+**Start:** double-click `FG-LG-Fullscreen.exe`. It creates a full-monitor, always-on-top, borderless, fully opaque image that passes clicks and keyboard focus to the game underneath.
 
-Pipeline: `Desktop output → DXGI Output5::DuplicateOutput1 (or standard DuplicateOutput) → one D3D11 GPU CopyResource → shader preview`.
+**Close:** **Ctrl+Alt+F8**. Esc no longer works because the full-screen window never accepts focus. Mouse input remains with the underlying application.
 
-- No NvOFA, confidence costs, generated frames, x4 scheduling, NVIDIA NvFBC, WGC, CUDA, cross-API copies, IVSHMEM, CPU readback or game injection.
-- Single DX11 device, one thread, no locks, bounded non-blocking `AcquireNextFrame(0)`, no CPU/GPU fence wait, `Present(0, DO_NOT_WAIT)` with frame latency 1.
-- Small 960x540 preview with live capture and preview frame-rate counters. Uses the primary attached monitor by default and ignores mouse-only updates.
-- Windows display-affinity exclusion before showing preview to prevent recursive same-monitor screen capture. Fails explicitly if exclusion is unsupported. Optional DDA-specific exclusion is nonfatal.
-- Automatic duplication retry on access loss/display mode transitions. Escape or window X exits.
+The capture path is unchanged: `IDXGIOutput5::DuplicateOutput1` (or DXGI standard DDA for compatibility) → single GPU-only D3D11 `CopyResource` → original preview pixel shader → flip-discard `Present(0, DO_NOT_WAIT)`. Output is stretched to the full selected display, with no letterbox.
 
-## Run
+Window capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) is applied **before** setting the layered window style; `WCA_EXCLUDED_FROM_DDA` is requested as an optional DDA protection. A background display mode change updates the fullscreen window and rebuilds the backbuffer.
 
-1. Open the public [AppVeyor build](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) on branch `lookingglass-dxgi-capture-only`; download `FG-LookingGlass-CaptureOnly-Windows-x64.zip` from Artifacts **only after a successful build**.
-2. Run `FG-LG-Capture.exe`. Move content behind the preview and confirm the picture moves and **Captured/s** continues changing. The preview itself may be excluded from capture, which is expected.
-3. To capture another display: run `FG-LG-Capture.exe --monitor=2` (1-based physical outputs).
-4. Test CS2 **borderless/windowed** before exclusive fullscreen; exclusive mode can interrupt desktop duplication. The title says `RETRYING DXGI` while duplication cannot start.
+**Select another monitor:** launch with `--monitor=2`.
 
-**Important:** counters are source updates and successful Preview `Present()` calls, **not** measured click-to-photon latency or confirmed scanout. This is source code, not Windows/GPU runtime verified yet.
+**Known risk:** a layered topmost HWND may affect DXGI flip presentation and independent flip eligibility. This source patch is checksum verified but needs actual Windows x64 compilation and user runtime testing. If the overlay is black, fails to launch, or shows a recursive image, revert to [capture-only v1](../lookingglass-dxgi-capture-only); do not assume self-capture prevention has worked.
 
-## Build locally
-
-MSVC 2022+ x64 Developer Command Prompt: `python prepare_source.py`, then `Build.cmd`. No Python packages, NVIDIA headers or SDK dependencies. Source reconstruction is SHA256-checked. User's complete readable `src/main.cpp` is included in the source ZIP; GitHub branch stores its verified compressed text to avoid duplicating large source contents.
-
-Next, after stable capture is confirmed: add **NvOFA 4x4 FAST, confidence cost OFF** in a *separate* build; only then test extrapolation shaders.
+Build in an x64 MSVC Developer Command Prompt: `python prepare_source.py` then `Build.cmd`. No Python is needed to run the compiled EXE. AppVeyor builds and publishes `FG-LookingGlass-Fullscreen-ClickThrough-Windows-x64.zip`.

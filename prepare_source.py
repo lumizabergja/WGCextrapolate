@@ -31,3 +31,17 @@ if checksum(data) != expected:
     raise SystemExit("STOP: final capture-only C++ source SHA256 mismatch " + checksum(data))
 target.write_bytes(data)
 print("Verified standalone Looking Glass DXGI capture-only source:", expected)
+# Patch the SHA-verified v1 source to fullscreen, click-through v2.
+import json
+ops = json.loads(zlib.decompress(base64.b64decode(
+    (root / "src" / "fullscreen_delta.b64").read_text(encoding="ascii").strip())))
+lines = data.decode("utf-8").splitlines(keepends=True)
+for start, stop, replacement in sorted(ops, key=lambda item: item[0], reverse=True):
+    lines[start:stop] = [replacement] if replacement else []
+new_data = "".join(lines).encode("utf-8")
+v2_sha = "34eaa13afd0ebb7020a150459854194886bd5a0a0f78f34d66a619796637df66"
+if checksum(new_data) != v2_sha:
+    raise SystemExit("STOP: fullscreen click-through patched C++ source hash mismatch "
+                     + checksum(new_data))
+target.write_bytes(new_data)
+print("Verified fullscreen click-through DXGI capture source:", v2_sha)
