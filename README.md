@@ -1,29 +1,14 @@
-# WGC Extrapolate — visible motion v3 (D3D11 / Windows)
+# WGC Extrapolate — v4 reduced-overhead D3D11 FG
+Experimental Windows Graphics Capture / NVIDIA optical flow / D3D11 frame-extrapolation app.
 
-Experimental **Windows Graphics Capture → D3D11 → NVIDIA Optical Flow (FAST 4x4) → extrapolation shader → DXGI flip presentation**, with Off, Dynamic, and fixed x2–x6.
+**v3 working backup:** [v3-working-backup](../../tree/v3-working-backup). v4 deliberately retains its working x2–x6 generated-frame scheduler and the same optical-flow warp math.
 
-## Why the previous version looked like native frames
+**v4 changes:**
+- Reuses signaled D3D11 event queries instead of creating a GPU completion query for each capture.
+- Removes unnecessary vertex-shader resource/constant/sampler bindings and unused previous-frame pixel-shader SRV.
+- Samples the current full-resolution texture once, rather than twice, on unprotected prediction pixels.
+- Keeps WGC native texture SRVs, NvOFA 4x4 FAST, max DXGI frame latency 1, the real-frame fast path, and no app-level pixel copies or DX12 conversions.
 
-Two different failure modes were possible:
+**Build:** [AppVeyor](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) uses `appveyor.yml` and `reconstruct.py` to verify and compile v4, then publishes `FG-WGC-D3D11-LowLatency-Windows-x64.zip` if successful. Local source archives may contain fully reconstructed `src/main.cpp` and can run `Build-And-Pack.cmd` on Windows directly.
 
-- The scheduler previously prioritized new native frames so aggressively that it could starve generated slots at high source FPS.
-- Even when it submitted an FG frame, the shader's scene-cut/residual/confidence checks could reject the optical-flow warp and return a copy of the real frame, particularly during camera movement.
-
-**v3** removes that overaggressive shader gate and uses a cheaper single-flow-warp prediction shader. Fixed x2–x6 modes reserve at most one imminent generated presentation opportunity before accepting the latest waiting native frame. Off and Dynamic retain a real-frame-first path. There are no additional CPU pixel copies or D3D11-to-DX12 conversions.
-
-## Identify your build
-
-The v3 executable window title is `FG WGC v3`. Its status line reads:
-`v3 WGC .../s  Real .../s  FG .../s  OF .../s`
-
-- `OF=0` while real captures update in fixed x4: the optical-flow engine is not executing, so check mode/initialization/errors.
-- `OF>0, FG=0`: a scheduler/flip-slot timing problem remains.
-- `OF>0, FG>0` but still no visible motion: the shader may be receiving zero or invalid motion vectors. The FG number counts submitted draws, not actual scanout or changed pixels.
-
-## Build in AppVeyor
-
-The public repo's `appveyor.yml` calls `python reconstruct.py` to produce the SHA256-verified v3 source from three small patch stages (base, pacing v2, motion v3). Then it downloads Nvidia optical-flow headers, compiles on Visual Studio 2022, and should publish `FG-WGC-D3D11-LowLatency-Windows-x64.zip` in Artifacts **if successful**.
-
-For local builds use x64 Visual Studio Developer Command Prompt, then `python reconstruct.py` and `Build-And-Pack.cmd`.
-
-**Important:** This is an unverified source-level fix. It has passed deterministic source-reconstruction validation, not Windows compilation or actual GPU runtime tests. At 240 Hz the display can show at most 240 total frames/s; adding FG frames at 240 native FPS replaces some native display opportunities. To see stronger extrapolation, first try fixed x4 at 60 native FPS on a moving scene.
+**Verification:** Source reconstruction matches SHA256 `80f95a236ee353c069971061f5fe6a4415fb4b8915dc25ca4fa39f5cdd249d12`; GPU runtime latency improvements are not yet measured. Keep the same FPS cap, display Hz, and x-multiplier when comparing v3 vs v4. Real frames and FG compete for finite 240 Hz scanout slots; visible FG at 240 native FPS cannot simultaneously display all real frames.
