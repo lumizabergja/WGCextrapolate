@@ -73,59 +73,62 @@ void Refresh(){SendMessageW(gWindowCombo,CB_RESETCONTENT,0,0);gTargets.clear();E
 // Edge-aware interpolation uses four grid vectors and luma-guided weighting.
 // Occlusion fallback compares previous warped appearance against current pixel to reject unreliable flow.
 static const char kShader[] = R"HLSL(
-cbuffer Params:register(b0) { float2 dimensions; float2 flowDims; float extrapolate; float hasFlow; float debugMode; float pad0; };
-Texture2D<float4> latestTex:register(t0);
-Texture2D<float4> previousTex:register(t1);
-Texture2D<int2> vectors:register(t2);
-SamplerState smoothSample:register(s0);
-struct VSOut{float4 pos:SV_Position;float2 uv:TEXCOORD0;};
-VSOut VSMain(uint vertex:SV_VertexID){
- VSOut o; float2 p=float2((vertex<<1)&2, vertex&2);
- o.pos=float4(p*float2(2,-2)+float2(-1,1),0,1);o.uv=p;return o;
+Texture2D<float4> currentFrame:register(t0);
+Texture2D<int2> rawFlow:register(t1);
+Texture2D<float4> previousFrame:register(t2);
+SamplerState samp:register(s0);
+cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float debugMode;float centerRadiusPx;float centerFeatherPx;float2 outputSize;};
+struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;};
+// Use native block centers, including partial cells on odd-sized captures.
+float2 flow(float2 uv){
+    uint fw,fh;rawFlow.GetDimensions(fw,fh);
+    float2 pos=uv/(motionInv*gridSize*gridExtent)*float2(fw,fh)-0.5;
+    int2 base=int2(floor(pos));float2 f=frac(pos);
+    int2 edge=int2(int(fw)-1,int(fh)-1);
+    int2 a=clamp(base,int2(0,0),edge),b=clamp(base+int2(1,0),int2(0,0),edge);
+    int2 c=clamp(base+int2(0,1),int2(0,0),edge),d=clamp(base+int2(1,1),int2(0,0),edge);
+    float2 v00=float2(rawFlow.Load(int3(a,0)))*(1.0/32.0);
+    float2 v10=float2(rawFlow.Load(int3(b,0)))*(1.0/32.0);
+    float2 v01=float2(rawFlow.Load(int3(c,0)))*(1.0/32.0);
+    float2 v11=float2(rawFlow.Load(int3(d,0)))*(1.0/32.0);
+    return lerp(lerp(v00,v10,f.x),lerp(v01,v11,f.x),f.y)*motionInv;
 }
-float Luma(float3 c){return dot(c,float3(0.2126,0.7152,0.0722));}
-float2 ReadFlow(int2 g){g=clamp(g,int2(0,0),int2(flowDims)-1);return float2(vectors.Load(int3(g,0)))/32.0;}
-float2 EdgeAwareFlow(float2 pixel, float centerLuma){
- float2 grid=pixel*0.25-0.5;int2 base=(int2)floor(grid);float2 fr=frac(grid);
- float2 sum=float2(0,0);float total=0;
- [unroll]for(int y=0;y<2;y++){[unroll]for(int x=0;x<2;x++){
-  int2 gp=clamp(base+int2(x,y),int2(0,0),int2(flowDims)-1);
-  float2 blockPos=(float2(gp)+0.5)*4.0;
-  float l=Luma(latestTex.SampleLevel(smoothSample,saturate(blockPos/dimensions),0).rgb);
-  float w=(x==0?1-fr.x:fr.x)*(y==0?1-fr.y:fr.y);
-  w*=rcp(1.0+abs(l-centerLuma)*12.0);
-  sum+=ReadFlow(gp)*w;total+=w;
- }}return sum/max(total,1e-5);
+float cutSample(float2 uv){float2 q=uv+flow(uv);if(any(q<0)||any(q>1))return 0;return dot(abs(currentFrame.SampleLevel(samp,uv,0).rgb-previousFrame.SampleLevel(samp,q,0).rgb),float3(.333333,.333333,.333333));}
+V VS(uint id:SV_VertexID){
+    V o;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);
+    o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);o.scene=0;
+    [branch] if(horizon>0.00001){float e=cutSample(float2(.2,.3))+cutSample(float2(.8,.3))+cutSample(float2(.5,.5))+cutSample(float2(.2,.7))+cutSample(float2(.8,.7));o.scene=smoothstep(.19,.32,e*.2);}
+    return o;
 }
-float4 PSMain(VSOut i):SV_Target{
- float2 uv=saturate(i.uv);float4 current=latestTex.SampleLevel(smoothSample,uv,0);
- // Flow diagnostic applies to BOTH real and generated frames; this confirms vectors reach PSMain.
- if(debugMode>1.5 && hasFlow>0.5){
-   float2 mv=EdgeAwareFlow(uv*dimensions,Luma(current.rgb));
-   return float4(saturate(0.5+mv.x/64.0),saturate(0.5+mv.y/64.0),saturate(length(mv)/32.0),1.0);
- }
- // Magenta bar is only written by the generated-frame shader path.
- if(debugMode>0.5 && extrapolate>0.001 && uv.x<0.22 && uv.y<0.042) return float4(1.0,0.0,1.0,1.0);
- // Real frames run the same shader, using extrapolation factor zero.
- if(hasFlow<0.5) return float4(current.rgb,1.0);
- float2 pixels=uv*dimensions;
- float2 vec=EdgeAwareFlow(pixels,Luma(current.rgb));
- // A second fixed-point step approximates flow defined at the backward-warped source.
- float2 firstUv=saturate(uv-vec*(extrapolate/dimensions));
- float2 vec2=EdgeAwareFlow(firstUv*dimensions,Luma(latestTex.SampleLevel(smoothSample,firstUv,0).rgb));
- vec=lerp(vec,vec2,0.35);
- vec=clamp(vec,float2(-256,-256),float2(256,256));
- float2 futureUv=saturate(uv-vec*(extrapolate/dimensions));
- float4 predicted=latestTex.SampleLevel(smoothSample,futureUv,0);
- float2 priorUv=saturate(uv-vec/dimensions);
- float3 prev=previousTex.SampleLevel(smoothSample,priorUv,0).rgb;
- // Reject cross-object vectors / uncovered regions without a hardware cost map.
- float mismatch=abs(Luma(prev)-Luma(current.rgb));
- float trust=saturate((0.20-mismatch)*8.0);
- // Avoid drawing black borders from exaggerated motion near the boundaries.
- float2 edge=min(futureUv,1.0-futureUv)*dimensions;
- trust*=saturate(min(edge.x,edge.y)*0.5);
- return float4(lerp(current.rgb,predicted.rgb,trust),1.0);
+float centerMask(float2 uv){
+    // The center mask affects only predicted pixels, never real captured frames.
+    // 0px radius + 0px feather is a full bypass (no center protection).
+    if(centerRadiusPx<=0.0 && centerFeatherPx<=0.0)return 1.0;
+    float distancePx=length((uv-float2(.5,.5))*outputSize);
+    if(centerFeatherPx<=0.0)return distancePx>centerRadiusPx?1.0:0.0;
+    return smoothstep(centerRadiusPx,centerRadiusPx+centerFeatherPx,distancePx);
+}
+float4 PS(V i):SV_Target {
+    // Reuse V15 Clean V16 shader motion path, with diagnostic overlays optional.
+    float2 uv=i.uv;
+    float4 base=currentFrame.SampleLevel(samp,uv,0);
+    if(debugMode>1.5 && horizon<=0.00001){
+        float2 v=flow(uv)*float2(64.0,64.0);
+        return float4(saturate(0.5+v.x),saturate(0.5+v.y),saturate(length(v)),1);
+    }
+    if(debugMode>0.5 && debugMode<1.5 && horizon>0.00001 && uv.x<.22 && uv.y<.042)
+        return float4(1,0,1,1);
+
+    [branch] if(horizon<=0.00001 || i.scene>0.9)return base;
+    float2 v=flow(uv),q=uv+horizon*v;
+    if(any(q<0)||any(q>1))return base;
+    float2 mv=flow(q),old=q+mv;
+    if(any(old<0)||any(old>1)||length(mv)>maxMotion)return base;
+    float4 next=currentFrame.SampleLevel(samp,q,0);
+    float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
+    float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
+    float confidence=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
+    return lerp(base,next,saturate(confidence*centerMask(uv)));
 }
 )HLSL";
 
@@ -141,7 +144,8 @@ struct D3D {
  ComPtr<IDXGIDevice1> dxgi;
  UINT sourceW{},sourceH{},outputW{},outputH{};
  bool tearing{};
- struct CB {float dimensions[2],flowDims[2],extrapolate,hasFlow,debugMode,pad0;};
+ struct CB {float horizon,invW,invH,maxMotion;float flowW,flowH,grid,debugMode;float centerRadiusPx,centerFeatherPx,outputW,outputH;};
+ static_assert(sizeof(CB)==48);
  explicit D3D(HWND presenter, UINT w,UINT h,UINT outW,UINT outH) : sourceW(w),sourceH(h),outputW(outW),outputH(outH) {
   UINT flags=D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL obtained{};
@@ -160,12 +164,12 @@ struct D3D {
   Check(factory->CreateSwapChainForHwnd(dev.Get(),presenter,&desc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd");
   factory->MakeWindowAssociation(presenter,DXGI_MWA_NO_ALT_ENTER);
   ID3DBlob* vsBlob=nullptr;ID3DBlob* psBlob=nullptr;ID3DBlob* diagnostics=nullptr;
-  HRESULT hr=D3DCompile(kShader,strlen(kShader),"embedded.hlsl",nullptr,nullptr,"VSMain","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&diagnostics);
+  HRESULT hr=D3DCompile(kShader,strlen(kShader),"embedded.hlsl",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&diagnostics);
   if(FAILED(hr)) {std::string s="VS shader compile: ";if(diagnostics)s.append((char*)diagnostics->GetBufferPointer(),diagnostics->GetBufferSize());if(diagnostics)diagnostics->Release();throw std::runtime_error(s);}
   if(diagnostics){diagnostics->Release();diagnostics=nullptr;}
   ComPtr<ID3DBlob> vertex;vertex.Attach(vsBlob);
   Check(dev->CreateVertexShader(vertex->GetBufferPointer(),vertex->GetBufferSize(),nullptr,&vs),"CreateVertexShader");
-  hr=D3DCompile(kShader,strlen(kShader),"embedded.hlsl",nullptr,nullptr,"PSMain","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&diagnostics);
+  hr=D3DCompile(kShader,strlen(kShader),"embedded.hlsl",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&diagnostics);
   if(FAILED(hr)){std::string s="PS shader compile: ";if(diagnostics)s.append((char*)diagnostics->GetBufferPointer(),diagnostics->GetBufferSize());if(diagnostics)diagnostics->Release();throw std::runtime_error(s);}
   if(diagnostics)diagnostics->Release();
   ComPtr<ID3DBlob> pixel;pixel.Attach(psBlob);
