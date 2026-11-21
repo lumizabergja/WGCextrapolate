@@ -21,6 +21,14 @@ build.cmd
 
 The `appveyor.yml` creates an artifact ZIP on a Windows runner. No Python.
 
+
+## Checking whether generated frames are actually visible
+- The default diagnostic view is **Magenta marker on generated frames**. A magenta bar in the upper-left corner is drawn by the HLSL pixel shader only when its extrapolation factor is above zero. Select **Normal image** to disable the marker for normal quality testing.
+- Select **Visualize NvOFA motion vectors** to inspect the output of optical flow on both real and generated frames. Uniform gray/dark means little detected motion; colors changing as the scene moves indicate nonzero motion vectors.
+- The title displays **WGC/s**, **FG submitted/s**, and **NvOFA/s**. *Submitted* means the application called DXGI Present; Windows may replace frames before scanout.
+- On a 240 Hz screen, test with a moving window capped near **60 real FPS** and select **x4** (or 120 FPS and x2). If the source already updates at 240 FPS, attempting x4 would require 960 distinct displays per second, which a 240 Hz panel cannot show.
+- If FG submitted/s remains zero, the scheduler/capture cadence is preventing generated presents. If FG submitted/s is positive but the magenta bar never appears, investigate DXGI queue replacement, compositor mode, and actual scanout. If the bar appears but the scene still looks native, switch to the flow-vector diagnostic to check for weak/zero motion or the shader's occlusion fallback.
+
 ## Accuracy and limitations
 - **Experimental; not hardware verified.** A completed MSVC build is not a substitute for GPU testing.
 - WGC's own internal capture can be buffered/copied by Windows and is not provably zero-copy. Windows 10 has no `MinUpdateInterval` property.
