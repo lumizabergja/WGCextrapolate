@@ -1,29 +1,11 @@
-# WGC Extrapolate — visible motion v3 (D3D11 / Windows)
+# FG V15 Clean v16 — Community NvFBC compatibility branch
 
-Experimental **Windows Graphics Capture → D3D11 → NVIDIA Optical Flow (FAST 4x4) → extrapolation shader → DXGI flip presentation**, with Off, Dynamic, and fixed x2–x6.
+**Experimental. Not yet verified on the user's RTX 5060 Ti or Windows 10 22H2.**
 
-## Why the previous version looked like native frames
+This branch compiles the original V15 v16 DX9Ex -> shared D3D11 -> NvOFA -> DXGI code via SHA-verified reconstruction from the original source patches, then applies a small community NvFBC compatibility patch (hash fb445337af61c569883a67b83fa27587387745425c02775bd1165476edbeecee).
 
-Two different failure modes were possible:
+Changes: Windows 10 capture-exclusion overlay initialization, the MIT x64 ABI declarations from [NvFBC Relay](https://github.com/garrettsparks/nvfbc-relay), System32-only DLL loading, documented NvFBC CreateEx first, legacy key retry without undocumented game PID block, capture-status/error reporting, no WGC/DXGI capture fallback. **NvFBC captures the selected display, not a specific game's PID**.
 
-- The scheduler previously prioritized new native frames so aggressively that it could starve generated slots at high source FPS.
-- Even when it submitted an FG frame, the shader's scene-cut/residual/confidence checks could reject the optical-flow warp and return a copy of the real frame, particularly during camera movement.
+Use [AppVeyor](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) to build this isolated branch. If successful, its Artifacts contain FG-V15-Community-NvFBC-Windows-x64.zip.
 
-**v3** removes that overaggressive shader gate and uses a cheaper single-flow-warp prediction shader. Fixed x2–x6 modes reserve at most one imminent generated presentation opportunity before accepting the latest waiting native frame. Off and Dynamic retain a real-frame-first path. There are no additional CPU pixel copies or D3D11-to-DX12 conversions.
-
-## Identify your build
-
-The v3 executable window title is `FG WGC v3`. Its status line reads:
-`v3 WGC .../s  Real .../s  FG .../s  OF .../s`
-
-- `OF=0` while real captures update in fixed x4: the optical-flow engine is not executing, so check mode/initialization/errors.
-- `OF>0, FG=0`: a scheduler/flip-slot timing problem remains.
-- `OF>0, FG>0` but still no visible motion: the shader may be receiving zero or invalid motion vectors. The FG number counts submitted draws, not actual scanout or changed pixels.
-
-## Build in AppVeyor
-
-The public repo's `appveyor.yml` calls `python reconstruct.py` to produce the SHA256-verified v3 source from three small patch stages (base, pacing v2, motion v3). Then it downloads Nvidia optical-flow headers, compiles on Visual Studio 2022, and should publish `FG-WGC-D3D11-LowLatency-Windows-x64.zip` in Artifacts **if successful**.
-
-For local builds use x64 Visual Studio Developer Command Prompt, then `python reconstruct.py` and `Build-And-Pack.cmd`.
-
-**Important:** This is an unverified source-level fix. It has passed deterministic source-reconstruction validation, not Windows compilation or actual GPU runtime tests. At 240 Hz the display can show at most 240 total frames/s; adding FG frames at 240 native FPS replaces some native display opportunities. To see stronger extrapolation, first try fixed x4 at 60 native FPS on a moving scene.
+Community [keylase NvFBC wrapper](https://github.com/keylase/nvidia-patch/blob/master/win/nvfbcwrp/README.md) may enable GeForce but system driver modification is not automated here. No guarantee it works for RTX 5060 Ti. Windows NvFBC has been deprecated since Capture SDK 7.1; do not assume a passing compiler build proves it works.
