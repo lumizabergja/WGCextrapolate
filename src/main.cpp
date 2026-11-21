@@ -62,7 +62,7 @@ std::atomic<bool> g_engineFinished{true};
 std::atomic<bool> g_lastGameExited{false};
 constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
-std::atomic<int> g_fgMode{2};
+std::atomic<int> g_fgMode{1};
 std::atomic<int> g_targetHz{0};
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
@@ -913,11 +913,11 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
             36,229,160,210,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMultiplier)),nullptr,nullptr);
         StyleControl(g_multi);
-        for(const wchar_t* mode:{L"Dynamic",L"Off",L"x2",L"x3",L"x4",L"x5",L"x6"})
+        for(const wchar_t* mode:{L"Off",L"x2",L"x3",L"x4"})
             SendMessageW(g_multi,CB_ADDSTRING,0,(LPARAM)mode);
         SendMessageW(g_multi,CB_SETCURSEL,0,0);
-        UiLabel(hwnd,L"Target FPS",217,225,95,20,true);
-        g_dynamicTarget=CreateWindowW(L"EDIT",L"240",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
+        UiLabel(hwnd,L"NvOFA FAST 4x4 | cost OFF",217,225,245,20,true);
+        g_dynamicTarget=CreateWindowW(L"EDIT",L"240",WS_CHILD|ES_NUMBER|ES_AUTOHSCROLL,
             218,247,100,27,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDynamicTarget)),nullptr,nullptr);
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
@@ -992,7 +992,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
                 const auto value=SendMessageW(g_multi,CB_GETCURSEL,0,0);
-                if(value!=CB_ERR)g_fgMode.store(int(value));
+                if(value!=CB_ERR)g_fgMode.store(int(value)+1);
             }
             break;
         case kCenterRadius:
@@ -1036,7 +1036,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             }
             const Game game=g_games[size_t(selection)];
             auto chosen=SendMessageW(g_multi,CB_GETCURSEL,0,0);
-            g_fgMode.store(chosen==CB_ERR?0:int(chosen));
+            g_fgMode.store(chosen==CB_ERR?1:int(chosen)+1);
             if(g_worker.joinable())g_worker.join();
             g_userStopRequested.store(false,std::memory_order_release);
             g_lastGameExited.store(false,std::memory_order_release);
