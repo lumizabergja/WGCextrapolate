@@ -2,8 +2,8 @@ version: 1.1.{build}
 image: Visual Studio 2022
 platform: x64
 configuration: Release
-clone_depth: 1
-
+# Full Git clone: AppVeyor may build an older queued SHA after branch advances.
+# Do not use clone_depth: 1; checkout must be able to resolve the requested SHA.
 # Isolated build branch: wgc-nvofa-v1-appveyor.
 # Compiles the repository's existing WGC/NvOFA code; branch is kept separate from main.
 # All build files live in this PUBLIC repository. No private dependencies.
