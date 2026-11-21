@@ -1,29 +1,40 @@
-# WGC Extrapolate — visible motion v3 (D3D11 / Windows)
+# WGC + NvOFA 4x4 FAST extrapolation — CLEAN implementation
 
-Experimental **Windows Graphics Capture → D3D11 → NVIDIA Optical Flow (FAST 4x4) → extrapolation shader → DXGI flip presentation**, with Off, Dynamic, and fixed x2–x6.
+**This implementation is written from scratch using public Microsoft and NVIDIA documentation.** It contains no old project source, presenters, or shaders.
 
-## Why the previous version looked like native frames
+## Target
+- Windows 10 22H2 (build 19045); GPU: NVIDIA RTX 5060 Ti 8 GB; driver 576.88.
+- Capture: Windows.Graphics.Capture -> CreateFreeThreaded 2-buffer pool, HWND selection, newest frame only.
+- D3D11 GPU-resident textures. NvOFA requires persistent registered input surfaces; one GPU CopyResource per real frame when the driver accepts BGRA8, otherwise a GPU-only RGBA conversion pass. There is **no CPU pixel readback**. This is NOT zero-copy end-to-end.
+- NvOFA SDK 5.0 D3D11, FAST preset, 4x4 grid, `enableOutputCost = NV_OF_FALSE`.
+- Extrapolation: signed S10.5 vector decoding, luma-guided flow smoothing, bounded backward warp, previous-frame mismatch/occlusion fallback, clip-edge protection. Off/x2/x3/x4.
+- Presentation: D3D11 flip-discard swap chain, tearing if allowed, DXGI maximum latency 1, native source frames prioritized over generated.
+- Live mode selector, window Refresh/Start/Stop, Ctrl+Alt+F8 stop, fullscreen output option.
 
-Two different failure modes were possible:
+## Build
+On a Visual Studio 2022/2026 x64 Developer Command Prompt:
 
-- The scheduler previously prioritized new native frames so aggressively that it could starve generated slots at high source FPS.
-- Even when it submitted an FG frame, the shader's scene-cut/residual/confidence checks could reject the optical-flow warp and return a copy of the real frame, particularly during camera movement.
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+build.cmd
+```
 
-**v3** removes that overaggressive shader gate and uses a cheaper single-flow-warp prediction shader. Fixed x2–x6 modes reserve at most one imminent generated presentation opportunity before accepting the latest waiting native frame. Off and Dynamic retain a real-frame-first path. There are no additional CPU pixel copies or D3D11-to-DX12 conversions.
+The `appveyor.yml` creates an artifact ZIP on a Windows runner. No Python.
 
-## Identify your build
+## Accuracy and limitations
+- **Experimental; not hardware verified.** A completed MSVC build is not a substitute for GPU testing.
+- WGC's own internal capture can be buffered/copied by Windows and is not provably zero-copy. Windows 10 has no `MinUpdateInterval` property.
+- Hardware/NVIDIA format support is checked at runtime; unsupported formats return explicit errors instead of silently falling back.
+- The capture and presenter can still be DWM-composed: fullscreen flip-model does not guarantee Independent Flip. Click-through depends on Windows hit testing.
+- Extrapolation cannot reveal correct hidden geometry without depth; a color-based disocclusion gate reduces artifacts but does not eliminate them.
+- NvOFA SDK 5.0's FAST preset trades some motion-vector quality for throughput. If the D3D11 device/format negotiation is not compatible with the target driver, the app stops and reports an error.
+- The separate flow engine is asynchronous. Real-frame priority prevents an explicit optical-flow wait before real presentation, but driver resource dependencies can still block generated frames.
+- Capture/scanout FPS and end-to-end input latency must be measured on the actual system; not claimed here.
 
-The v3 executable window title is `FG WGC v3`. Its status line reads:
-`v3 WGC .../s  Real .../s  FG .../s  OF .../s`
-
-- `OF=0` while real captures update in fixed x4: the optical-flow engine is not executing, so check mode/initialization/errors.
-- `OF>0, FG=0`: a scheduler/flip-slot timing problem remains.
-- `OF>0, FG>0` but still no visible motion: the shader may be receiving zero or invalid motion vectors. The FG number counts submitted draws, not actual scanout or changed pixels.
-
-## Build in AppVeyor
-
-The public repo's `appveyor.yml` calls `python reconstruct.py` to produce the SHA256-verified v3 source from three small patch stages (base, pacing v2, motion v3). Then it downloads Nvidia optical-flow headers, compiles on Visual Studio 2022, and should publish `FG-WGC-D3D11-LowLatency-Windows-x64.zip` in Artifacts **if successful**.
-
-For local builds use x64 Visual Studio Developer Command Prompt, then `python reconstruct.py` and `Build-And-Pack.cmd`.
-
-**Important:** This is an unverified source-level fix. It has passed deterministic source-reconstruction validation, not Windows compilation or actual GPU runtime tests. At 240 Hz the display can show at most 240 total frames/s; adding FG frames at 240 native FPS replaces some native display opportunities. To see stronger extrapolation, first try fixed x4 at 60 native FPS on a moving scene.
+## Public references
+- https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture
+- https://github.com/robmikh/Win32CaptureSample
+- https://docs.nvidia.com/video-technologies/optical-flow-sdk/nvofa-programming-guide/index.html
+- https://docs.nvidia.com/video-technologies/optical-flow-sdk/nvofa-application-note/index.html
+- https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model
+- SDK 5.0 interface mirror: https://github.com/SlimRG/NvidiaOF5

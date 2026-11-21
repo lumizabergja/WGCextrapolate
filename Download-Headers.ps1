@@ -1,10 +1,9 @@
 $ErrorActionPreference='Stop'
-New-Item -ItemType Directory -Force 'vendor/headers' | Out-Null
-$urls=@{
-  'nvOpticalFlowD3D11.h'='https://raw.githubusercontent.com/SlimRG/NvidiaOF5/main/nvOpticalFlowD3D11.h'
-  'nvOpticalFlowCommon.h'='https://raw.githubusercontent.com/SlimRG/NvidiaOF5/main/nvOpticalFlowCommon.h'
+New-Item -ItemType Directory -Force 'include' | Out-Null
+# SDK 5.0 public interface headers. These are pulled as a matched pair, not mixed with SDK 2.0.
+$base='https://raw.githubusercontent.com/SlimRG/NvidiaOF5/master/'
+foreach($name in @('nvOpticalFlowCommon.h','nvOpticalFlowD3D11.h')) {
+  Invoke-WebRequest -Uri ($base + $name) -OutFile (Join-Path 'include' $name) -UseBasicParsing
+  if ((Get-Item (Join-Path 'include' $name)).Length -lt 3000) {throw "Invalid SDK header: $name"}
 }
-foreach($name in $urls.Keys) {
-  Invoke-WebRequest -UseBasicParsing -Uri $urls[$name] -OutFile "vendor/headers/$name"
-  if((Get-Item "vendor/headers/$name").Length -lt 1024) { throw "Invalid NVIDIA interface header: $name" }
-}
+Write-Host 'Retrieved matching NVIDIA Optical Flow SDK 5.0 API headers.'
