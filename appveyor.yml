@@ -10,9 +10,7 @@ clone_depth: 1
 install:
   - ps: |
       $ErrorActionPreference = 'Stop'
-      python --version
-      python reconstruct.py
-      if ($LASTEXITCODE -ne 0) { throw 'Optimized WGC source verification/reconstruction failed' }
+      # This branch contains edited full source; v3 hash-based reconstruction does not apply.
       & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
       if ($LASTEXITCODE -ne 0) { throw 'Optical flow SDK interface header download failed' }
 
