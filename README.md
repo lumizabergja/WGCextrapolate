@@ -10,14 +10,14 @@ The presenter uses a 2-buffer waitable DXGI flip-discard swapchain, maximum fram
 The diagnostic menu still provides a magenta generated-frame marker and an NvOFA flow-vector visualization. Submission counters do not guarantee physical scanout. **This build is an experimental integration; hardware latency and quality are not yet verified.**
 
 
-**This implementation is written from scratch using public Microsoft and NVIDIA documentation.** It contains no old project source, presenters, or shaders.
+**The WGC capture backend was written from scratch.** The motion shader and frame-pacing design are now ported from V15 Clean V16, with optional diagnostic overlays. No NvFBC capture code is used.
 
 ## Target
 - Windows 10 22H2 (build 19045); GPU: NVIDIA RTX 5060 Ti 8 GB; driver 576.88.
 - Capture: Windows.Graphics.Capture -> CreateFreeThreaded 2-buffer pool, HWND selection, newest frame only.
 - D3D11 GPU-resident textures. NvOFA requires persistent registered input surfaces; one GPU CopyResource per real frame when the driver accepts BGRA8, otherwise a GPU-only RGBA conversion pass. There is **no CPU pixel readback**. This is NOT zero-copy end-to-end.
 - NvOFA SDK 5.0 D3D11, FAST preset, 4x4 grid, `enableOutputCost = NV_OF_FALSE`.
-- Extrapolation: signed S10.5 vector decoding, luma-guided flow smoothing, bounded backward warp, previous-frame mismatch/occlusion fallback, clip-edge protection. Off/x2/x3/x4.
+- Extrapolation: V15 signed S10.5 optical-flow decoding, four-grid bilinear flow filtering, scene-cut detection, previous-frame consistency, bounded future warp, and optional diagnostic overlays. Off/x2/x3/x4.
 - Presentation: D3D11 flip-discard swap chain, tearing if allowed, DXGI maximum latency 1. Both real and generated frames execute NvOFA FAST 4x4 and the same HLSL motion-extrapolation shader before the same DXGI Present(0); real frames use extrapolation factor 0, generated frames use factors above 0.
 - Live mode selector, window Refresh/Start/Stop, Ctrl+Alt+F8 stop, fullscreen output option.
 
