@@ -1,0 +1,38 @@
+version: 1.0.{build}
+image: Visual Studio 2022
+platform: x64
+configuration: Release
+clone_depth: 1
+
+# All build files live in this PUBLIC repository. No private dependencies.
+install:
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+      python --version
+      python reconstruct.py
+      if ($LASTEXITCODE -ne 0) { throw 'Optimized WGC source verification/reconstruction failed' }
+      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+      if ($LASTEXITCODE -ne 0) { throw 'Optical flow SDK interface header download failed' }
+
+build_script:
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      if (!(Test-Path $vswhere)) { throw 'Visual Studio installer locator missing' }
+      $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+      if (!$vs) { throw 'MSVC x64 tools missing from Windows build image' }
+      $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+      if (!(Test-Path $vcvars)) { throw 'vcvars64.bat missing' }
+      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build-And-Pack.cmd > build.log 2>&1')
+      $exit = $LASTEXITCODE
+      if (Test-Path build.log) { Get-Content build.log }
+      if ($exit -ne 0) { throw "Windows C++ compilation/package failed ($exit). See build.log." }
+      if (!(Test-Path 'artifacts\FG-WGC-D3D11-LowLatency-Windows-x64.zip')) { throw 'Expected ZIP artifact missing' }
+
+artifacts:
+  - path: artifacts\FG-WGC-D3D11-LowLatency-Windows-x64.zip
+    name: FG-WGC-D3D11-LowLatency-Windows-x64
+  - path: build.log
+    name: MSVC build.log
+
+test: off
