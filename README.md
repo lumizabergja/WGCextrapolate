@@ -1,11 +1,12 @@
-# FG V15 Clean v16 — Community NvFBC compatibility branch
+# V15 NvFBC Enable Probe (Windows experimental)
 
-**Experimental. Not yet verified on the user's RTX 5060 Ti or Windows 10 22H2.**
+The driver returned `NVFBC_ERROR_DRIVER_FAILURE (-5)`, `capture possible=0`, for both standard and legacy CreateEx on RTX 5060 Ti / Windows 10 22H2. This is a driver-side rejection, **not** evidence that the NvFBC 9.0 Linux direct-PID APIs are usable on Windows.
 
-This branch compiles the original V15 v16 DX9Ex -> shared D3D11 -> NvOFA -> DXGI code via SHA-verified reconstruction from the original source patches, then applies a small community NvFBC compatibility patch (hash fb445337af61c569883a67b83fa27587387745425c02775bd1165476edbeecee).
+This isolated branch tests one previously untried **Windows** initialization step, NVIDIA Capture SDK 7.x `NvFBC_Enable(NVFBC_STATE_ENABLE)`, following the community [nvfbc-relay](https://github.com/garrettsparks/nvfbc-relay) technique. The enable call is attempted only when the driver reports capture disabled and not currently capturing. The app does not replace or patch the NVIDIA driver. It retains the original V15 DX9Ex -> D3D11 -> NvOFA -> DXGI pipeline.
 
-Changes: Windows 10 capture-exclusion overlay initialization, the MIT x64 ABI declarations from [NvFBC Relay](https://github.com/garrettsparks/nvfbc-relay), System32-only DLL loading, documented NvFBC CreateEx first, legacy key retry without undocumented game PID block, capture-status/error reporting, no WGC/DXGI capture fallback. **NvFBC captures the selected display, not a specific game's PID**.
+If Enable succeeds, the app exits with a message to close and relaunch it, because the call may reset the GPU device. If Enable fails, the message reports `enable=<code>`. **-15** usually indicates insufficient administrator privileges, **-5** means driver failure. If it remains -5 even with administrator rights, this is not solvable just by copying Linux Capture SDK patches; the Windows driver has disabled NvFBC.
 
-Use [AppVeyor](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) to build this isolated branch. If successful, its Artifacts contain FG-V15-Community-NvFBC-Windows-x64.zip.
+[Latest NVIDIA Capture SDK](https://developer.nvidia.com/capture-sdk) is Linux-only since Windows NvFBC was deprecated. Windows 10 22H2 is outside supported Windows NvFBC versions. Do not install Linux ELF driver patches or replace your signed Windows system DLLs for this test.
 
-Community [keylase NvFBC wrapper](https://github.com/keylase/nvidia-patch/blob/master/win/nvfbcwrp/README.md) may enable GeForce but system driver modification is not automated here. No guarantee it works for RTX 5060 Ti. Windows NvFBC has been deprecated since Capture SDK 7.1; do not assume a passing compiler build proves it works.
+## Build
+[AppVeyor](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) compiles this branch using `appveyor.yml`. Download the ZIP from Artifacts after successful compilation; source reconstruction hashes are checked. Run the executable normally for a baseline, then optionally as Administrator once to test the documented enable step, if you accept possible temporary display reset. The working WGC main branch and previous V15 community branch remain unchanged.
