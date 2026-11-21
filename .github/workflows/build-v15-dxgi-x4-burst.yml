@@ -40,8 +40,14 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Burst script decoding failed'}
           python burst_fix.py
           if($LASTEXITCODE -ne 0){throw 'Burst pacing patch failed source verification'}
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
-          if($LASTEXITCODE -ne 0){throw 'Optical Flow SDK headers unavailable'}
+          $downloaded=$false
+          for($attempt=1;$attempt -le 6;$attempt++){
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+            if($LASTEXITCODE -eq 0){$downloaded=$true;break}
+            Write-Host "NVIDIA headers transient download failure; attempt $attempt/6"
+            Start-Sleep -Seconds ([Math]::Min(3*$attempt,12))
+          }
+          if(-not $downloaded){throw 'Optical Flow SDK headers unavailable after retries'}
       - name: Compile MSVC optimized diagnostic EXE
         shell: pwsh
         run: |
