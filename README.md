@@ -6,7 +6,7 @@ This branch is based on the **working capture-only v1**. It changes the window a
 
 **Close:** **Ctrl+Alt+F8**. Esc no longer works because the full-screen window never accepts focus. Mouse input remains with the underlying application.
 
-The capture path is unchanged: `IDXGIOutput5::DuplicateOutput1` (or DXGI standard DDA for compatibility) → single GPU-only D3D11 `CopyResource` → original preview pixel shader → flip-discard `Present(0, DO_NOT_WAIT)`. Output is stretched to the full selected display, with no letterbox.
+The flip swapchain is created before making the window topmost and fullscreen (Microsoft DXGI sample startup sequence).\n\nThe capture path is unchanged: `IDXGIOutput5::DuplicateOutput1` (or DXGI standard DDA for compatibility) → single GPU-only D3D11 `CopyResource` → original preview pixel shader → flip-discard `Present(0, DO_NOT_WAIT)`. Output is stretched to the full selected display, with no letterbox.
 
 Window capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) is applied **before** setting the layered window style; `WCA_EXCLUDED_FROM_DDA` is requested as an optional DDA protection. A background display mode change updates the fullscreen window and rebuilds the backbuffer.
 

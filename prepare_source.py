@@ -45,3 +45,15 @@ if checksum(new_data) != v2_sha:
                      + checksum(new_data))
 target.write_bytes(new_data)
 print("Verified fullscreen click-through DXGI capture source:", v2_sha)
+# DXGI requires the HWND flip swapchain before topmost fullscreen placement.
+ops2 = json.loads(zlib.decompress(base64.b64decode(
+    (root / "src" / "swapchain_startup_fix.b64").read_text(encoding="ascii").strip())))
+lines = new_data.decode("utf-8").splitlines(keepends=True)
+for start, stop, replacement in sorted(ops2, key=lambda item: item[0], reverse=True):
+    lines[start:stop] = [replacement] if replacement else []
+final_data = "".join(lines).encode("utf-8")
+final_sha = "ed3ef771adfbc4f39b2d2aba97254cef4cca62ecef4d699366491f4c61fcdb2f"
+if checksum(final_data) != final_sha:
+    raise SystemExit("STOP: DXGI swapchain startup fix hash mismatch "+checksum(final_data))
+target.write_bytes(final_data)
+print("Verified fullscreen click-through v2 startup source:", final_sha)
