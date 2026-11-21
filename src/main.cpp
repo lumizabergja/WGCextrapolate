@@ -335,7 +335,7 @@ void Engine(Target target){
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   RECT rect{};if(!GetWindowRect(target.hwnd,&rect))throw std::runtime_error("Selected window no longer exists");
   const HMONITOR monitor=MonitorFromWindow(target.hwnd,MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(monitor,&mi);
+  MONITORINFOEXW mi{};mi.cbSize=sizeof(mi);GetMonitorInfoW(monitor,&mi);
   const bool fullscreen=gFullScreen.load();
   UINT outW=(UINT)(mi.rcMonitor.right-mi.rcMonitor.left),outH=(UINT)(mi.rcMonitor.bottom-mi.rcMonitor.top);
   if(!fullscreen){outW=960;outH=540;}
@@ -362,77 +362,110 @@ void Engine(Target target){
   auto token=pool.FrameArrived([event](auto const&,auto const&){SetEvent(event);});
   std::unique_ptr<NvFlow> optical;
   // Shared real/generated path: initialize NvOFA even for Off mode. First capture primes history.
-  int current=-1,prior=-1,nextSlot=0,outSlot=0,pending=0;bool validFlow=false;
+  int current=-1,prior=-1,nextSlot=0,outSlot=0,pending=0;bool validFlow=false,realPending=false;
   LONGLONG freq=Frequency(),lastReal=0,baseInterval=freq/60,nextGen=0;
   size_t realCount=0,genCount=0,ofCount=0;
   size_t lastStatReal=0,lastStatGen=0,lastStatOF=0;
   LONGLONG lastStats=Ticks();
-  session.StartCapture();Report(L"Running: WGC native D3D11 capture");
+
+  // V15 Clean V16: DXGI waitable swapchain + measured source cadence.
+  DEVMODEW dm{};dm.dmSize=sizeof(dm);
+  const bool haveHz=EnumDisplaySettingsW(mi.szDevice,ENUM_CURRENT_SETTINGS,&dm)!=0;
+  const UINT hz=(haveHz&&dm.dmDisplayFrequency>=30)?dm.dmDisplayFrequency:240;
+  const LONGLONG scanoutTicks=std::max<LONGLONG>(1,freq/LONGLONG(hz));
+  session.StartCapture();Report(L"V15 shader with WGC; awaiting first frame pair");
   while(!gStopRequested.load() && IsWindow(target.hwnd)){
-   // Diagnostic rates count submitted frames, not actual physical scanout.
-   const LONGLONG statNow=Ticks();
-   if(statNow-lastStats>=freq/2){
-    const double sec=double(statNow-lastStats)/double(freq);
-    wchar_t status[240]{};
-    swprintf_s(status,L"WGC %.1f/s | FG submitted %.1f/s | NvOFA %.1f/s",
-     double(realCount-lastStatReal)/sec,double(genCount-lastStatGen)/sec,double(ofCount-lastStatOF)/sec);
-    Report(status);
-    lastStats=statNow;lastStatReal=realCount;lastStatGen=genCount;lastStatOF=ofCount;
-   }
-   // Drain the pool to newest unique available source frame, never queue stale images.
-   capture::Direct3D11CaptureFrame newest{nullptr};
-   for(int n=0;n<8;n++){auto f=pool.TryGetNextFrame();if(!f)break;if(newest)newest.Close();newest=std::move(f);}
-   if(newest){
-    auto content=newest.ContentSize();
-    if(content.Width!=(int)d3d.sourceW||content.Height!=(int)d3d.sourceH)throw std::runtime_error("Capture resolution changed; stop and restart to reinitialize NvOFA");
-    auto access=newest.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-    ComPtr<ID3D11Texture2D> captureTex;
-    Check(access->GetInterface(IID_PPV_ARGS(&captureTex)),"Get WGC D3D11 texture");
-    const int mode=gMode.load();
-    if(!optical)optical=std::make_unique<NvFlow>(d3d);
-    if(lastReal){LONGLONG age=Ticks()-lastReal;if(age>freq/500 && age<freq/15)baseInterval=(baseInterval*3+age)/4;}
-    const int slot=nextSlot;nextSlot=(nextSlot+1)%3;
-    if(optical->inputFormat==DXGI_FORMAT_B8G8R8A8_UNORM){
-      d3d.ctx->CopyResource(optical->frames[slot].Get(),captureTex.Get()); // one GPU copy, no CPU readback
-    }else{
-      ComPtr<ID3D11ShaderResourceView> sourceView;
-      Check(d3d.dev->CreateShaderResourceView(captureTex.Get(),nullptr,&sourceView),"Create WGC source SRV for RGBA conversion");
-      d3d.Blit(optical->frames[slot].Get(),sourceView.Get()); // necessary GPU format conversion
+    LONGLONG now=Ticks();
+    if(now-lastStats>=freq/2){
+      const double seconds=double(now-lastStats)/double(freq);
+      wchar_t status[240]{};
+      swprintf_s(status,L"WGC %.1f/s | FG submitted %.1f/s | NvOFA %.1f/s | %u Hz",
+        double(realCount-lastStatReal)/seconds,double(genCount-lastStatGen)/seconds,
+        double(ofCount-lastStatOF)/seconds,hz);
+      Report(status);lastStats=now;lastStatReal=realCount;lastStatGen=genCount;lastStatOF=ofCount;
     }
-    newest.Close();
-    prior=current;current=slot;lastReal=Ticks();realCount++;
-    validFlow=false;
-    // Real and extrapolated frames run through the SAME NvOFA -> HLSL -> DXGI path.
-    // A complete frame pair is required; the first real frame primes the flow history.
-    if(prior>=0){
-      outSlot=(outSlot+1)%3;
-      optical->Execute(prior,current,outSlot);++ofCount;
-      validFlow=true;
-      // A real frame has zero extrapolation, but still consumes the current OF output
-      // and executes the same edge-aware PSMain as generated frames.
-      d3d.Present(optical->frameViews[current].Get(),optical->frameViews[prior].Get(),optical->outputViews[outSlot].Get(),0.0f,true);
-      if(mode>1){pending=1;nextGen=lastReal+baseInterval/mode;}
-      else pending=0;
-    }else pending=0;
-    continue;
-   }
-   int mode=gMode.load();
-   if(mode<=1||!validFlow||pending<=0||pending>=mode){
-    WaitForSingleObject(event,2);continue;
-   }
-   const LONGLONG now=Ticks();
-   if(now<nextGen){const LONGLONG remain=nextGen-now;
-    if(remain>freq/700){DWORD ms=(DWORD)std::min<LONGLONG>(20,(remain*1000)/freq-1);WaitForSingleObject(event,ms?ms:1);}
-    else if(remain>freq/20000)SwitchToThread();
-    continue;
-   }
-   // Do not display predicted frames beyond one source period: stale visuals create a laggy feeling.
-   if(now-lastReal>baseInterval || now-lastReal>freq/15){pending=0;continue;}
-   const float alpha=float(pending)/float(mode);
-   d3d.Present(optical->frameViews[current].Get(),optical->frameViews[prior].Get(),optical->outputViews[outSlot].Get(),alpha,true);
-   genCount++;pending++;nextGen=lastReal+baseInterval*pending/mode;
-   if(pending>=mode)pending=0;
-   // Frame counters are reported regularly in the status title.
+    // Newest-frame mailbox: never build an application-level capture backlog.
+    capture::Direct3D11CaptureFrame newest{nullptr};
+    for(int n=0;n<8;n++){
+      auto frame=pool.TryGetNextFrame();
+      if(!frame)break;
+      if(newest)newest.Close();
+      newest=std::move(frame);
+    }
+    if(newest){
+      auto content=newest.ContentSize();
+      if(content.Width!=int32_t(d3d.sourceW)||content.Height!=int32_t(d3d.sourceH))
+        throw std::runtime_error("Source size changed; restart capture to rebuild optical flow");
+      const auto access=newest.Surface().as<
+        ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+      ComPtr<ID3D11Texture2D> input;
+      Check(access->GetInterface(IID_PPV_ARGS(&input)),"Get WGC D3D11 texture");
+      if(!optical)optical=std::make_unique<NvFlow>(d3d);
+      now=Ticks();
+      if(lastReal){
+        const LONGLONG dt=now-lastReal;
+        if(dt>freq/500&&dt<freq/15)baseInterval=(baseInterval*9+dt)/10;
+      }
+      const int next=nextSlot;nextSlot=(nextSlot+1)%3;
+      if(optical->inputFormat==DXGI_FORMAT_B8G8R8A8_UNORM)
+        d3d.ctx->CopyResource(optical->frames[next].Get(),input.Get());
+      else{
+        ComPtr<ID3D11ShaderResourceView> srv;
+        Check(d3d.dev->CreateShaderResourceView(input.Get(),nullptr,&srv),"Source conversion SRV");
+        d3d.Blit(optical->frames[next].Get(),srv.Get());
+      }
+      newest.Close();
+      prior=current;current=next;lastReal=now;++realCount;
+      validFlow=(prior>=0);realPending=validFlow;pending=0;
+      if(validFlow){
+        // V15 motion direction is CURRENT -> PREVIOUS, required for uv+horizon*flow.
+        outSlot=(outSlot+1)%3;
+        optical->Execute(current,prior,outSlot);++ofCount;
+      }
+    }
+    if(!validFlow){WaitForSingleObject(event,2);continue;}
+    const int mode=std::clamp(gMode.load(),1,4);
+    now=Ticks();
+    const LONGLONG step=std::max<LONGLONG>(scanoutTicks,baseInterval/mode);
+    const LONGLONG age=now-lastReal;
+    // The real frame and all generated frames use exactly the same OFA -> HLSL -> DXGI path.
+    bool submitReal=realPending;
+    bool submitFG=!submitReal && mode>1 && pending>0 && pending<mode &&
+       now>=nextGen && age<=std::min<LONGLONG>(baseInterval+baseInterval/4,freq/15);
+    if(submitReal || submitFG){
+      const DWORD ready=WaitForSingleObject(d3d.frameReady,0);
+      if(ready==WAIT_FAILED)throw std::runtime_error("DXGI frame-ready wait failed");
+      if(ready==WAIT_OBJECT_0){
+        const float horizon=submitReal?0.f:float(std::clamp(
+          double(age)/double(std::max<LONGLONG>(1,baseInterval)),0.0,1.25));
+        d3d.Present(optical->frameViews[current].Get(),optical->frameViews[prior].Get(),
+                    optical->outputViews[outSlot].Get(),horizon,true);
+        if(submitReal){
+          realPending=false;pending=(mode>1)?1:0;
+          nextGen=lastReal+step;
+        }else{
+          ++genCount;++pending;
+          nextGen=lastReal+step*pending;
+        }
+        continue;
+      }
+      HANDLE wake[2]={event,d3d.frameReady};
+      if(WaitForMultipleObjects(2,wake,FALSE,2)==WAIT_FAILED)
+         throw std::runtime_error("Combined WGC/DXGI wait failed");
+      continue;
+    }
+    if(mode<=1||pending==0||pending>=mode){
+      WaitForSingleObject(event,2);continue;
+    }
+    if(age>std::min<LONGLONG>(baseInterval+baseInterval/4,freq/15)){
+      pending=0;continue;
+    }
+    if(now<nextGen){
+      LONGLONG remaining=nextGen-now;
+      if(remaining>freq/700)WaitForSingleObject(event,
+          DWORD(std::clamp<LONGLONG>(remaining*1000/freq-1,1,2)));
+      else SwitchToThread();
+    }
   }
   pool.FrameArrived(token);session.Close();pool.Close();CloseHandle(event);
  }catch(std::exception const& ex){Report(L"Error: "+ToWide(ex.what()));}
