@@ -536,7 +536,7 @@ FramePtr PrepareFrame(wgc::Direct3D11CaptureFrame frame,DxDevices& dx,Flow11& fl
         frame.Close();throw WgcNeedsRecreate("WGC window content size changed");
     }
     auto surface=frame.Surface();
-    auto access=surface.as<::IDirect3DDxgiInterfaceAccess>();
+    auto access=surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
     auto result=std::make_unique<CapturedFrame>();
     result->flowOwner=&flow;
     result->frame=std::move(frame);
