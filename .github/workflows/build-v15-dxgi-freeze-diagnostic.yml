@@ -1,0 +1,80 @@
+name: Build DXGI Freeze Diagnostic
+on:
+  push:
+    branches: [v15clean-v16-dxgi-freeze-test]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic-windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct exact V15 DXGI and apply diagnostic instrumentation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check brotli==1.1.0
+          if($LASTEXITCODE -ne 0){throw 'Brotli installation failed'}
+          python prepare_source.py
+          if($LASTEXITCODE -ne 0){throw 'V15 source reconstruction failed'}
+          python patch_freeze.py
+          if($LASTEXITCODE -ne 0){throw 'DXGI freeze-fix reconstruction failed'}
+          python -c "import pathlib,base64,gzip; p=pathlib.Path('diagnostics/diag_min.py.gz.b64'); pathlib.Path('diag_min.py').write_bytes(gzip.decompress(base64.b64decode(p.read_text())))"
+          if($LASTEXITCODE -ne 0){throw 'Diagnostic script decoding failed'}
+          python diag_min.py
+          if($LASTEXITCODE -ne 0){throw 'Diagnostic patch rejected source'}
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+          if($LASTEXITCODE -ne 0){throw 'Optical Flow SDK headers unavailable'}
+      - name: Compile MSVC optimized diagnostic EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $programFilesX86=[Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhere=Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs=(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if(!$vs){throw 'MSVC x64 not installed'}
+          $vcvars=Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd > build.log 2>&1')
+          $status=$LASTEXITCODE
+          if(Test-Path build.log){Get-Content build.log}
+          if($status -ne 0){throw "MSVC failed with $status"}
+          if(!(Test-Path 'bin/FG-LG-DXGI-FreezeFix.exe')){throw 'Diagnostic EXE not produced'}
+      - name: Make ready-to-run test archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force 'artifacts' | Out-Null
+          Copy-Item bin/FG-LG-DXGI-FreezeFix.exe artifacts/FG-DXGI-Freeze-Diagnostic.exe
+          @'
+          FG V15 Clean V16 - Looking Glass DXGI Freeze Diagnostic
+          1. Extract this ZIP to a normal writable folder, e.g. Desktop\FG-Diagnostic.
+          2. Close any other FG build first.
+          3. Run FG-DXGI-Freeze-Diagnostic.exe and select CS2. Start.
+          4. If the game image freezes, allow it a few seconds if the PC is still responsive.
+          5. Stop or terminate the app through Task Manager if necessary.
+          6. Send back FG-DXGI-Freeze-Report.txt from beside the EXE.
+          7. If that file is missing, inspect %TEMP%\FG-DXGI-Freeze-Report.txt.
+          The log contains stage names and counters, not screenshot pixels.
+          Diagnostic instrumentation may alter timing; this is NOT a latency benchmark.
+          '@ | Set-Content -Encoding UTF8 artifacts/INSTRUCTIONS.txt
+          Compress-Archive -Path artifacts/FG-DXGI-Freeze-Diagnostic.exe, artifacts/INSTRUCTIONS.txt -DestinationPath artifacts/FG-DXGI-Freeze-Diagnostic-Windows-x64.zip -Force
+          Compress-Archive -Path src,diag_min.py,Build.cmd,prepare_source.py,patch_freeze.py,README.md -DestinationPath artifacts/FG-DXGI-Freeze-Diagnostic-Source.zip -Force
+          if(!(Test-Path artifacts/FG-DXGI-Freeze-Diagnostic-Windows-x64.zip)){throw 'No diagnostic ZIP'}
+      - name: Upload diagnostic packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-DXGI-Freeze-Diagnostic-ZIPs
+          path: artifacts/*.zip
+          if-no-files-found: error
+      - name: Upload compile output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-DXGI-Diagnostic-BuildLog
+          path: build.log
+          if-no-files-found: ignore
