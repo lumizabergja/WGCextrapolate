@@ -112,7 +112,7 @@ float4 PS(V i):SV_Target {
     // Reuse V15 Clean V16 shader motion path, with diagnostic overlays optional.
     float2 uv=i.uv;
     float4 base=currentFrame.SampleLevel(samp,uv,0);
-    if(debugMode>1.5 && horizon<=0.00001){
+    if(debugMode>1.5){
         float2 v=flow(uv)*float2(64.0,64.0);
         return float4(saturate(0.5+v.x),saturate(0.5+v.y),saturate(length(v)),1);
     }
@@ -136,6 +136,8 @@ struct D3D {
  ComPtr<ID3D11Device> dev;
  ComPtr<ID3D11DeviceContext> ctx;
  ComPtr<IDXGISwapChain1> swap;
+ ComPtr<IDXGISwapChain2> lowLatencySwap;
+ HANDLE frameReady{}; // Borrowed swapchain waitable object
  ComPtr<ID3D11VertexShader> vs;
  ComPtr<ID3D11PixelShader> ps;
  ComPtr<ID3D11SamplerState> sampler;
@@ -151,7 +153,7 @@ struct D3D {
   D3D_FEATURE_LEVEL obtained{};
   Check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,flags,nullptr,0,D3D11_SDK_VERSION,&dev,&obtained,&ctx),"D3D11CreateDevice");
   ComPtr<ID3D11Multithread> multi;Check(ctx.As(&multi),"Get ID3D11Multithread");multi->SetMultithreadProtected(TRUE);
-  Check(dev.As(&dxgi),"Get IDXGIDevice1");dxgi->SetMaximumFrameLatency(1);
+  Check(dev.As(&dxgi),"Get IDXGIDevice1");
   ComPtr<IDXGIAdapter> adapter;Check(dxgi->GetAdapter(&adapter),"DXGI GetAdapter");
   ComPtr<IDXGIFactory2> factory;Check(adapter->GetParent(IID_PPV_ARGS(&factory)),"DXGI GetFactory");
   ComPtr<IDXGIFactory5> factory5;
@@ -160,9 +162,15 @@ struct D3D {
   desc.Width=outW;desc.Height=outH;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;desc.BufferCount=2;
   desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
   desc.Scaling=DXGI_SCALING_STRETCH;desc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
-  desc.Flags=tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0;
+  // V15 Clean V16: wait on the actual DXGI frame slot instead of filling its queue.
+   desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+        (tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0);
   Check(factory->CreateSwapChainForHwnd(dev.Get(),presenter,&desc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd");
   factory->MakeWindowAssociation(presenter,DXGI_MWA_NO_ALT_ENTER);
+   Check(swap.As(&lowLatencySwap),"Get IDXGISwapChain2");
+   Check(lowLatencySwap->SetMaximumFrameLatency(1),"DXGI max frame latency 1");
+   frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
+   if(!frameReady)throw std::runtime_error("DXGI frame latency handle missing");
   ID3DBlob* vsBlob=nullptr;ID3DBlob* psBlob=nullptr;ID3DBlob* diagnostics=nullptr;
   HRESULT hr=D3DCompile(kShader,strlen(kShader),"embedded.hlsl",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&diagnostics);
   if(FAILED(hr)) {std::string s="VS shader compile: ";if(diagnostics)s.append((char*)diagnostics->GetBufferPointer(),diagnostics->GetBufferSize());if(diagnostics)diagnostics->Release();throw std::runtime_error(s);}
@@ -178,49 +186,73 @@ struct D3D {
   Check(dev->CreateSamplerState(&smp,&sampler),"CreateSamplerState");
   D3D11_BUFFER_DESC bd{};bd.ByteWidth=sizeof(CB);bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
   Check(dev->CreateBuffer(&bd,nullptr,&constants),"CreateConstantBuffer");
+   ComPtr<ID3D11Texture2D> back;
+   Check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Swapchain GetBuffer");
+   Check(dev->CreateRenderTargetView(back.Get(),nullptr,&rtv),"Persistent V15 swap RTV");
  }
+
 
  void Blit(ID3D11Texture2D* dest, ID3D11ShaderResourceView* src){
-  // Only used when NVIDIA advertises RGBA input but not BGRA. 100% GPU-resident.
-  ComPtr<ID3D11RenderTargetView> destRTV;
-  Check(dev->CreateRenderTargetView(dest,nullptr,&destRTV),"Create RGBA conversion RTV");
-  D3D11_VIEWPORT vp{};vp.Width=float(sourceW);vp.Height=float(sourceH);vp.MinDepth=0;vp.MaxDepth=1;
-  ctx->RSSetViewports(1,&vp);ctx->OMSetRenderTargets(1,destRTV.GetAddressOf(),nullptr);
-  ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  ctx->VSSetShader(vs.Get(),nullptr,0);ctx->PSSetShader(ps.Get(),nullptr,0);
-  ctx->PSSetSamplers(0,1,sampler.GetAddressOf());
-  CB cb{};cb.dimensions[0]=float(sourceW);cb.dimensions[1]=float(sourceH);
-  cb.flowDims[0]=float((sourceW+3)/4);cb.flowDims[1]=float((sourceH+3)/4);
-  ctx->UpdateSubresource(constants.Get(),0,nullptr,&cb,0,0);
-  ctx->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-  ID3D11ShaderResourceView* views[3]={src,nullptr,nullptr};ctx->PSSetShaderResources(0,3,views);
-  ctx->Draw(3,0);
-  ID3D11ShaderResourceView* none[3]={nullptr,nullptr,nullptr};ctx->PSSetShaderResources(0,3,none);
-  ID3D11RenderTargetView* nil=nullptr;ctx->OMSetRenderTargets(1,&nil,nullptr);
+   // GPU-only color conversion when the driver requires RGBA instead of BGRA.
+   ComPtr<ID3D11RenderTargetView> destRTV;
+   Check(dev->CreateRenderTargetView(dest,nullptr,&destRTV),"Create GPU conversion RTV");
+   D3D11_VIEWPORT vp{0,0,float(sourceW),float(sourceH),0,1};
+   ctx->RSSetViewports(1,&vp);
+   ctx->OMSetRenderTargets(1,destRTV.GetAddressOf(),nullptr);
+   ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+   ctx->VSSetShader(vs.Get(),nullptr,0);
+   ctx->PSSetShader(ps.Get(),nullptr,0);
+   ctx->VSSetSamplers(0,1,sampler.GetAddressOf());
+   ctx->PSSetSamplers(0,1,sampler.GetAddressOf());
+   CB cb{};cb.horizon=0;
+   cb.invW=1.f/float(sourceW);cb.invH=1.f/float(sourceH);
+   cb.maxMotion=.12f;cb.flowW=float((sourceW+3)/4);cb.flowH=float((sourceH+3)/4);
+   cb.grid=4.f;cb.outputW=float(sourceW);cb.outputH=float(sourceH);
+   ctx->UpdateSubresource(constants.Get(),0,nullptr,&cb,0,0);
+   ctx->VSSetConstantBuffers(0,1,constants.GetAddressOf());
+   ctx->PSSetConstantBuffers(0,1,constants.GetAddressOf());
+   ID3D11ShaderResourceView* views[3]={src,nullptr,src};
+   ctx->VSSetShaderResources(0,3,views);
+   ctx->PSSetShaderResources(0,3,views);
+   ctx->Draw(3,0);
+   ID3D11ShaderResourceView* none[3]={};
+   ctx->VSSetShaderResources(0,3,none);
+   ctx->PSSetShaderResources(0,3,none);
+   ID3D11RenderTargetView* nil=nullptr;ctx->OMSetRenderTargets(1,&nil,nullptr);
+ }
+ void Present(ID3D11ShaderResourceView* latest,ID3D11ShaderResourceView* previous,
+              ID3D11ShaderResourceView* flow,float extrapolate,bool flowValid){
+   D3D11_VIEWPORT vp{0,0,float(outputW),float(outputH),0,1};
+   ctx->RSSetViewports(1,&vp);
+   ctx->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+   ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+   ctx->VSSetShader(vs.Get(),nullptr,0);
+   ctx->PSSetShader(ps.Get(),nullptr,0);
+   ctx->VSSetSamplers(0,1,sampler.GetAddressOf());
+   ctx->PSSetSamplers(0,1,sampler.GetAddressOf());
+   CB cb{};
+   cb.horizon=flowValid?extrapolate:0.f;
+   cb.invW=1.f/float(sourceW);cb.invH=1.f/float(sourceH);
+   cb.maxMotion=.12f;cb.flowW=float((sourceW+3)/4);cb.flowH=float((sourceH+3)/4);
+   cb.grid=4.f;cb.debugMode=float(gDebugMode.load(std::memory_order_relaxed));
+   cb.outputW=float(outputW);cb.outputH=float(outputH);
+   // Disabled center mask: exactly the V15 shader's no-protection configuration.
+   ctx->UpdateSubresource(constants.Get(),0,nullptr,&cb,0,0);
+   ctx->VSSetConstantBuffers(0,1,constants.GetAddressOf());
+   ctx->PSSetConstantBuffers(0,1,constants.GetAddressOf());
+   ID3D11ShaderResourceView* views[3]{latest,flowValid?flow:nullptr,
+                                      previous?previous:latest};
+   ctx->VSSetShaderResources(0,3,views); // V15 scene cut is calculated in VS.
+   ctx->PSSetShaderResources(0,3,views);
+   ctx->Draw(3,0);
+   ID3D11ShaderResourceView* none[3]{};
+   ctx->VSSetShaderResources(0,3,none);
+   ctx->PSSetShaderResources(0,3,none);
+   ID3D11RenderTargetView* nil=nullptr;ctx->OMSetRenderTargets(1,&nil,nullptr);
+   Check(swap->Present(0,tearing?DXGI_PRESENT_ALLOW_TEARING:0),
+         "V15 DXGI low-latency Present");
  }
 
- void Present(ID3D11ShaderResourceView* latest,ID3D11ShaderResourceView* previous,ID3D11ShaderResourceView* flow,float extrapolate,bool flowValid){
-  ComPtr<ID3D11Texture2D> back;Check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"SwapChain GetBuffer");
-  rtv.Reset();Check(dev->CreateRenderTargetView(back.Get(),nullptr,&rtv),"CreateRenderTargetView");
-  D3D11_VIEWPORT vp{};vp.Width=(float)outputW;vp.Height=(float)outputH;vp.MinDepth=0;vp.MaxDepth=1;
-  ctx->RSSetViewports(1,&vp);ctx->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
-  ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  ctx->VSSetShader(vs.Get(),nullptr,0);ctx->PSSetShader(ps.Get(),nullptr,0);
-  ctx->PSSetSamplers(0,1,sampler.GetAddressOf());
-  CB cb{};cb.dimensions[0]=(float)sourceW;cb.dimensions[1]=(float)sourceH;
-  cb.flowDims[0]=(float)((sourceW+3)/4);cb.flowDims[1]=(float)((sourceH+3)/4);
-  cb.extrapolate=extrapolate;cb.hasFlow=flowValid?1.0f:0.0f;cb.debugMode=(float)gDebugMode.load();
-  ctx->UpdateSubresource(constants.Get(),0,nullptr,&cb,0,0);
-  ctx->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-  ID3D11ShaderResourceView* views[3]={latest,previous?previous:latest,flow};ctx->PSSetShaderResources(0,3,views);
-  ctx->Draw(3,0);
-  ID3D11ShaderResourceView* nullViews[3]={nullptr,nullptr,nullptr};ctx->PSSetShaderResources(0,3,nullViews);
-  ID3D11RenderTargetView* nullRTV=nullptr;ctx->OMSetRenderTargets(1,&nullRTV,nullptr);
-  // Present(0) prioritizes low latency and may tear. Output frequency is still scheduled externally.
-  HRESULT hr=swap->Present(0,tearing?DXGI_PRESENT_ALLOW_TEARING:0);
-  Check(hr,"Present");
-  rtv.Reset();
- }
 };
 
 struct NvFlow {
