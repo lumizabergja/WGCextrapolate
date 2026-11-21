@@ -537,20 +537,22 @@ if cleanup_hash != expected_cleanup_hash:
     raise RuntimeError(f'FG v16 clean source mismatch: {cleanup_hash}')
 print('Verified FG v16 cleanup:', cleanup_hash)
 
-# Additional isolated NvFBC community compatibility experiment.
+
+# Looking Glass inspired DXGI 1.5 / D3D11 GPU-only port.
+# Apply only to the SHA-verified V15 Clean v16 source.
 import zlib
 original = out.read_bytes()
 base_sha = "24b2fa5bec64694cf047451a17da84cee6e4ec0ee91c87942d0d6e39601b83ae"
-target_sha = "fb445337af61c569883a67b83fa27587387745425c02775bd1165476edbeecee"
+target_sha = "edf9012b454e2638660806495065a41309cd7a925eb4cd1f5ced465b24220f02"
 if hashlib.sha256(original).hexdigest() != base_sha:
-    raise RuntimeError("Refusing NvFBC community patch on non-V15-v16 source")
-ops = json.loads(zlib.decompress(base64.b64decode((root / "community_delta.b64").read_text(encoding="ascii"))))
+    raise RuntimeError("Refusing Looking Glass DXGI port on unexpected V15 source")
+ops = json.loads(zlib.decompress(base64.b64decode((root/"lg_dxgi_delta.b64").read_text(encoding="ascii"))))
 lines = original.decode("utf-8").splitlines(keepends=True)
-for i, j, replacement in sorted(ops, key=lambda v: v[0], reverse=True):
+for i, j, replacement in sorted(ops, key=lambda op: op[0], reverse=True):
     lines[i:j] = [replacement] if replacement else []
 patched = "".join(lines).encode("utf-8")
-h = hashlib.sha256(patched).hexdigest()
-if h != target_sha:
-    raise RuntimeError(f"NvFBC community source failed SHA256 validation: {h}")
+actual = hashlib.sha256(patched).hexdigest()
+if actual != target_sha:
+    raise RuntimeError(f"DXGI source mismatch: got {actual}, expected {target_sha}")
 out.write_bytes(patched)
-print("V15 community NvFBC source verified:", h)
+print("Verified V15 Looking Glass DXGI source:", actual)

@@ -5,33 +5,35 @@ configuration: Release
 clone_depth: 1
 branches:
   only:
-    - v15-nvfbc-community
+    - v15-lookingglass-dxgi
 install:
   - ps: |
-      $ErrorActionPreference='Stop'
+      $ErrorActionPreference = 'Stop'
       python -m pip install --disable-pip-version-check brotli==1.1.0
-      if($LASTEXITCODE -ne 0){throw 'Brotli for original V15 source reconstruction failed'}
+      if ($LASTEXITCODE -ne 0) { throw 'Python Brotli install failed' }
       python prepare_source.py
-      if($LASTEXITCODE -ne 0){throw 'Verified V15 source reconstruction failed'}
-      powershell -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
-      if($LASTEXITCODE -ne 0){throw 'NvFBC community header download failed'}
+      if ($LASTEXITCODE -ne 0) { throw 'Verified V15 Looking Glass source reconstruction failed' }
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+      if ($LASTEXITCODE -ne 0) { throw 'NVIDIA optical flow header download failed' }
+
 build_script:
   - ps: |
-      $ErrorActionPreference='Stop'
-      $vswhere=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-      $vs=(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-      if(!$vs){throw 'MSVC x64 unavailable'}
-      $vcvars=Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+      $ErrorActionPreference = 'Stop'
+      $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+      $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+      if (!$vs) { throw 'MSVC x64 unavailable' }
+      $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
       & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd > build.log 2>&1')
-      $ec=$LASTEXITCODE
-      if(Test-Path build.log){Get-Content build.log}
-      if($ec -ne 0){throw "C++ compilation failed (exit $ec)"}
-      if(!(Test-Path 'bin/FG.exe')){throw 'Executable missing'}
+      $ec = $LASTEXITCODE
+      if (Test-Path 'build.log') { Get-Content 'build.log' }
+      if ($ec -ne 0) { throw "Windows C++ compile failed ($ec)" }
+      if (!(Test-Path 'bin/FG-LG-DXGI.exe')) { throw 'Executable missing' }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path bin/FG.exe,README.md -DestinationPath artifacts/FG-V15-Community-NvFBC-Windows-x64.zip -Force
+      Compress-Archive -Path bin/FG-LG-DXGI.exe,README.md -DestinationPath artifacts/FG-V15-LookingGlass-DXGI-Windows-x64.zip -Force
+
 artifacts:
-  - path: artifacts/FG-V15-Community-NvFBC-Windows-x64.zip
-    name: FG-V15-Community-NvFBC-Windows-x64
+  - path: artifacts/FG-V15-LookingGlass-DXGI-Windows-x64.zip
+    name: FG-V15-LookingGlass-DXGI-Windows-x64
   - path: build.log
-    name: MSVC-build-log
+    name: MSVC build log
 test: off

@@ -1,11 +1,22 @@
-# FG V15 Clean v16 — Community NvFBC compatibility branch
+# V15 Clean v16 — Looking Glass DXGI Desktop Duplication experimental backend
 
-**Experimental. Not yet verified on the user's RTX 5060 Ti or Windows 10 22H2.**
+Uses open-source Looking Glass B7 **DXGI 1.5 Desktop Duplication design**, adapted to our **same-PC D3D11/NvOFA** extrapolator, without using IVSHMEM or Looking Glass's Windows host executable.
 
-This branch compiles the original V15 v16 DX9Ex -> shared D3D11 -> NvOFA -> DXGI code via SHA-verified reconstruction from the original source patches, then applies a small community NvFBC compatibility patch (hash fb445337af61c569883a67b83fa27587387745425c02775bd1165476edbeecee).
+Pipeline:
+`Selected game monitor → DXGI Output5::DuplicateOutput1 (BGRA8) → one GPU-only CopyResource into reusable D3D11 textures → NvOFA 4x4 FAST → original V15 Clean v16 HLSL → DXGI flip-discard presenter`
 
-Changes: Windows 10 capture-exclusion overlay initialization, the MIT x64 ABI declarations from [NvFBC Relay](https://github.com/garrettsparks/nvfbc-relay), System32-only DLL loading, documented NvFBC CreateEx first, legacy key retry without undocumented game PID block, capture-status/error reporting, no WGC/DXGI capture fallback. **NvFBC captures the selected display, not a specific game's PID**.
+- No Nvidia NvFBC, DLL hacks, WGC, D3D9Ex, CPU readback, D3D11on12, VM, injection or Looking Glass client dependency.
+- Single NVIDIA GPU and display monitor selected from game HWND.
+- Original V15 HLSL shader verified unchanged. Original click-through UI/Start/Stop, dynamic and x2-x6 remain. One synthetic slot reserved in fixed modes, real frames have priority afterward.
+- GPU copy completion fences and D3D11 multithread protection. Skip pointer-only DXGI updates. No copy from flow output to present backbuffer.
+- Overlay capture exclusion is applied before setting WS_EX_LAYERED to avoid Win10 WDA failures.
+- Captures full monitor image, not game PID. At 4:3 stretched CS2 it captures the stretched display image, and NvOFA works at monitor resolution.
+- DXGI can add compositor latency and does not guarantee faster end-to-end capture than WGC; no claimed measurements yet.
 
-Use [AppVeyor](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) to build this isolated branch. If successful, its Artifacts contain FG-V15-Community-NvFBC-Windows-x64.zip.
+**Windows x64 build:** [AppVeyor CI](https://ci.appveyor.com/project/lumizabergja/wgcextrapolate) automatically compiles this branch if build succeeds, publishing `FG-V15-LookingGlass-DXGI-Windows-x64.zip` in Artifacts.
 
-Community [keylase NvFBC wrapper](https://github.com/keylase/nvidia-patch/blob/master/win/nvfbcwrp/README.md) may enable GeForce but system driver modification is not automated here. No guarantee it works for RTX 5060 Ti. Windows NvFBC has been deprecated since Capture SDK 7.1; do not assume a passing compiler build proves it works.
+For local compilation: run `python -m pip install brotli==1.1.0`, `python prepare_source.py`, `powershell -ExecutionPolicy Bypass -File Download-Headers.ps1`, and `Build.cmd` from an x64 Visual Studio Developer Command Prompt.
+
+Port based on the user's original V15 Clean v16 source. Capture design reference: [gnif/LookingGlass DXGI source](https://github.com/gnif/LookingGlass/blob/master/host/platform/Windows/capture/DXGI/src/dxgi.c). No Looking Glass code copied verbatim.
+
+**Status:** Experimental source patch; compilation and live RTX 5060 Ti runtime not yet verified. Compare x4 at 60 native FPS and then x2 at 120 native FPS, both at 240 Hz. Independent Flip is controlled by Windows and not guaranteed by code.
