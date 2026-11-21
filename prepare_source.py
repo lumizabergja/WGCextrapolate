@@ -57,3 +57,20 @@ if checksum(final_data) != final_sha:
     raise SystemExit("STOP: DXGI swapchain startup fix hash mismatch "+checksum(final_data))
 target.write_bytes(final_data)
 print("Verified fullscreen click-through v2 startup source:", final_sha)
+
+# Add the isolated Start/Stop panel, without changing the capture engine.
+# SHA256 checked before and after to ensure the working DXGI path is preserved.
+ui_base = "ed3ef771adfbc4f39b2d2aba97254cef4cca62ecef4d699366491f4c61fcdb2f"
+ui_final = "d9b8b75635ac4077af0a3c64808169cef25f7b087231e074fb3a2741dea37915"
+if checksum(final_data) != ui_base:
+    raise SystemExit("STOP: unexpected v2 fullscreen source before UI patch")
+ops3 = json.loads(zlib.decompress(base64.b64decode(
+    (root / "src" / "start_stop_delta.b64").read_text(encoding="ascii").strip())))
+lines = final_data.decode("utf-8").splitlines(keepends=True)
+for start, stop, replacement in sorted(ops3, key=lambda item: item[0], reverse=True):
+    lines[start:stop] = [replacement] if replacement else []
+startstop = "".join(lines).encode("utf-8")
+if checksum(startstop) != ui_final:
+    raise SystemExit("STOP: Start/Stop source SHA256 mismatch " + checksum(startstop))
+target.write_bytes(startstop)
+print("Verified Looking Glass DXGI Start/Stop UI:", ui_final)

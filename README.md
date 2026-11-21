@@ -1,17 +1,18 @@
-# Looking Glass-style DXGI capture-only v2 — fullscreen + click-through
+# Looking Glass DXGI capture — Start / Stop (no selection)
 
-This branch is based on the **working capture-only v1**. It changes the window and output presentation **only**. No optical flow, interpolation, motion vectors, NvFBC, DLL injection, API capture fallback, or game frame generation.
+This is the proven same-PC **Looking Glass-style DXGI Desktop Duplication fullscreen click-through preview**, now with an ordinary compact **Start** and **Stop** window. No window picker.
 
-**Start:** double-click `FG-LG-Fullscreen.exe`. It creates a full-monitor, always-on-top, borderless, fully opaque image that passes clicks and keyboard focus to the game underneath.
+**Start** launches fullscreen capture on the primary monitor using the same D3D11 output selection, GPU-only CopyResource and preview shader as the previous working v2. **Stop** releases the D3D11 resources and closes only the fullscreen overlay; the small control window remains open and can start capture again.
 
-**Close:** **Ctrl+Alt+F8**. Esc no longer works because the full-screen window never accepts focus. Mouse input remains with the underlying application.
+**Ctrl + Alt + F8** stops capture and restores the controller if minimized. Close the controller window to exit entirely. Minimize to taskbar while gaming; it remains interactive when restored.
 
-The flip swapchain is created before making the window topmost and fullscreen (Microsoft DXGI sample startup sequence).\n\nThe capture path is unchanged: `IDXGIOutput5::DuplicateOutput1` (or DXGI standard DDA for compatibility) → single GPU-only D3D11 `CopyResource` → original preview pixel shader → flip-discard `Present(0, DO_NOT_WAIT)`. Output is stretched to the full selected display, with no letterbox.
+The controller and overlay both request WDA_EXCLUDEFROMCAPTURE to avoid DXGI capture-of-self feedback. The overlay is topmost, borderless, click-through and nonactivating. Start/Stop controller appears above the overlay when visible.
 
-Window capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) is applied **before** setting the layered window style; `WCA_EXCLUDED_FROM_DDA` is requested as an optional DDA protection. A background display mode change updates the fullscreen window and rebuilds the backbuffer.
+No NvOFA, no frame generation, no WGC, no NvFBC, no frame pacing modifications. The `DxgiCaptureOnly` capture engine source matches the prior working v2 exactly.
 
-**Select another monitor:** launch with `--monitor=2`.
+## Build
+AppVeyor builds `lookingglass-capture-start-stop` and publishes `FG-LookingGlass-StartStop-Windows-x64.zip` after successful compilation.
 
-**Known risk:** a layered topmost HWND may affect DXGI flip presentation and independent flip eligibility. This source patch is checksum verified but needs actual Windows x64 compilation and user runtime testing. If the overlay is black, fails to launch, or shows a recursive image, revert to [capture-only v1](../lookingglass-dxgi-capture-only); do not assume self-capture prevention has worked.
+To build locally from this branch: run `python prepare_source.py`, then `Build.cmd` in a Visual Studio x64 Developer Command Prompt. For convenience, the separately provided source ZIP contains the full `src/main.cpp` and can be built with `Build.cmd` without Python. A compiled EXE requires no Python.
 
-Build in an x64 MSVC Developer Command Prompt: `python prepare_source.py` then `Build.cmd`. No Python is needed to run the compiled EXE. AppVeyor builds and publishes `FG-LookingGlass-Fullscreen-ClickThrough-Windows-x64.zip`.
+Compiled and actual click-through behavior on the user's machine must be tested before calling the variant stable. An optional existing `--monitor=N` argument is retained but no monitor/window selection is shown in the UI.
