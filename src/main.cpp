@@ -98,7 +98,9 @@ float2 EdgeAwareFlow(float2 pixel, float centerLuma){
 }
 float4 PSMain(VSOut i):SV_Target{
  float2 uv=saturate(i.uv);float4 current=latestTex.SampleLevel(smoothSample,uv,0);
- if(hasFlow<0.5 || extrapolate<0.001) return float4(current.rgb,1.0);
+ // Both real and generated frames run the same optical-flow-backed shader.
+  // Real frames use extrapolate == 0 and keep their original pixel positions.
+  if(hasFlow<0.5) return float4(current.rgb,1.0);
  float2 pixels=uv*dimensions;
  float2 vec=EdgeAwareFlow(pixels,Luma(current.rgb));
  // A second fixed-point step approximates flow defined at the backward-warped source.
@@ -316,7 +318,7 @@ void Engine(Target target){
   HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!event)throw std::runtime_error("CreateEvent failed");
   auto token=pool.FrameArrived([event](auto const&,auto const&){SetEvent(event);});
   std::unique_ptr<NvFlow> optical;
-  // NvOFA only runs when mode is x2-x4; Off still runs without an NvOFA session.
+  // Shared real/generated path: initialize NvOFA even for Off mode. First capture primes history.
   int current=-1,prior=-1,nextSlot=0,outSlot=0,pending=0;bool validFlow=false;
   LONGLONG freq=Frequency(),lastReal=0,baseInterval=freq/60,nextGen=0;
   size_t realCount=0,genCount=0;
@@ -332,8 +334,7 @@ void Engine(Target target){
     ComPtr<ID3D11Texture2D> captureTex;
     Check(access->GetInterface(IID_PPV_ARGS(&captureTex)),"Get WGC D3D11 texture");
     const int mode=gMode.load();
-    if(mode>1&&!optical)optical=std::make_unique<NvFlow>(d3d);
-    if(mode==1 && !optical)optical=std::make_unique<NvFlow>(d3d); // same texture storage for live Off switching
+    if(!optical)optical=std::make_unique<NvFlow>(d3d);
     if(lastReal){LONGLONG age=Ticks()-lastReal;if(age>freq/500 && age<freq/15)baseInterval=(baseInterval*3+age)/4;}
     const int slot=nextSlot;nextSlot=(nextSlot+1)%3;
     if(optical->inputFormat==DXGI_FORMAT_B8G8R8A8_UNORM){
@@ -346,11 +347,17 @@ void Engine(Target target){
     newest.Close();
     prior=current;current=slot;lastReal=Ticks();realCount++;
     validFlow=false;
-    // Real source frame always submits immediately before optical flow or generated frames.
-    d3d.Present(optical->frameViews[current].Get(),nullptr,nullptr,0,false);
-    if(prior>=0 && mode>1){
-      outSlot=(outSlot+1)%3;optical->Execute(prior,current,outSlot);validFlow=true;
-      pending=1;nextGen=lastReal+baseInterval/mode;
+    // Real and extrapolated frames run through the SAME NvOFA -> HLSL -> DXGI path.
+    // A complete frame pair is required; the first real frame primes the flow history.
+    if(prior>=0){
+      outSlot=(outSlot+1)%3;
+      optical->Execute(prior,current,outSlot);
+      validFlow=true;
+      // A real frame has zero extrapolation, but still consumes the current OF output
+      // and executes the same edge-aware PSMain as generated frames.
+      d3d.Present(optical->frameViews[current].Get(),optical->frameViews[prior].Get(),optical->outputViews[outSlot].Get(),0.0f,true);
+      if(mode>1){pending=1;nextGen=lastReal+baseInterval/mode;}
+      else pending=0;
     }else pending=0;
     continue;
    }
