@@ -1,4 +1,14 @@
-# WGC + NvOFA 4x4 FAST extrapolation — CLEAN implementation
+# WGC + NvOFA 4x4 FAST extrapolation — V15 Clean V16 motion integration
+
+## V15 Clean V16 motion and pacing integration
+This branch keeps the **fresh WGC HWND window capture and NvOFA FAST 4x4 / output cost OFF** backend. It ports the original V15 Clean V16 shader from the repository's `v15-nvfbc-community` source, including 4-neighbor optical-flow interpolation, current/previous color consistency, 5-point scene-cut detection, bounded motion, and the exact scene/occlusion blending logic. Default center protection is disabled (radius 0, feather 0).
+  
+Unlike the early fresh shader, flow is calculated **current -> previous**, which matches V15's shader sampling direction `uv + horizon*flow`. Real frames use horizon 0, generated frames use source-age extrapolation >0, both after NvOFA and through the same shader.
+
+The presenter uses a 2-buffer waitable DXGI flip-discard swapchain, maximum frame latency 1, a fixed backbuffer RTV, `Present(0)` and a 1-slot software scheduling policy. The latest WGC frame replaces stale captures; generated slots are spaced by the measured source interval and limited by the display refresh. Real frames take priority. For a 240 Hz monitor, test x4 with a source near 60 FPS; there cannot be 960 distinct displayed frames from a 240 FPS x4 input on that monitor.
+
+The diagnostic menu still provides a magenta generated-frame marker and an NvOFA flow-vector visualization. Submission counters do not guarantee physical scanout. **This build is an experimental integration; hardware latency and quality are not yet verified.**
+
 
 **This implementation is written from scratch using public Microsoft and NVIDIA documentation.** It contains no old project source, presenters, or shaders.
 
