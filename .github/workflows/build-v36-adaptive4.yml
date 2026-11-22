@@ -1,0 +1,54 @@
+name: Build V36 Adaptive 4-Frame + Persistent Stop (Windows x64)
+
+on:
+  push:
+    branches:
+      - v36-adaptive4-stopfixed-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout V36 source and prior V35 reconstruction
+        uses: actions/checkout@v4
+
+      - name: Prepare V36 patch / dedicated shader validation
+        shell: pwsh
+        run: |
+          python ci/prepare-v36.py
+          if ($LASTEXITCODE -ne 0) { throw 'V36 preparation failed' }
+
+      - name: Rebuild V35 baseline, apply V36 modifications and compile x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath v36-windows-build.log
+          if($LASTEXITCODE -ne 0){throw "V36 Windows compiler failed ($LASTEXITCODE)"}
+          if(-not(Test-Path 'artifacts/FG-V36-Adaptive4Frame-StopFixed-Windows-x64.zip')) {
+            throw 'No compiled V36 ready-to-run ZIP'
+          }
+
+      - name: Check produced executable and archive
+        if: success()
+        shell: pwsh
+        run: |
+          if(-not(Test-Path 'FG-Extrap-V36.exe')){throw 'Missing V36 executable'}
+          Get-Item 'FG-Extrap-V36.exe' | Format-List Name,Length
+          Get-FileHash 'FG-Extrap-V36.exe' -Algorithm SHA256 | Format-List
+          & python -c "import zipfile; p='artifacts/FG-V36-Adaptive4Frame-StopFixed-Windows-x64.zip'; z=zipfile.ZipFile(p); names=z.namelist(); assert any(x.endswith('FG-Extrap-V36.exe') for x in names), names; print('Compiled V36 executable verified in artifact')"
+          if($LASTEXITCODE -ne 0){throw 'V36 ZIP verification failed'}
+
+      - name: Upload V36 ready-to-run ZIP and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V36-Adaptive4Frame-StopFixed-Windows-x64
+          path: |
+            artifacts/FG-V36-Adaptive4Frame-StopFixed-Windows-x64.zip
+            v36-windows-build.log
+          if-no-files-found: warn
