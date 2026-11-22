@@ -58,6 +58,15 @@ $encoded=(Get-Content 'ci/v15-crosshair-update.py.gz.b64' -Raw).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'V15 source-update unpack failed' }
 & python 'ci/v15-crosshair-update.py'
 if ($LASTEXITCODE -ne 0) { throw 'V15 center-mask/native-only/Stop patch failed' }
+# Remove a leftover hover-state reference to the now-deleted resolution segment.
+$uiMain=Get-Content 'source/main.cpp' -Raw
+$orphan='premium::kResolution.Contains(x,y)?3:-1;'
+if ($uiMain.Contains($orphan)) {
+  $uiMain=$uiMain.Replace($orphan,'-1;')
+  [IO.File]::WriteAllText('source/main.cpp',$uiMain,$utf8)
+}
+if ($uiMain.Contains('premium::kResolution')) { throw 'Orphaned NvOFA-resolution UI reference' }
+
 
 
 # GDI+ imaging interfaces inherit IUnknown, which must be declared before
