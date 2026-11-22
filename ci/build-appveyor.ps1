@@ -111,18 +111,20 @@ $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Componen
 if (-not $vs) { throw 'Visual Studio C++ tools were not found' }
 $vcvars = Join-Path ($vs | Select-Object -First 1) 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path $vcvars)) { throw 'vcvars64.bat was not found' }
-$compile = @(
-  '@echo off',
-  'call "' + $vcvars + '"',
-  'if errorlevel 1 exit /b 1',
-  'cd /d "' + $root + '\source"',
-  'rc /nologo /fo app.res app.rc',
-  'if errorlevel 1 exit /b 1',
-  'cl /nologo /std:c++20 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /I "' + $slInclude + '" /I "' + $ofaInclude + '" main.cpp dlss_bridge.cpp nvof_bridge.cpp wgc_capture.cpp app.res /Fe:"' + $root + '\FG-Extrap-V35.exe" /link /SUBSYSTEM:WINDOWS d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib comctl32.lib shell32.lib ole32.lib user32.lib gdi32.lib wintrust.lib crypt32.lib windowsapp.lib',
-  'if errorlevel 1 exit /b 1'
-)
-[IO.File]::WriteAllLines('compile-v35-appveyor.cmd',$compile,[Text.Encoding]::ASCII)
-& cmd.exe /d /c 'compile-v35-appveyor.cmd'
+$batch = @"
+@echo off
+call "$vcvars"
+if errorlevel 1 exit /b 1
+cd /d "$root\source"
+rc /nologo /fo app.res app.rc
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /I "$slInclude" /I "$ofaInclude" main.cpp dlss_bridge.cpp nvof_bridge.cpp wgc_capture.cpp app.res /Fe:"$root\FG-Extrap-V35.exe" /link /SUBSYSTEM:WINDOWS d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib comctl32.lib shell32.lib ole32.lib user32.lib gdi32.lib wintrust.lib crypt32.lib windowsapp.lib
+if errorlevel 1 exit /b 1
+"@
+[IO.File]::WriteAllText('compile-v35-appveyor.cmd', $batch, [Text.Encoding]::ASCII)
+Write-Host 'MSVC batch setup:'
+Get-Content 'compile-v35-appveyor.cmd'
+& cmd.exe /d /c 'call compile-v35-appveyor.cmd'
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'FG-Extrap-V35.exe')) {
   throw 'MSVC compile failed, so no ready-to-run release can be published'
 }
