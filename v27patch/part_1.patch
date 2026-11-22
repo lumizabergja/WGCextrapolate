@@ -1,0 +1,79 @@
+                     const bool active=foreground==target||foreground==outputWindow||GetAncestor(foreground,GA_ROOT)==target;
+-                    if(paused_||!active||IsIconic(target)) { Sleep(2); continue; }
++                    if(paused_||!active||IsIconic(target)) {
++                        if(!suspendedForAltTab) {
++                            if(useWgc_) wgc.Shutdown();
++                            else c.duplication.Reset();
++                            suspendedForAltTab=true;
++                            gLog.Write(useWgc_ ? L"V27 WGC suspended for Alt-Tab/minimize." : L"V27 DXGI duplication released for Alt-Tab/minimize.");
++                        }
++                        Sleep(2);
++                        continue;
++                    }
++                    if(suspendedForAltTab) {
++                        bool recovered=false;
++                        if(useWgc_) {
++                            std::wstring wgcError;
++                            recovered=wgc.Init(target,c.device.Get(),d.qpcFrequency,wgcError);
++                            if(!recovered&&!wgcError.empty())
++                                gLog.Write(L"V27 WGC resume retry: "+wgcError);
++                        } else {
++                            recovered=recreateDxgiDuplication();
++                        }
++                        if(!recovered) {
++                            Sleep(10);
++                            continue;
++                        }
++                        suspendedForAltTab=false;
++                        gLog.Write(useWgc_ ? L"V27 WGC capture resumed after Alt-Tab." : L"V27 DXGI duplication recreated after Alt-Tab.");
++                    }
+ 
+                     DXGI_OUTDUPL_FRAME_INFO info{}; ComPtr<IDXGIResource> resource;
+                     ComPtr<ID3D11Texture2D> desktop; LARGE_INTEGER sourceTimestamp{};
+                     bool wgcFrameHeld=false;
+                     struct FrameLease {IDXGIOutputDuplication* d{};~FrameLease(){if(d)d->ReleaseFrame();}} lease{};
+                     if(!useWgc_) {
+                         HRESULT hr=c.duplication->AcquireNextFrame(16,&info,&resource);
+                         if(hr==DXGI_ERROR_WAIT_TIMEOUT) continue;
++                        if(hr==DXGI_ERROR_ACCESS_LOST) {
++                            gLog.Write(L"V27 DXGI access lost; recreating duplication in-place.");
++                            if(!recreateDxgiDuplication()) { Sleep(10); }
++                            else gLog.Write(L"V27 DXGI duplication recovered from access loss.");
++                            continue;
++                        }
+                         HR(hr,"Acquire captured frame");
+                         lease.d=c.duplication.Get();
+                         if(!info.LastPresentTime.QuadPart||!info.AccumulatedFrames) continue;
+                         sourceTimestamp=info.LastPresentTime;
+                         HR(resource.As(&desktop),"Captured texture");
+@@ -1258,13 +1347,17 @@
+                         if(!wgc.WaitForFrame(workerControlEvent_)) {
+                             if(stop_) break;
+                             continue;
+                         }
+                         bool sizeChanged=false; std::wstring wgcError;
+-                        if(!wgc.TryGetNextFrame(desktop,sourceTimestamp,sizeChanged,wgcError))
+-                            throw std::runtime_error(std::string("WGC frame failure: ")+
+-                                std::string(wgcError.begin(),wgcError.end()));
++                        if(!wgc.TryGetNextFrame(desktop,sourceTimestamp,sizeChanged,wgcError)) {
++                            gLog.Write(L"V27 WGC frame delivery failed; rebuilding capture session: "+wgcError);
++                            wgc.Shutdown();
++                            suspendedForAltTab=true;
++                            Sleep(10);
++                            continue;
++                        }
+                         if(sizeChanged||!desktop) continue;
+                         wgcFrameHeld=true;
+                     }
+ 
+                     HWND currentForeground=GetForegroundWindow();
+@@ -1330,13 +1423,16 @@
+                         else if(clientLeft+width<=sourceDesc.Width&&clientTop+height<=sourceDesc.Height){box.left=clientLeft;box.top=clientTop;}
+                         else if(width<=sourceDesc.Width&&height<=sourceDesc.Height){
+                             box.left=std::min<UINT>(clientLeft,sourceDesc.Width-width);
+                             box.top=std::min<UINT>(clientTop,sourceDesc.Height-height);
+                         } else {
++                            // A minimized/restoring window can briefly report a tiny surface.
++                            // Treat that as a transient Alt-Tab state instead of killing the worker.
+                             c.mailboxes[slot].state.store(CaptureState::kFree,std::memory_order_release);
+                             wgc.ReleaseFrame();

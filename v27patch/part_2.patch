@@ -1,0 +1,83 @@
+-                            throw std::runtime_error("WGC source became smaller than the fixed input; restart after changing resolution.");
++                            Sleep(2);
++                            continue;
+                         }
+                     }
+                     box.right=box.left+width;box.bottom=box.top+height;box.back=1;
+                     c.context->CopySubresourceRegion(c.sharedTextures[slot].Get(),0,0,0,0,desktop.Get(),0,&box);
+                     const UINT64 ready=c.nextCaptureValue++;
+@@ -1353,11 +1449,21 @@
+                     if(producerHistory>=0 && producerHistory<static_cast<int>(kCaptureSlots) && producerHistory!=sourceSlot)
+                         gDLSS.ProducerPrepareMotion(slot,static_cast<UINT>(producerHistory),publishedSequence,
+                             d.captureFence.Get(),ready,d.releaseFence.Get(),producerHistoryDone);
+ 
+                     if(wgcFrameHeld){wgc.ReleaseFrame();wgcFrameHeld=false;}
+-                    if(lease.d){HR(lease.d->ReleaseFrame(),"Release captured frame");lease.d=nullptr;}
++                    if(lease.d){
++                        const HRESULT releaseHr=lease.d->ReleaseFrame();
++                        lease.d=nullptr;
++                        if(releaseHr==DXGI_ERROR_ACCESS_LOST) {
++                            c.duplication.Reset();
++                            suspendedForAltTab=true;
++                            gLog.Write(L"V27 DXGI access lost while releasing a frame; duplication will be recreated in-place.");
++                        } else {
++                            HR(releaseHr,"Release captured frame");
++                        }
++                    }
+                     c.mailboxes[slot].state.store(CaptureState::kReady,std::memory_order_release);
+                     producerCaptured.fetch_add(1,std::memory_order_relaxed);
+                     SetEvent(mailboxEvent);
+                 }
+             } catch(const std::exception& e) {
+@@ -1690,11 +1796,22 @@
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+         } else ShowWindow(hwnd, SW_HIDE);
+         return 0;
+     case WM_NCHITTEST: return HTTRANSPARENT;
+     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+-    case WM_SIZE: if (running_) recreateSwapchain_ = true; return 0;
++    case WM_SIZE:
++        if (running_) {
++            const UINT newWidth=LOWORD(lp);
++            const UINT newHeight=HIWORD(lp);
++            if(wp!=SIZE_MINIMIZED&&newWidth&&newHeight&&
++               (newWidth!=presenterClientWidth_||newHeight!=presenterClientHeight_)) {
++                presenterClientWidth_=newWidth;
++                presenterClientHeight_=newHeight;
++                recreateSwapchain_=true;
++            }
++        }
++        return 0;
+     case WM_KEYDOWN:
+         if (wp == VK_ESCAPE) { stop_ = true; if(workerControlEvent_) SetEvent(workerControlEvent_); return 0; }
+         if (wp == VK_F8) { paused_ = !paused_; if(workerControlEvent_) SetEvent(workerControlEvent_); return 0; }
+         if (wp == VK_F11) { ToggleFullscreen(); return 0; }
+         break;
+--- a/source/wgc_capture.cpp
++++ b/source/wgc_capture.cpp
+@@ -27,11 +27,14 @@
+     (void)target; (void)device; (void)qpcFrequency;
+     error = L"Windows Graphics Capture support was not compiled in. Build V12 with MSVC and the Windows 10/11 SDK C++/WinRT headers.";
+     return false;
+ #else
+     try {
+-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
++        if (!apartmentInitialized_) {
++            winrt::init_apartment(winrt::apartment_type::multi_threaded);
++            apartmentInitialized_ = true;
++        }
+         target_ = target;
+         qpcFrequency_ = qpcFrequency;
+ 
+         ComPtr<IDXGIDevice> dxgiDevice;
+         winrt::check_hresult(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)));
+--- a/source/wgc_capture.h
++++ b/source/wgc_capture.h
+@@ -47,6 +47,7 @@
+     HWND target_{};
+     LARGE_INTEGER qpcFrequency_{};
+     UINT width_{};
+     UINT height_{};
+     bool initialized_{false};
++    bool apartmentInitialized_{false};
+ };

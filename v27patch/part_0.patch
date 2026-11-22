@@ -1,0 +1,91 @@
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -269,10 +269,12 @@
+     HANDLE workerControlEvent_{};
+     std::atomic<bool> stop_{false};
+     std::atomic<bool> paused_{false};
+     std::atomic<bool> running_{false};
+     std::atomic<bool> recreateSwapchain_{false};
++    UINT presenterClientWidth_{};
++    UINT presenterClientHeight_{};
+     bool fullscreen_{true};
+     UINT multiplier_{2};
+     bool lowLatency_{true};
+     bool useWgc_{false};
+     UINT nvofGrid_{4};
+@@ -521,10 +523,15 @@
+         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+     SetWindowDisplayAffinity(presenter_, WDA_EXCLUDEFROMCAPTURE_VALUE);
+     ShowWindow(presenter_, SW_SHOWNOACTIVATE);
+     UpdateWindow(presenter_);
+     ShowWindow(target, SW_SHOW);
++    RECT presenterClient{};
++    if (GetClientRect(presenter_, &presenterClient)) {
++        presenterClientWidth_ = static_cast<UINT>(std::max<LONG>(0, presenterClient.right - presenterClient.left));
++        presenterClientHeight_ = static_cast<UINT>(std::max<LONG>(0, presenterClient.bottom - presenterClient.top));
++    }
+     // Preserve game keyboard/raw-input focus; do not attach input queues.
+     SetForegroundWindow(target);
+     gLog.Write(L"Game retains focus; presenter is non-activating and click-through.");
+     return true;
+ }
+@@ -1233,24 +1240,106 @@
+                 } else {
+                     gLog.Write(c.duplicateOutput1
+                         ? L"V26 producer active: DXGI DuplicateOutput1, three-slot latest-frame mailbox."
+                         : L"V26 producer active: DXGI DuplicateOutput compatibility fallback, three-slot latest-frame mailbox.");
+                 }
++                gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+                 gLog.Write(L"V26 capture ordering: Copy -> capture-fence Signal -> immediate D3D11 Flush -> OFA submit -> release capture frame -> publish mailbox.");
++
++                auto recreateDxgiDuplication=[&]()->bool {
++                    c.duplication.Reset();
++                    c.output5.Reset();
++                    c.output.Reset();
++                    c.duplicateOutput1=false;
++
++                    RECT source{};
++                    if(!GetClientScreenRect(target,source)) return false;
++                    HMONITOR sourceMonitor=MonitorFromRect(&source,MONITOR_DEFAULTTONEAREST);
++                    for(UINT oi=0;;++oi) {
++                        ComPtr<IDXGIOutput> output;
++                        const HRESULT enumHr=c.adapter->EnumOutputs(oi,&output);
++                        if(enumHr==DXGI_ERROR_NOT_FOUND) break;
++                        if(FAILED(enumHr)) return false;
++                        DXGI_OUTPUT_DESC desc{};
++                        if(FAILED(output->GetDesc(&desc))) continue;
++                        if(desc.Monitor==sourceMonitor) {
++                            if(FAILED(output.As(&c.output))) return false;
++                            c.outputDesc=desc;
++                            break;
++                        }
++                    }
++                    if(!c.output) return false;
++
++                    RECT desktop=c.outputDesc.DesktopCoordinates;
++                    RECT clipped{std::max(source.left,desktop.left),std::max(source.top,desktop.top),
++                                 std::min(source.right,desktop.right),std::min(source.bottom,desktop.bottom)};
++                    if(clipped.right<=clipped.left||clipped.bottom<=clipped.top) return false;
++                    const UINT recoveredWidth=static_cast<UINT>(clipped.right-clipped.left);
++                    const UINT recoveredHeight=static_cast<UINT>(clipped.bottom-clipped.top);
++                    if(recoveredWidth!=width||recoveredHeight!=height) return false;
++                    c.sourceRect=clipped;
++
++                    HRESULT duplicateHr=E_FAIL;
++                    if(SUCCEEDED(c.output.As(&c.output5))&&c.output5) {
++                        const DXGI_FORMAT formats[]={DXGI_FORMAT_B8G8R8A8_UNORM};
++                        duplicateHr=c.output5->DuplicateOutput1(c.device.Get(),0,ARRAYSIZE(formats),formats,&c.duplication);
++                        if(SUCCEEDED(duplicateHr)) c.duplicateOutput1=true;
++                        else { c.duplication.Reset(); c.output5.Reset(); }
++                    }
++                    if(!c.duplication) {
++                        duplicateHr=c.output->DuplicateOutput(c.device.Get(),&c.duplication);
++                        if(FAILED(duplicateHr)) return false;
++                    }
++                    return true;
++                };
++
++                bool suspendedForAltTab=false;
+                 uint64_t sequence=0;
+                 while(!stop_&&IsWindow(target)&&IsWindow(outputWindow)) {
+                     HWND foreground=GetForegroundWindow();
