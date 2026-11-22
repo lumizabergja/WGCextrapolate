@@ -1,0 +1,211 @@
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -30,7 +30,7 @@
+ 
+ namespace {
+ 
+-constexpr wchar_t kAppName[] = L"DX12 Presenter V32 - DLSS FG 2x / 3x / 4x / 5x / 6x";
++constexpr wchar_t kAppName[] = L"DX12 Presenter V33 - DLSS FG 2x-6x + Dynamic MFG";
+ constexpr wchar_t kControlClass[] = L"LoLDX12Presenter.Control";
+ constexpr wchar_t kPresenterClass[] = L"LoLDX12Presenter.Output";
+ constexpr UINT WM_APP_STATUS = WM_APP + 1;
+@@ -362,7 +362,7 @@
+     label(L"FG",410,94,30,22);
+     HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+         447,89,110,160,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
+-    for(const wchar_t* option:{L"2x",L"3x",L"4x",L"5x",L"6x"}) SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
++    for(const wchar_t* option:{L"2x",L"3x",L"4x",L"5x",L"6x",L"Dynamic MFG"}) SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(multiplier,CB_SETCURSEL,2,0);
+     label(L"Capture",18,132,60,22);
+     HWND backend=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+@@ -441,10 +441,11 @@
+     if (!IsWindow(target)) { RefreshTargets(); SetWindowTextW(status_, L"That window closed. Select it again."); return; }
+     fullscreen_ = SendDlgItemMessageW(control_, IDC_FULLSCREEN, BM_GETCHECK, 0, 0) == BST_CHECKED;
+     LRESULT selectedMultiplier = SendDlgItemMessageW(control_, IDC_MULTIPLIER, CB_GETCURSEL, 0, 0);
+-    if (selectedMultiplier < 0 || selectedMultiplier > 4) {
+-        SetWindowTextW(status_, L"Choose 2x, 3x, 4x, 5x or 6x before starting."); return;
++    if (selectedMultiplier < 0 || selectedMultiplier > 5) {
++        SetWindowTextW(status_, L"Choose 2x-6x or Dynamic MFG before starting."); return;
+     }
+-    multiplier_ = static_cast<UINT>(selectedMultiplier) + 2;
++    // 0 is an internal sentinel for Streamline Dynamic MFG. Fixed selections map to 2..6.
++    multiplier_ = selectedMultiplier == 5 ? 0u : static_cast<UINT>(selectedMultiplier) + 2u;
+     lowLatency_ = SendDlgItemMessageW(control_,IDC_LOW_LATENCY,BM_GETCHECK,0,0)==BST_CHECKED;
+     LRESULT selectedBackend = SendDlgItemMessageW(control_, IDC_CAPTURE_BACKEND, CB_GETCURSEL, 0, 0);
+     if (selectedBackend < 0 || selectedBackend > 1) {
+@@ -1238,7 +1239,7 @@
+ 
+     try {
+         gLog.Write(L"V26 Late-OFA-wait + latest-frame-latch build. Backend: " + std::wstring(useWgc_ ? L"WGC" : L"DXGI DuplicateOutput1") +
+-                   L" / DX12. Selected multiplier: " + std::to_wstring(multiplier_) + L"x. NVOFA grid request: " +
++                   L" / DX12. Selected FG mode: " + (multiplier_ ? std::to_wstring(multiplier_) + L"x fixed" : std::wstring(L"Dynamic MFG (display refresh)")) + L". NVOFA grid request: " +
+                    std::to_wstring(nvofGrid_) + L"x" + std::to_wstring(nvofGrid_) + L" FAST.");
+         QueryPerformanceFrequency(&d.qpcFrequency);
+         {
+--- a/source/dlss_bridge.h
++++ b/source/dlss_bridge.h
+@@ -26,13 +26,13 @@
+     DeviceFn createDevice{};
+     Log log;
+     UINT rw{},rh{},ow{},oh{};
+-    static constexpr UINT kInputSets = 3;
++    static constexpr UINT kMaxInputSets = 4;
+     struct InputSet {
+         ComPtr<ID3D12Resource> current,motion,depth;
+         ComPtr<ID3D12Fence> completionFence;
+         uint64_t completionValue{};
+     };
+-    InputSet inputSets[kInputSets];
++    InputSet inputSets[kMaxInputSets];
+     ComPtr<ID3D12Resource> previous;
+     bool sr{},fg{},initialized{},history{};
+     bool srEvaluated{};
+@@ -60,7 +60,7 @@
+     void TagBackbuffer(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+     void BeforeFrame(ID3D12CommandQueue*);
+     void DrainInputs(ID3D12CommandQueue*);
+-    ID3D12Resource* InputColor(UINT i) const { return inputSets[i % kInputSets].current.Get(); }
++    ID3D12Resource* InputColor(UINT i) const { return inputSets[i % inputSetCount].current.Get(); }
+     UINT ActiveInputSet() const { return activeInputSet; }
+     void AfterPresent();
+     uint64_t ConsumeInputRecycleWaits() { auto v=inputRecycleWaits; inputRecycleWaits=0; return v; }
+@@ -94,7 +94,8 @@
+     bool framePrepared{};
+     bool frameSlept{};
+     UINT reflexTiming{};
+-    UINT activeInputSet{}, nextInputSet{};
++    UINT activeInputSet{}, nextInputSet{}, inputSetCount{3};
++    bool dynamicMfg{};
+     uint64_t inputRecycleWaits{};
+     uint64_t reflexSleepCount{};
+     double reflexSleepSumMs{}, reflexSleepMaxMs{};
+--- a/source/dlss_bridge.cpp
++++ b/source/dlss_bridge.cpp
+@@ -156,8 +156,8 @@
+     auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=slot*stride;device->CreateUnorderedAccessView(r,nullptr,&d,h);
+ }
+ void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resource* source0,ID3D12Resource* source1,ID3D12Resource* source2,UINT w,UINT h,bool, bool useFG,UINT multiplier,bool boost,UINT nvofGrid,UINT reflexMode,bool nvofCost) {
+-    if (multiplier < 2 || multiplier > 6) throw std::runtime_error("Select a fixed FG multiplier from 2x through 6x.");
+-    device=dev;sr=false;fg=useFG;ow=w;oh=h;rw=w;rh=h;history=false;index=0;srEvaluated=false; reflexTiming=reflexMode; activeInputSet=0; nextInputSet=0; inputRecycleWaits=0;
++    if (multiplier != 0 && (multiplier < 2 || multiplier > 6)) throw std::runtime_error("Select 2x through 6x fixed FG, or Dynamic MFG.");
++    device=dev;sr=false;fg=useFG;ow=w;oh=h;rw=w;rh=h;history=false;index=0;srEvaluated=false; reflexTiming=reflexMode; activeInputSet=0; nextInputSet=0; inputRecycleWaits=0; dynamicMfg=(multiplier==0); inputSetCount=(dynamicMfg || multiplier>=5) ? 4u : 3u;
+     DXGI_ADAPTER_DESC1 ad{};HR(adapter->GetDesc1(&ad),"Adapter desc");
+     sl::AdapterInfo ai{};ai.deviceLUID=(uint8_t*)&ad.AdapterLuid;ai.deviceLUIDSizeInBytes=sizeof(LUID);
+     if(fg) {
+@@ -175,26 +175,53 @@
+         go.colorWidth=w;go.colorHeight=h;go.colorBufferFormat=DXGI_FORMAT_B8G8R8A8_UNORM;
+         go.mvecDepthWidth=rw;go.mvecDepthHeight=rh;go.mvecBufferFormat=DXGI_FORMAT_R16G16_FLOAT;go.depthBufferFormat=DXGI_FORMAT_R32_FLOAT;
+         go.hudLessBufferFormat=DXGI_FORMAT_R16G16B16A16_FLOAT;
++        go.numFramesToGenerate = dynamicMfg ? 1u : multiplier - 1u;
++        // V33: ask Streamline for the real runtime capabilities and a rough VRAM estimate
++        // before enabling FG. This is startup-only and adds no steady-state work.
++        go.flags = sl::DLSSGFlags::eRequestVRAMEstimate;
+         sl::DLSSGState state{};Check(fgState(viewport,state,&go),"DLSS-G capabilities");
+-        if (multiplier - 1 > state.numFramesToGenerateMax)
++        const bool dynamicSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
++        const bool vsyncSupported = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
++        if (dynamicMfg && !dynamicSupported)
++            throw std::runtime_error("Dynamic MFG is not supported by this GPU/driver/runtime. Choose a fixed multiplier.");
++        if (!dynamicMfg && multiplier - 1 > state.numFramesToGenerateMax)
+             throw std::runtime_error("Selected " + std::to_string(multiplier) + "x FG exceeds runtime support (maximum " +
+                 std::to_string(state.numFramesToGenerateMax + 1) + "x). Choose a lower multiplier.");
+-        go.mode = sl::DLSSGMode::eOn;
+-        go.numFramesToGenerate = multiplier - 1;
++        {
++            const double vramMiB = double(state.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0);
++            wchar_t caps[320]{};
++            swprintf_s(caps,L"V33 DLSS-G capabilities: max fixed %ux; Dynamic MFG=%s; VSync support=%s; min dimension=%u; estimated FG VRAM %.1f MiB.",
++                state.numFramesToGenerateMax + 1, dynamicSupported ? L"yes" : L"no",
++                vsyncSupported ? L"yes" : L"no", state.minWidthOrHeight, vramMiB);
++            log(caps);
++        }
+         go.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
++        if (dynamicMfg) {
++            go.mode = sl::DLSSGMode::eDynamic;
++            go.numFramesToGenerate = 1; // ignored by Dynamic MFG
++            go.dynamicTargetFrameRate = 0.0f; // Streamline auto-detects display refresh
++        } else {
++            go.mode = sl::DLSSGMode::eOn;
++            go.numFramesToGenerate = multiplier - 1;
++        }
+         activeOptions = go;
+         suspended = false;
+         framePrepared = false;
+         reportCalls = reportPresents = 0;
+         reportResult = sl::Result::eOk;
+         reportStatus = sl::DLSSGStatus::eOk;
+-        Check(fgOptions(viewport,go),"Enable fixed NVIDIA Frame Generation");
+-        log(L"Requested fixed " + std::to_wstring(multiplier) + L"x FG: " +
+-            std::to_wstring(go.numFramesToGenerate) + L" generated frames per captured frame. Dynamic mode OFF. Runtime max generated frames=" +
+-            std::to_wstring(state.numFramesToGenerateMax));
++        Check(fgOptions(viewport,go), dynamicMfg ? "Enable NVIDIA Dynamic MFG" : "Enable fixed NVIDIA Frame Generation");
++        if (dynamicMfg)
++            log(L"V33 Dynamic MFG enabled: target frame rate auto-detects the active display refresh rate.");
++        else
++            log(L"Requested fixed " + std::to_wstring(multiplier) + L"x FG: " +
++                std::to_wstring(go.numFramesToGenerate) + L" generated frames per captured frame. Runtime max generated frames=" +
++                std::to_wstring(state.numFramesToGenerateMax));
++        log(L"V33 Streamline input ring: " + std::to_wstring(inputSetCount) +
++            L" sets (3 for 2x-4x; 4 for 5x/6x/Dynamic to reduce recycled-input waits).");
+     }
+     auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+-    for(UINT i=0;i<kInputSets;++i) {
++    for(UINT i=0;i<inputSetCount;++i) {
+         Texture(inputSets[i].current,rw,rh,DXGI_FORMAT_R16G16B16A16_FLOAT,read);
+         Texture(inputSets[i].motion,rw,rh,DXGI_FORMAT_R16G16_FLOAT,read);
+         Texture(inputSets[i].depth,rw,rh,DXGI_FORMAT_R32_FLOAT,read);
+@@ -205,10 +232,10 @@
+     constexpr UINT descriptorBlock=8;
+     constexpr UINT sourceSlots=3;
+     constexpr UINT flowSlots=NvofBridge::kFlowSlots;
+-    D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=descriptorBlock*sourceSlots*kInputSets*flowSlots;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=descriptorBlock*sourceSlots*inputSetCount*flowSlots;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+     HR(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)),"Compute descriptors");stride=dev->GetDescriptorHandleIncrementSize(hd.Type);
+     ID3D12Resource* sources[sourceSlots]={source0,source1,source2};
+-    for(UINT set=0;set<kInputSets;++set) for(UINT b=0;b<sourceSlots;++b) for(UINT f=0;f<flowSlots;++f){
++    for(UINT set=0;set<inputSetCount;++set) for(UINT b=0;b<sourceSlots;++b) for(UINT f=0;f<flowSlots;++f){
+         const UINT base=((set*sourceSlots+b)*flowSlots+f)*descriptorBlock;
+         SRV(sources[b],DXGI_FORMAT_B8G8R8A8_UNORM,base+0);SRV(inputSets[set].current.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,base+1);SRV(previous.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,base+2);
+         SRV(nvof.Available()?nvof.Flow(f):nullptr,DXGI_FORMAT_R16G16_SINT,base+3);
+@@ -446,16 +473,16 @@
+     // V18: do not blindly recycle the next round-robin Streamline input set.
+     // Prefer any set whose prior DLSS-G input consumption is already complete,
+     // avoiding an unnecessary GPU queue wait when another set is immediately free.
+-    UINT chosen=kInputSets;
+-    for(UINT n=0;n<kInputSets;++n) {
+-        const UINT candidate=(nextInputSet+n)%kInputSets;
++    UINT chosen=inputSetCount;
++    for(UINT n=0;n<inputSetCount;++n) {
++        const UINT candidate=(nextInputSet+n)%inputSetCount;
+         auto& in=inputSets[candidate];
+         if(!in.completionFence || !in.completionValue || in.completionFence->GetCompletedValue()>=in.completionValue) {
+             chosen=candidate; break;
+         }
+     }
+-    if(chosen==kInputSets) chosen=nextInputSet%kInputSets;
+-    activeInputSet=chosen; nextInputSet=(chosen+1)%kInputSets;
++    if(chosen==inputSetCount) chosen=nextInputSet%inputSetCount;
++    activeInputSet=chosen; nextInputSet=(chosen+1)%inputSetCount;
+     auto& in=inputSets[activeInputSet];
+     if(in.completionFence && in.completionValue && in.completionFence->GetCompletedValue()<in.completionValue) {
+         ++inputRecycleWaits;
+@@ -463,8 +490,8 @@
+     }
+ }
+ void DlssExperiment::DrainInputs(ID3D12CommandQueue* queue) {
+-    for(auto& in:inputSets) if(in.completionFence && in.completionValue)
+-        HR(queue->Wait(in.completionFence.Get(),in.completionValue),"Drain FG input set");
++    for(UINT i=0;i<inputSetCount;++i) { auto& in=inputSets[i]; if(in.completionFence && in.completionValue)
++        HR(queue->Wait(in.completionFence.Get(),in.completionValue),"Drain FG input set"); }
+ }
+ void DlssExperiment::AfterPresent() {
+     if (!fg) return;
+@@ -489,7 +516,7 @@
+     nvof.ResetHistory();
+ }
+ std::wstring DlssExperiment::Status() {
+-    std::wstring s = L"Fixed " + std::to_wstring(activeOptions.numFramesToGenerate + 1) + L"x requested";
++    std::wstring s = dynamicMfg ? L"Dynamic MFG requested" : L"Fixed " + std::to_wstring(activeOptions.numFramesToGenerate + 1) + L"x requested";
+     if (reportResult != sl::Result::eOk)
+         s += L" | SDK error=" + std::to_wstring(static_cast<int>(reportResult));
+     else if (static_cast<unsigned>(reportStatus))

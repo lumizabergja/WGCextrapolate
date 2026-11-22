@@ -1,0 +1,79 @@
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -1175,6 +1175,11 @@
+     std::string captureFailureMessage;
+     std::atomic<uint64_t> producerCaptured{0};
+     std::atomic<uint64_t> producerDropped{0};
++    // V29: measure capture-release cost after mailbox publication. This work is
++    // intentionally off the render critical path and is reported once per second.
++    std::atomic<uint64_t> captureReleaseSamples{0};
++    std::atomic<uint64_t> captureReleaseTicks{0};
++    std::atomic<uint64_t> captureReleaseMaxTicks{0};
+ 
+     auto releaseLiveHistory = [&]() {
+         const int held = c.historySlot.exchange(-1,std::memory_order_acq_rel);
+@@ -1243,7 +1248,8 @@
+                         : L"V26 producer active: DXGI DuplicateOutput compatibility fallback, three-slot latest-frame mailbox.");
+                 }
+                 gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+-                gLog.Write(L"V28 capture ordering: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit -> release capture frame -> publish mailbox.");
++                gLog.Write(L"V28 capture ordering retained: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit.");
++                gLog.Write(L"V29 overlap: publish mailbox immediately after OFA submit; DXGI/WGC ReleaseFrame runs after publication, off the render critical path.");
+ 
+                 auto recreateDxgiDuplication=[&]()->bool {
+                     c.duplication.Reset();
+@@ -1452,6 +1458,17 @@
+                         gDLSS.ProducerPrepareMotion(slot,static_cast<UINT>(producerHistory),publishedSequence,
+                             d.captureFence.Get(),ready,d.releaseFence.Get(),producerHistoryDone);
+ 
++                    // V29: publish immediately after the OFA submission. The renderer only
++                    // consumes the copied D3D12 mailbox resource and waits on readyValue, so
++                    // releasing the original DXGI/WGC capture frame is not a dependency.
++                    // Moving ReleaseFrame after publication lets capture cleanup overlap the
++                    // renderer/OFA path instead of serializing every presented base frame.
++                    c.mailboxes[slot].state.store(CaptureState::kReady,std::memory_order_release);
++                    producerCaptured.fetch_add(1,std::memory_order_relaxed);
++                    SetEvent(mailboxEvent);
++
++                    LARGE_INTEGER releaseBegin{}, releaseEnd{};
++                    QueryPerformanceCounter(&releaseBegin);
+                     if(wgcFrameHeld){wgc.ReleaseFrame();wgcFrameHeld=false;}
+                     if(lease.d){
+                         const HRESULT releaseHr=lease.d->ReleaseFrame();
+@@ -1464,9 +1481,15 @@
+                             HR(releaseHr,"Release captured frame");
+                         }
+                     }
+-                    c.mailboxes[slot].state.store(CaptureState::kReady,std::memory_order_release);
+-                    producerCaptured.fetch_add(1,std::memory_order_relaxed);
+-                    SetEvent(mailboxEvent);
++                    QueryPerformanceCounter(&releaseEnd);
++                    if(releaseEnd.QuadPart>=releaseBegin.QuadPart) {
++                        const uint64_t ticks=static_cast<uint64_t>(releaseEnd.QuadPart-releaseBegin.QuadPart);
++                        captureReleaseSamples.fetch_add(1,std::memory_order_relaxed);
++                        captureReleaseTicks.fetch_add(ticks,std::memory_order_relaxed);
++                        uint64_t observed=captureReleaseMaxTicks.load(std::memory_order_relaxed);
++                        while(observed<ticks && !captureReleaseMaxTicks.compare_exchange_weak(
++                            observed,ticks,std::memory_order_relaxed,std::memory_order_relaxed)) {}
++                    }
+                 }
+             } catch(const std::exception& e) {
+                 captureFailureMessage=e.what();
+@@ -1712,6 +1735,17 @@
+                 d.gpuProfileSamples=0; d.gpuTagSumMs=d.gpuSetupSumMs=d.gpuDrawSumMs=d.gpuFinishSumMs=0; d.gpuTotalSumMs=d.gpuTotalMaxMs=0;
+                 d.dependencySamples=d.captureFencePending=d.nvofFencePending=d.preprocessFencePending=0;
+                 d.presentSamples=0; d.presentSumMs=d.presentMaxMs=0;
++                const uint64_t releaseCount=captureReleaseSamples.exchange(0,std::memory_order_relaxed);
++                const uint64_t releaseTicks=captureReleaseTicks.exchange(0,std::memory_order_relaxed);
++                const uint64_t releaseMaxTicks=captureReleaseMaxTicks.exchange(0,std::memory_order_relaxed);
++                if(releaseCount && d.qpcFrequency.QuadPart>0) {
++                    const double tickMs=1000.0/double(d.qpcFrequency.QuadPart);
++                    wchar_t releaseTiming[280]{};
++                    swprintf_s(releaseTiming,L"V29 capture release off critical path: avg %.3f ms, max %.3f ms (%llu samples).",
++                        (double(releaseTicks)/double(releaseCount))*tickMs,double(releaseMaxTicks)*tickMs,
++                        static_cast<unsigned long long>(releaseCount));
++                    gLog.Write(releaseTiming);
++                }
+                 const uint64_t capturedNow=producerCaptured.load(std::memory_order_relaxed);
+                 const uint64_t droppedNow=producerDropped.load(std::memory_order_relaxed);
+                 const uint64_t capturedDelta=capturedNow-lastCapturedReport;

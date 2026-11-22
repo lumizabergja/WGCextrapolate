@@ -1,0 +1,287 @@
+diff --git a/source/main.cpp b/source/main.cpp
+index 4f7da6c..5240232 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
+ 
+ namespace {
+ 
+-constexpr wchar_t kAppName[] = L"DX12 Presenter V33 - DLSS FG 2x-6x + Dynamic MFG";
++constexpr wchar_t kAppName[] = L"DX12 Presenter V34 - OFA Resolution + Split Ready";
+ constexpr wchar_t kControlClass[] = L"LoLDX12Presenter.Control";
+ constexpr wchar_t kPresenterClass[] = L"LoLDX12Presenter.Output";
+ constexpr UINT WM_APP_STATUS = WM_APP + 1;
+@@ -45,7 +45,8 @@ constexpr UINT kPreprocessQueriesPerFrame = 2;
+ 
+ enum ControlId : int {
+     IDC_TARGET = 100, IDC_REFRESH, IDC_START, IDC_STOP,
+-    IDC_FULLSCREEN, IDC_LOW_LATENCY, IDC_STATUS, IDC_MULTIPLIER, IDC_CAPTURE_BACKEND, IDC_NVOF_GRID, IDC_REFLEX_TIMING, IDC_NVOF_COST
++    IDC_FULLSCREEN, IDC_LOW_LATENCY, IDC_STATUS, IDC_MULTIPLIER, IDC_CAPTURE_BACKEND, IDC_NVOF_GRID, IDC_REFLEX_TIMING, IDC_NVOF_COST,
++    IDC_NVOF_RESOLUTION
+ };
+ 
+ std::wstring WinError(HRESULT hr) {
+@@ -96,6 +97,7 @@ struct CaptureState {
+         UINT64 readyValue{};
+         LARGE_INTEGER sourceTimestamp{};
+         std::atomic<uint64_t> sequence{0};
++        std::atomic<bool> ofaSubmitDone{true};
+     };
+     ComPtr<IDXGIFactory6> factory;
+     ComPtr<IDXGIAdapter1> adapter;
+@@ -254,7 +256,7 @@ private:
+     bool CreateSwapchain(HWND presenter, bool lowLatency, Dx12State& d, bool resize);
+     bool CreatePipeline(Dx12State& d);
+     bool RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 copyReady,
+-                     float syntheticOffsetPixels = 0.0f);
++                     uint64_t frameSequence, float syntheticOffsetPixels = 0.0f);
+     void DestroyDx12(Dx12State& d);
+     static BOOL CALLBACK EnumWindowsProc(HWND, LPARAM);
+     static LRESULT CALLBACK ControlProc(HWND, UINT, WPARAM, LPARAM);
+@@ -280,6 +282,8 @@ private:
+     bool useWgc_{false};
+     UINT nvofGrid_{4};
+     bool nvofCost_{true};
++    UINT nvofWidth_{0};
++    UINT nvofHeight_{0};
+     UINT reflexTiming_{1};
+     RECT windowedRect_{100, 100, 1380, 820};
+ };
+@@ -308,7 +312,7 @@ int App::Run(HINSTANCE instance) {
+     if (!RegisterClasses()) {gDLSS.Shutdown();return 1;}
+     control_ = CreateWindowExW(WS_EX_APPWINDOW, kControlClass, kAppName,
+         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+-        CW_USEDEFAULT, CW_USEDEFAULT, 590, 420, nullptr, nullptr, instance_, nullptr);
++        CW_USEDEFAULT, CW_USEDEFAULT, 590, 465, nullptr, nullptr, instance_, nullptr);
+     if (!control_) {gDLSS.Shutdown();return 1;}
+     CreateControls();
+     RefreshTargets();
+@@ -378,19 +382,25 @@ void App::CreateControls() {
+     SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"4x4 FAST"));
+     SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"8x8 FAST"));
+     SendMessageW(ofGrid,CB_SETCURSEL,2,0);
++    label(L"OFA resolution",18,170,82,22);
++    HWND ofRes=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
++        105,165,230,150,control_,reinterpret_cast<HMENU>(IDC_NVOF_RESOLUTION),instance_,nullptr);
++    for(const wchar_t* option:{L"Native capture resolution",L"1600x900",L"1280x720",L"960x540",L"640x360"})
++        SendMessageW(ofRes,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
++    SendMessageW(ofRes,CB_SETCURSEL,0,0);
+     CreateWindowW(L"BUTTON",L"OFA confidence cost (quality)",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,365,166,195,24,control_,reinterpret_cast<HMENU>(IDC_NVOF_COST),instance_,nullptr);
+     SendDlgItemMessageW(control_,IDC_NVOF_COST,BM_SETCHECK,BST_CHECKED,0);
+-    label(L"Reflex sleep",18,170,80,22);
++    label(L"Reflex sleep",18,208,80,22);
+     HWND reflex=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        105,165,250,120,control_,reinterpret_cast<HMENU>(IDC_REFLEX_TIMING),instance_,nullptr);
++        105,203,250,120,control_,reinterpret_cast<HMENU>(IDC_REFLEX_TIMING),instance_,nullptr);
+     SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Off (Reflex mode)"));
+     SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Pre-capture (V14 behavior)"));
+     SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"After frame arrival"));
+     SendMessageW(reflex,CB_SETCURSEL,1,0);
+-    CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,210,180,36,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,210,210,110,36,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
+-    status_=label(L"Choose capture backend, FG multiplier and Reflex timing, then Start.",18,265,540,65);
+-    label(L"F11 fullscreen | F8 pause | F10 stop",18,345,540,22);
++    CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,180,36,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
++    CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,210,248,110,36,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
++    status_=label(L"Choose capture backend, FG multiplier, OFA resolution and Reflex timing, then Start.",18,300,540,65);
++    label(L"F11 fullscreen | F8 pause | F10 stop",18,388,540,22);
+ }
+ 
+ BOOL CALLBACK App::EnumWindowsProc(HWND hwnd, LPARAM param) {
+@@ -459,6 +469,14 @@ void App::Start() {
+     static constexpr UINT kGridChoices[] = {1u,2u,4u,8u};
+     nvofGrid_ = kGridChoices[selectedGrid];
+     nvofCost_ = SendDlgItemMessageW(control_,IDC_NVOF_COST,BM_GETCHECK,0,0)==BST_CHECKED;
++    LRESULT selectedResolution = SendDlgItemMessageW(control_, IDC_NVOF_RESOLUTION, CB_GETCURSEL, 0, 0);
++    if (selectedResolution < 0 || selectedResolution > 4) {
++        SetWindowTextW(status_, L"Choose an OFA processing resolution before starting."); return;
++    }
++    static constexpr UINT kOFAWidths[]  = {0u,1600u,1280u,960u,640u};
++    static constexpr UINT kOFAHeights[] = {0u, 900u, 720u,540u,360u};
++    nvofWidth_ = kOFAWidths[selectedResolution];
++    nvofHeight_ = kOFAHeights[selectedResolution];
+     LRESULT selectedReflex = SendDlgItemMessageW(control_, IDC_REFLEX_TIMING, CB_GETCURSEL, 0, 0);
+     if (selectedReflex < 0 || selectedReflex > 2) {
+         SetWindowTextW(status_, L"Choose Reflex sleep timing before starting."); return;
+@@ -483,6 +501,9 @@ void App::Start() {
+     EnableWindow(GetDlgItem(control_, IDC_START), FALSE);
+     EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), FALSE);
+     EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), FALSE);
++    EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), FALSE);
++    EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), FALSE);
++    EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), FALSE);
+     EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), FALSE);
+     EnableWindow(GetDlgItem(control_, IDC_STOP), TRUE);
+     worker_ = std::thread(&App::Worker, this, target, presenter_);
+@@ -879,13 +900,13 @@ bool App::InitDx12(HWND, CaptureState& c, uint32_t sourceWidth,
+ }
+ 
+ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 copyReady,
+-                      float syntheticOffsetPixels) {
++                      uint64_t frameSequence, float syntheticOffsetPixels) {
+     sourceSlot %= kCaptureSlots;
+     const int priorHistorySlot = c.historySlot.load(std::memory_order_acquire);
+     const UINT frame = d.swapchain->GetCurrentBackBufferIndex();
+     const auto sourceDesc = d.sharedTextures[sourceSlot]->GetDesc();
+     const auto backDesc = d.backBuffers[frame]->GetDesc();
+-    const bool parallelCopy = gDLSS.HasHardwareMotion() && syntheticOffsetPixels == 0.0f &&
++    const bool parallelCopy = gDLSS.HardwareMotionAvailable() && syntheticOffsetPixels == 0.0f &&
+         (sourceDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0 &&
+         sourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+         backDesc.Dimension == sourceDesc.Dimension && sourceDesc.Width == backDesc.Width &&
+@@ -928,6 +949,37 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+         ++d.rasterFrames;
+     }
+ 
++    // V34 split-ready path: color publication happens before producer-side OFA submission.
++    // The early color copy above can therefore run while nvOFExecuteD3D12 (and, for
++    // reduced OFA resolutions, the GPU downsample) is being queued. Only the motion
++    // path waits for the producer's submission decision.
++    const int expectedHistory = priorHistorySlot;
++    const UINT64 priorHistoryDone = c.lastHistoryDone.load(std::memory_order_acquire);
++    if (gDLSS.HardwareMotionAvailable() && expectedHistory >= 0 &&
++        expectedHistory < static_cast<int>(kCaptureSlots) && expectedHistory != static_cast<int>(sourceSlot)) {
++        unsigned spins=0;
++        LARGE_INTEGER submitWaitStart{},submitWaitNow{}; QueryPerformanceCounter(&submitWaitStart);
++        bool submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
++        while(!submitComplete) {
++            if(spins++ < 256) YieldProcessor(); else SwitchToThread();
++            submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
++            if((spins & 63u)==0u && d.qpcFrequency.QuadPart>0) {
++                QueryPerformanceCounter(&submitWaitNow);
++                if(1000.0*double(submitWaitNow.QuadPart-submitWaitStart.QuadPart)/double(d.qpcFrequency.QuadPart)>5.0)
++                    break;
++            }
++        }
++        if(submitComplete) {
++            bool prepared=gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
++            if(!prepared) {
++                gDLSS.DiscardPreparedMotion(frameSequence);
++                if(gDLSS.PrepareMotion(sourceSlot,static_cast<UINT>(expectedHistory),frameSequence,
++                                       d.captureFence.Get(),copyReady,d.releaseFence.Get(),priorHistoryDone))
++                    gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
++            }
++        }
++    }
++
+     // V26 stage 1: record and submit motion/depth preprocessing on a dedicated
+     // compute queue. This queue waits directly on capture + NVOFA fences. The
+     // presenter queue sees only one final preprocess-fence dependency.
+@@ -1238,9 +1290,10 @@ void App::Worker(HWND target, HWND outputWindow) {
+     };
+ 
+     try {
+-        gLog.Write(L"V26 Late-OFA-wait + latest-frame-latch build. Backend: " + std::wstring(useWgc_ ? L"WGC" : L"DXGI DuplicateOutput1") +
+-                   L" / DX12. Selected FG mode: " + (multiplier_ ? std::to_wstring(multiplier_) + L"x fixed" : std::wstring(L"Dynamic MFG (display refresh)")) + L". NVOFA grid request: " +
+-                   std::to_wstring(nvofGrid_) + L"x" + std::to_wstring(nvofGrid_) + L" FAST.");
++        gLog.Write(L"V34 split-ready + OFA-resolution build. Backend: " + std::wstring(useWgc_ ? L"WGC" : L"DXGI DuplicateOutput1") +
++                   L" / DX12. Selected FG mode: " + (multiplier_ ? std::to_wstring(multiplier_) + L"x fixed" : std::wstring(L"Dynamic MFG (display refresh)")) +
++                   L". NVOFA grid request: " + std::to_wstring(nvofGrid_) + L"x" + std::to_wstring(nvofGrid_) + L" FAST. OFA resolution request: " +
++                   (nvofWidth_ ? std::to_wstring(nvofWidth_) + L"x" + std::to_wstring(nvofHeight_) : std::wstring(L"native")) + L".");
+         QueryPerformanceFrequency(&d.qpcFrequency);
+         {
+             std::wstring reason;
+@@ -1255,7 +1308,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+         if(!InitDx12(outputWindow,c,width,height,lowLatency_,d)) throw std::runtime_error("DX12 initialization failed. See log.");
+         RECT output{};GetClientRect(outputWindow,&output);
+         gDLSS.Init(d.device.Get(),c.adapter.Get(),d.sharedTextures[0].Get(),d.sharedTextures[1].Get(),d.sharedTextures[2].Get(),
+-                   output.right,output.bottom,false,true,multiplier_,true,nvofGrid_,reflexTiming_,nvofCost_);
++                   output.right,output.bottom,false,true,multiplier_,true,nvofGrid_,reflexTiming_,nvofCost_,nvofWidth_,nvofHeight_);
+         if(!CreateSwapchain(outputWindow,lowLatency_,d,false)) throw std::runtime_error("Swapchain creation failed.");
+         D3D12_SHADER_RESOURCE_VIEW_DESC view{};view.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+         view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.Texture2D.MipLevels=1;
+@@ -1285,7 +1338,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                 }
+                 gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+                 gLog.Write(L"V28 capture ordering retained: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit.");
+-                gLog.Write(L"V29 overlap retained: publish mailbox immediately after OFA submit; ReleaseFrame stays off the render critical path.");
++                gLog.Write(L"V34 split-ready: publish color mailbox before OFA submit; early copy overlaps OFA submission/downsample; ReleaseFrame stays off critical path.");
+                 gLog.Write(L"V30: pre-OFA depth/setup runs before the OFA fence wait; Alt-Tab uses retained capture sessions and rebuilds only on real access loss/stall.");
+ 
+                 auto recreateDxgiDuplication=[&]()->bool {
+@@ -1514,18 +1567,11 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     c.mailboxes[slot].readyValue=ready;
+                     c.mailboxes[slot].sourceTimestamp=sourceTimestamp;
+                     c.mailboxes[slot].sequence.store(publishedSequence,std::memory_order_release);
+-                    // OFA waits on the already-submitted capture fence.
+-                    const int producerHistory=c.historySlot.load(std::memory_order_acquire);
+-                    const UINT64 producerHistoryDone=c.lastHistoryDone.load(std::memory_order_acquire);
+-                    if(producerHistory>=0 && producerHistory<static_cast<int>(kCaptureSlots) && producerHistory!=sourceSlot)
+-                        gDLSS.ProducerPrepareMotion(slot,static_cast<UINT>(producerHistory),publishedSequence,
+-                            d.captureFence.Get(),ready,d.releaseFence.Get(),producerHistoryDone);
++                    c.mailboxes[slot].ofaSubmitDone.store(false,std::memory_order_release);
+ 
+-                    // V29: publish immediately after the OFA submission. The renderer only
+-                    // consumes the copied D3D12 mailbox resource and waits on readyValue, so
+-                    // releasing the original DXGI/WGC capture frame is not a dependency.
+-                    // Moving ReleaseFrame after publication lets capture cleanup overlap the
+-                    // renderer/OFA path instead of serializing every presented base frame.
++                    // V34: publish COLOR readiness before producer-side OFA submission.
++                    // The renderer can start the independent early copy immediately while
++                    // the producer queues OFA (and optional OFA-resolution downsample).
+                     c.mailboxes[slot].state.store(CaptureState::kReady,std::memory_order_release);
+                     producerCaptured.fetch_add(1,std::memory_order_relaxed);
+                     SetEvent(mailboxEvent);
+@@ -1536,6 +1582,17 @@ void App::Worker(HWND target, HWND outputWindow) {
+                         gLog.Write(L"V31 presenter shown after first fresh post-Alt-Tab capture.");
+                     }
+ 
++                    // OFA waits on the already-submitted capture fence. ofaSubmitDone is
++                    // a CPU-side submission-complete latch only; it never waits for OFA GPU completion.
++                    const int producerHistory=c.historySlot.load(std::memory_order_acquire);
++                    const UINT64 producerHistoryDone=c.lastHistoryDone.load(std::memory_order_acquire);
++                    if(producerHistory>=0 && producerHistory<static_cast<int>(kCaptureSlots) && producerHistory!=sourceSlot)
++                        gDLSS.ProducerPrepareMotion(slot,static_cast<UINT>(producerHistory),publishedSequence,
++                            d.captureFence.Get(),ready,d.releaseFence.Get(),producerHistoryDone);
++                    c.mailboxes[slot].ofaSubmitDone.store(true,std::memory_order_release);
++
++                    // Capture-frame release remains off the render critical path.
++
+                     LARGE_INTEGER releaseBegin{}, releaseEnd{};
+                     QueryPerformanceCounter(&releaseBegin);
+                     if(wgcFrameHeld){wgc.ReleaseFrame();wgcFrameHeld=false;}
+@@ -1702,21 +1759,8 @@ void App::Worker(HWND target, HWND outputWindow) {
+             lastFrame=now;
+             const UINT64 ready=c.mailboxes[sourceSlot].readyValue;
+             const uint64_t frameSequence=c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire);
+-            const int expectedHistory=c.historySlot.load(std::memory_order_acquire);
+-            const UINT64 priorHistoryDone=c.lastHistoryDone.load(std::memory_order_acquire);
+-            // V26: consume the producer-prepared flow only if it was generated
+-            // against the mailbox that is still the previous actually-presented
+-            // frame. If render advanced history after producer submission, discard
+-            // the mismatched flow and fall back to a correct render-side submit.
+-            bool prepared=gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
+-            if(!prepared && expectedHistory>=0 && expectedHistory<static_cast<int>(kCaptureSlots) && expectedHistory!=sourceSlot) {
+-                gDLSS.DiscardPreparedMotion(frameSequence);
+-                if(gDLSS.PrepareMotion(static_cast<UINT>(sourceSlot),static_cast<UINT>(expectedHistory),frameSequence,
+-                                       d.captureFence.Get(),ready,d.releaseFence.Get(),priorHistoryDone))
+-                    gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
+-            }
+             d.captureTimestamp=c.mailboxes[sourceSlot].sourceTimestamp;
+-            if(!RenderFrame(c,d,static_cast<UINT>(sourceSlot),ready))
++            if(!RenderFrame(c,d,static_cast<UINT>(sourceSlot),ready,frameSequence))
+                 throw std::runtime_error("Present failed. Check NVIDIA Streamline logs.");
+             ++presented;
+ 
+@@ -1875,6 +1919,9 @@ LRESULT App::OnControlMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+         case IDC_STOP: Stop(); EnableWindow(GetDlgItem(control_, IDC_START), TRUE);
+             EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), TRUE);
+             EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), TRUE);
++            EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), TRUE);
++            EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), TRUE);
++            EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), TRUE);
+             EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), TRUE);
+             EnableWindow(GetDlgItem(control_, IDC_STOP), FALSE); return 0;
+         }
+@@ -1892,7 +1939,10 @@ LRESULT App::OnControlMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+         Stop();
+         EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), TRUE);
+         EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), TRUE);
++        EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), TRUE);
++        EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), TRUE);
++        EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), TRUE);
++        EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), TRUE);
+         EnableWindow(GetDlgItem(control_, IDC_START), TRUE);
+         EnableWindow(GetDlgItem(control_, IDC_STOP), FALSE);
+         return 0;

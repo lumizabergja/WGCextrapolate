@@ -1,0 +1,462 @@
+diff --git a/source/dlss_bridge.cpp b/source/dlss_bridge.cpp
+index 3ccbdad..1afe0de 100644
+--- a/source/dlss_bridge.cpp
++++ b/source/dlss_bridge.cpp
+@@ -8,7 +8,6 @@ Texture2D<float4> source : register(t0);
+ Texture2D<int2> nvofFlow : register(t3);
+ Texture2D<uint> nvofCost : register(t4);
+ RWTexture2D<float2> motion : register(u1);
+-RWTexture2D<float> depth : register(u2);
+ 
+ cbuffer Settings : register(b0) {
+     uint width;
+@@ -79,11 +78,23 @@ void ResolveNvof(uint3 id:SV_DispatchThreadID) {
+         if(any(v!=v)||any(abs(v)>512.0)) v=0.0;
+     }
+     motion[id.xy]=v;
+-    depth[id.xy]=0.5;
+ }
+ )HLSL";
+ 
+ 
++static const char kDepthFillShader[] = R"HLSL(
++RWTexture2D<float> depth : register(u2);
++cbuffer Settings : register(b0) {
++    uint width; uint height; uint resetHistory; uint flowGrid;
++    uint flowWidth; uint flowHeight; uint hasCost; uint sourceWidth; uint sourceHeight;
++};
++[numthreads(8,8,1)]
++void FillDepth(uint3 id:SV_DispatchThreadID) {
++    if(id.x>=width||id.y>=height) return;
++    depth[id.xy]=0.5;
++}
++)HLSL";
++
+ static void VerifyRuntime(const std::wstring& path) {
+     WINTRUST_FILE_INFO file{};
+     file.cbStruct = sizeof(file);
+@@ -231,6 +242,18 @@ void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resourc
+         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
+         HR(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&nvofResolvePSO)),"NVOFA resolve pipeline");
+     }
++    {
++        ComPtr<ID3DBlob> code,err;
++        HRESULT hr=D3DCompile(kDepthFillShader,sizeof(kDepthFillShader)-1,nullptr,nullptr,nullptr,
++                              "FillDepth","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&err);
++        if(FAILED(hr)) {
++            std::string msg="Depth pre-pass shader compile failed";
++            if(err) msg += ": "+std::string((const char*)err->GetBufferPointer(),err->GetBufferSize());
++            throw std::runtime_error(msg);
++        }
++        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
++        HR(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&depthFillPSO)),"Depth pre-pass pipeline");
++    }
+     log(L"Native-resolution FG input/output "+std::to_wstring(ow)+L"x"+std::to_wstring(oh)+L"; DLSS scaling is not loaded.");
+     log(nvof.Available()?L"Motion source: NVIDIA Optical Flow Accelerator; V26 flush-first capture + late OFA wait; async D3D12 preprocess queue active.":L"Motion source: original software estimator fallback; direct-source presenter remains active.");
+ }
+@@ -267,6 +290,63 @@ bool DlssExperiment::SelectPreparedMotion(uint64_t sequence,int expectedReferenc
+ bool DlssExperiment::WaitMotion(ID3D12CommandQueue* queue) {
+     return nvof.WaitOnFlow(queue);
+ }
++void DlssExperiment::RecordPreOFA(ID3D12GraphicsCommandList* list,UINT sourceIndex) {
++    PrepareFrame(false);
++    framePrepared=false; frameSlept=false;
++    auto& in=inputSets[activeInputSet];
++    Marker(sl::PCLMarker::eSimulationStart);Marker(sl::PCLMarker::eSimulationEnd);
++    sl::Constants c{};
++    sl::float4x4 identity{};identity[0]={1,0,0,0};identity[1]={0,1,0,0};identity[2]={0,0,1,0};identity[3]={0,0,0,1};
++    c.cameraViewToClip=identity;c.clipToCameraView=identity;c.clipToLensClip=identity;c.clipToPrevClip=identity;c.prevClipToClip=identity;
++    c.jitterOffset={0,0};c.mvecScale={1.0f/rw,1.0f/rh};c.cameraPinholeOffset={0,0};
++    c.cameraPos={0,0,0};c.cameraUp={0,1,0};c.cameraRight={1,0,0};c.cameraFwd={0,0,1};
++    c.cameraNear=0.1f;c.cameraFar=1000;c.cameraFOV=1.04719755f;c.cameraAspectRatio=float(ow)/oh;
++    c.motionVectorsInvalidValue=65504;c.depthInverted=sl::eFalse;c.cameraMotionIncluded=sl::eTrue;
++    const bool nvofFlowReady=nvof.Available()&&nvof.FlowReady();
++    const bool resetThisFrame=!history||(nvof.Available()&&!nvofFlowReady);
++    c.motionVectors3D=sl::eFalse;c.reset=resetThisFrame?sl::eTrue:sl::eFalse;c.orthographicProjection=sl::eTrue;
++    Check(constants(c,*token,viewport),"Set synthetic flat-plane constants");
++
++    const auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    ID3D12DescriptorHeap* hs[]={heap.Get()};list->SetDescriptorHeaps(1,hs);list->SetComputeRootSignature(root.Get());
++    auto table=heap->GetGPUDescriptorHandleForHeapStart();
++    const UINT flowSlot=nvof.Available()?nvof.ActiveFlowSlot():0u;
++    table.ptr+=SIZE_T(((activeInputSet*3u+(sourceIndex%3u))*NvofBridge::kFlowSlots+flowSlot)*8u)*stride;
++    list->SetComputeRootDescriptorTable(0,table);
++    UINT settings[]={rw,rh,resetThisFrame?1u:0u,nvof.Available()?nvof.Grid():4u,
++                     nvof.Available()?nvof.FlowWidth():0u,nvof.Available()?nvof.FlowHeight():0u,
++                     nvof.Available()&&nvof.HasCost()?1u:0u,
++                     nvof.Available()?nvof.SourceWidth():rw,nvof.Available()?nvof.SourceHeight():rh};
++    list->SetComputeRoot32BitConstants(1,9,settings,0);
++    Transition(list,in.depth.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    list->SetPipelineState(depthFillPSO.Get());
++    list->Dispatch((rw+7)/8,(rh+7)/8,1);
++    Transition(list,in.depth.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,read);
++}
++
++void DlssExperiment::RecordMotionResolve(ID3D12GraphicsCommandList* list,ID3D12Resource* source,UINT sourceIndex,bool sharedCopyRead) {
++    auto& in=inputSets[activeInputSet];
++    const bool nvofFlowReady=nvof.Available()&&nvof.FlowReady();
++    if(!nvofFlowReady) { RecordPreprocess(list,source,sourceIndex,sharedCopyRead); return; }
++    const bool resetThisFrame=!history;
++    const auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    if(!sharedCopyRead) Transition(list,source,D3D12_RESOURCE_STATE_COMMON,read);
++    ID3D12DescriptorHeap* hs[]={heap.Get()};list->SetDescriptorHeaps(1,hs);list->SetComputeRootSignature(root.Get());
++    auto table=heap->GetGPUDescriptorHandleForHeapStart();
++    const UINT flowSlot=nvof.ActiveFlowSlot();
++    table.ptr+=SIZE_T(((activeInputSet*3u+(sourceIndex%3u))*NvofBridge::kFlowSlots+flowSlot)*8u)*stride;
++    list->SetComputeRootDescriptorTable(0,table);
++    UINT settings[]={rw,rh,resetThisFrame?1u:0u,nvof.Grid(),nvof.FlowWidth(),nvof.FlowHeight(),
++                     nvof.HasCost()?1u:0u,nvof.SourceWidth(),nvof.SourceHeight()};
++    list->SetComputeRoot32BitConstants(1,9,settings,0);
++    Transition(list,in.motion.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    nvof.BeginRead(list);
++    list->SetPipelineState(nvofResolvePSO.Get());list->Dispatch((rw+7)/8,(rh+7)/8,1);
++    nvof.EndRead(list);
++    Transition(list,in.motion.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,read);
++    history=true;
++}
++
+ void DlssExperiment::RecordPreprocess(ID3D12GraphicsCommandList* list,ID3D12Resource* source,UINT sourceIndex,bool sharedCopyRead) {
+     PrepareFrame(false); // Fallback only; worker normally prepares according to selected timing.
+     framePrepared = false; frameSlept = false;
+@@ -320,6 +400,7 @@ void DlssExperiment::RecordPreprocess(ID3D12GraphicsCommandList* list,ID3D12Reso
+     Transition(list,in.motion.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     Transition(list,in.depth.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     if(nvofFlowReady) {
++        list->SetPipelineState(depthFillPSO.Get());list->Dispatch((rw+7)/8,(rh+7)/8,1);
+         nvof.BeginRead(list);
+         list->SetPipelineState(nvofResolvePSO.Get());list->Dispatch((rw+7)/8,(rh+7)/8,1);
+         nvof.EndRead(list);
+@@ -432,7 +513,7 @@ void DlssExperiment::Release() {
+     nvof.Shutdown();
+     token=nullptr;framePrepared=false;frameSlept=false;history=false;previous.Reset();
+     for(auto& in:inputSets){in.current.Reset();in.motion.Reset();in.depth.Reset();in.completionFence.Reset();in.completionValue=0;}
+-    resamplePSO.Reset();motionPSO.Reset();nvofResolvePSO.Reset();root.Reset();heap.Reset();device.Reset();
++    resamplePSO.Reset();motionPSO.Reset();nvofResolvePSO.Reset();depthFillPSO.Reset();root.Reset();heap.Reset();device.Reset();
+ }
+ void DlssExperiment::Shutdown() {
+     Release();if(initialized&&shutdown)shutdown();initialized=false;
+diff --git a/source/dlss_bridge.h b/source/dlss_bridge.h
+index d93908c..363bcd2 100644
+--- a/source/dlss_bridge.h
++++ b/source/dlss_bridge.h
+@@ -53,6 +53,8 @@ public:
+     bool MotionWouldBlockNow() const { return nvof.Available() && nvof.FlowPending(); }
+     void MarkMotionConsumed(ID3D12Fence* fence,uint64_t value) { nvof.MarkActiveConsumed(fence,value); }
+     bool HasHardwareMotion() const { return nvof.Available() && nvof.FlowReady(); }
++    void RecordPreOFA(ID3D12GraphicsCommandList*,UINT sourceIndex);
++    void RecordMotionResolve(ID3D12GraphicsCommandList*,ID3D12Resource*,UINT,bool sharedCopyRead);
+     void RecordPreprocess(ID3D12GraphicsCommandList*,ID3D12Resource*,UINT,bool sharedCopyRead);
+     void TagInputs(ID3D12GraphicsCommandList*);
+     void TagBackbuffer(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+@@ -74,6 +76,7 @@ public:
+     void Marker(sl::PCLMarker m);
+     std::wstring Status();
+     void ResetHistory() { history=false; nvof.ResetHistory(); }
++    void ResetAfterDiscontinuity() { framePrepared=false; frameSlept=false; history=false; nvof.ResetHistory(); }
+     void Release();
+     void Shutdown();
+     void EndRuntime() {if(initialized&&shutdown)shutdown();initialized=false;}
+@@ -82,7 +85,7 @@ private:
+     uint32_t index{};
+     ComPtr<ID3D12DescriptorHeap> heap;
+     ComPtr<ID3D12RootSignature> root;
+-    ComPtr<ID3D12PipelineState> resamplePSO,motionPSO,nvofResolvePSO;
++    ComPtr<ID3D12PipelineState> resamplePSO,motionPSO,nvofResolvePSO,depthFillPSO;
+     ComPtr<ID3D12Device> device;
+     NvofBridge nvof;
+     UINT stride{};
+diff --git a/source/main.cpp b/source/main.cpp
+index 28e8bc2..59276ed 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -141,6 +141,7 @@ struct Dx12State {
+     uint64_t copySamples{};
+     double copySumMs{}, copyMaxMs{}, joinGapSumMs{}, joinGapMaxMs{};
+     ComPtr<ID3D12CommandAllocator> preprocessAllocators[kAllocatorCount];
++    ComPtr<ID3D12GraphicsCommandList> preOFAList;
+     ComPtr<ID3D12GraphicsCommandList> preprocessList;
+     ComPtr<ID3D12RootSignature> rootSignature;
+     ComPtr<ID3D12PipelineState> pipeline;
+@@ -813,6 +814,10 @@ bool App::InitDx12(HWND, CaptureState& c, uint32_t sourceWidth,
+         d.transferAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.transferCopyList)), "Create transfer copy list");
+     HR(d.transferCopyList->Close(), "Close transfer copy list");
+     hr = d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
++        d.preprocessAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.preOFAList));
++    if (FAILED(hr)) return false;
++    d.preOFAList->Close();
++    hr = d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+         d.preprocessAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.preprocessList));
+     if (FAILED(hr)) return false;
+     d.preprocessList->Close();
+@@ -938,16 +943,28 @@ bool App::RenderFrame(CaptureState& c,Dx12State& d,UINT sourceSlot,UINT64 copyRe
+ 
+     HRESULT hr = d.preprocessAllocators[preprocessAllocatorIndex]->Reset();
+     if (FAILED(hr)) return false;
+-    hr = d.preprocessList->Reset(d.preprocessAllocators[preprocessAllocatorIndex].Get(), nullptr);
+-    if (FAILED(hr)) return false;
+ 
+     // DLSS-G input-set reuse must be synchronized on the queue that writes those
+     // inputs, not merely on the final presenter queue.
+     gDLSS.BeforeFrame(d.preprocessQueue.Get());
+ 
++    const bool splitPreprocess = gDLSS.HasHardwareMotion();
++    if (splitPreprocess) {
++        hr = d.preOFAList->Reset(d.preprocessAllocators[preprocessAllocatorIndex].Get(), nullptr);
++        if (FAILED(hr)) return false;
++        gDLSS.RecordPreOFA(d.preOFAList.Get(), sourceSlot);
++        hr = d.preOFAList->Close();
++        if (FAILED(hr)) return false;
++    }
++
++    hr = d.preprocessList->Reset(d.preprocessAllocators[preprocessAllocatorIndex].Get(), nullptr);
++    if (FAILED(hr)) return false;
+     const UINT preprocessQueryBase = preprocessAllocatorIndex * kPreprocessQueriesPerFrame;
+     d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 0);
+-    gDLSS.RecordPreprocess(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
++    if (splitPreprocess)
++        gDLSS.RecordMotionResolve(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
++    else
++        gDLSS.RecordPreprocess(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
+     d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 1);
+     d.preprocessList->ResolveQueryData(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                        preprocessQueryBase, kPreprocessQueriesPerFrame,
+@@ -960,6 +977,13 @@ bool App::RenderFrame(CaptureState& c,Dx12State& d,UINT sourceSlot,UINT64 copyRe
+     if (d.captureFence->GetCompletedValue() < copyReady) ++d.captureFencePending;
+     if (gDLSS.MotionWouldBlockNow()) ++d.nvofFencePending;
+ 
++    // V30 split preprocessing: depth/constants setup is independent of NVOFA.
++    // Submit that work before the OFA fence wait, then wait only immediately
++    // before the motion-vector resolve that actually consumes OFA output.
++    if (splitPreprocess) {
++        ID3D12CommandList* preLists[] = { d.preOFAList.Get() };
++        d.preprocessQueue->ExecuteCommandLists(1, preLists);
++    }
+     hr = d.preprocessQueue->Wait(d.captureFence.Get(), copyReady);
+     if (FAILED(hr)) return false;
+     if (!gDLSS.WaitMotion(d.preprocessQueue.Get())) return false;
+@@ -1249,7 +1273,8 @@ void App::Worker(HWND target, HWND outputWindow) {
+                 }
+                 gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+                 gLog.Write(L"V28 capture ordering retained: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit.");
+-                gLog.Write(L"V29 overlap: publish mailbox immediately after OFA submit; DXGI/WGC ReleaseFrame runs after publication, off the render critical path.");
++                gLog.Write(L"V29 overlap retained: publish mailbox immediately after OFA submit; ReleaseFrame stays off the render critical path.");
++                gLog.Write(L"V30: pre-OFA depth/setup runs before the OFA fence wait; Alt-Tab uses retained capture sessions and rebuilds only on real access loss/stall.");
+ 
+                 auto recreateDxgiDuplication=[&]()->bool {
+                     c.duplication.Reset();
+@@ -1299,36 +1324,43 @@ void App::Worker(HWND target, HWND outputWindow) {
+                 };
+ 
+                 bool suspendedForAltTab=false;
++                unsigned wgcStallTimeouts=0;
+                 uint64_t sequence=0;
+                 while(!stop_&&IsWindow(target)&&IsWindow(outputWindow)) {
+                     HWND foreground=GetForegroundWindow();
+                     const bool active=foreground==target||foreground==outputWindow||GetAncestor(foreground,GA_ROOT)==target;
+                     if(paused_||!active||IsIconic(target)) {
+                         if(!suspendedForAltTab) {
+-                            if(useWgc_) wgc.Shutdown();
+-                            else c.duplication.Reset();
++                            if(useWgc_) wgc.ReleaseFrame();
+                             suspendedForAltTab=true;
+-                            gLog.Write(useWgc_ ? L"V27 WGC suspended for Alt-Tab/minimize." : L"V27 DXGI duplication released for Alt-Tab/minimize.");
++                            wgcStallTimeouts=0;
++                            gLog.Write(useWgc_ ? L"V30 WGC soft-suspended for Alt-Tab; capture session retained."
++                                               : L"V30 DXGI soft-suspended for Alt-Tab; duplication retained.");
+                         }
+                         Sleep(2);
+                         continue;
+                     }
+                     if(suspendedForAltTab) {
+-                        bool recovered=false;
++                        bool recovered=true;
+                         if(useWgc_) {
+                             std::wstring wgcError;
+-                            recovered=wgc.Init(target,c.device.Get(),d.qpcFrequency,wgcError);
+-                            if(!recovered&&!wgcError.empty())
+-                                gLog.Write(L"V27 WGC resume retry: "+wgcError);
+-                        } else {
++                            if(!wgc.Available()) recovered=wgc.Init(target,c.device.Get(),d.qpcFrequency,wgcError);
++                            else recovered=wgc.DrainQueuedFrames(wgcError);
++                            if(!recovered) {
++                                gLog.Write(L"V30 WGC retained session was not reusable; rebuilding in-place: "+wgcError);
++                                wgc.Shutdown();
++                                wgcError.clear();
++                                recovered=wgc.Init(target,c.device.Get(),d.qpcFrequency,wgcError);
++                                if(!recovered&&!wgcError.empty()) gLog.Write(L"V30 WGC resume retry: "+wgcError);
++                            }
++                        } else if(!c.duplication) {
+                             recovered=recreateDxgiDuplication();
+                         }
+-                        if(!recovered) {
+-                            Sleep(10);
+-                            continue;
+-                        }
++                        if(!recovered) { Sleep(10); continue; }
+                         suspendedForAltTab=false;
+-                        gLog.Write(useWgc_ ? L"V27 WGC capture resumed after Alt-Tab." : L"V27 DXGI duplication recreated after Alt-Tab.");
++                        wgcStallTimeouts=0;
++                        gLog.Write(useWgc_ ? L"V30 WGC resumed after Alt-Tab without restarting the presenter."
++                                           : L"V30 DXGI resumed after Alt-Tab without restarting the presenter.");
+                     }
+ 
+                     DXGI_OUTDUPL_FRAME_INFO info{}; ComPtr<IDXGIResource> resource;
+@@ -1339,9 +1371,9 @@ void App::Worker(HWND target, HWND outputWindow) {
+                         HRESULT hr=c.duplication->AcquireNextFrame(16,&info,&resource);
+                         if(hr==DXGI_ERROR_WAIT_TIMEOUT) continue;
+                         if(hr==DXGI_ERROR_ACCESS_LOST) {
+-                            gLog.Write(L"V27 DXGI access lost; recreating duplication in-place.");
+-                            if(!recreateDxgiDuplication()) { Sleep(10); }
+-                            else gLog.Write(L"V27 DXGI duplication recovered from access loss.");
++                            c.duplication.Reset();
++                            suspendedForAltTab=true;
++                            gLog.Write(L"V30 DXGI access lost; duplication will be rebuilt on the active resume path.");
+                             continue;
+                         }
+                         HR(hr,"Acquire captured frame");
+@@ -1350,13 +1382,21 @@ void App::Worker(HWND target, HWND outputWindow) {
+                         sourceTimestamp=info.LastPresentTime;
+                         HR(resource.As(&desktop),"Captured texture");
+                     } else {
+-                        if(!wgc.WaitForFrame(workerControlEvent_)) {
++                        bool timedOut=false;
++                        if(!wgc.WaitForFrame(workerControlEvent_,250,timedOut)) {
+                             if(stop_) break;
++                            if(timedOut && ++wgcStallTimeouts>=2) {
++                                gLog.Write(L"V30 WGC produced no frames for 500 ms while active; rebuilding the capture session in-place.");
++                                wgc.Shutdown();
++                                suspendedForAltTab=true;
++                                wgcStallTimeouts=0;
++                            }
+                             continue;
+                         }
++                        wgcStallTimeouts=0;
+                         bool sizeChanged=false; std::wstring wgcError;
+                         if(!wgc.TryGetNextFrame(desktop,sourceTimestamp,sizeChanged,wgcError)) {
+-                            gLog.Write(L"V27 WGC frame delivery failed; rebuilding capture session: "+wgcError);
++                            gLog.Write(L"V30 WGC frame delivery failed; rebuilding capture session in-place: "+wgcError);
+                             wgc.Shutdown();
+                             suspendedForAltTab=true;
+                             Sleep(10);
+@@ -1476,7 +1516,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                         if(releaseHr==DXGI_ERROR_ACCESS_LOST) {
+                             c.duplication.Reset();
+                             suspendedForAltTab=true;
+-                            gLog.Write(L"V27 DXGI access lost while releasing a frame; duplication will be recreated in-place.");
++                            gLog.Write(L"V30 DXGI access lost while releasing a frame; duplication will be rebuilt on resume.");
+                         } else {
+                             HR(releaseHr,"Release captured frame");
+                         }
+@@ -1546,17 +1586,29 @@ void App::Worker(HWND target, HWND outputWindow) {
+ 
+         auto lastReport=std::chrono::steady_clock::now();auto lastFrame=lastReport;
+         uint64_t lastCapturedReport=0,lastDroppedReport=0;
+-        unsigned presented=0;bool visible=true;
++        unsigned presented=0;bool visible=true;bool renderSuspended=false;
+         while(!stop_&&IsWindow(target)&&IsWindow(outputWindow)) {
+             HWND foreground=GetForegroundWindow();
+             bool active=foreground==target||foreground==outputWindow||GetAncestor(foreground,GA_ROOT)==target;
+             if(paused_||!active||IsIconic(target)) {
+-                focus_compat::Enable(false);
+-                gDLSS.Suspend(true);
+-                if(visible){PostMessageW(outputWindow,WM_APP_OUTPUT_VISIBILITY,FALSE,0);visible=false;}
+-                releaseLiveHistory();Sleep(5);continue;
++                if(!renderSuspended) {
++                    focus_compat::Enable(false);
++                    if(visible){PostMessageW(outputWindow,WM_APP_OUTPUT_VISIBILITY,FALSE,0);visible=false;}
++                    releaseLiveHistory();
++                    gDLSS.ResetAfterDiscontinuity();
++                    renderSuspended=true;
++                    gLog.Write(L"V30 presenter soft-suspended for Alt-Tab; Streamline/DLSS-G instance retained.");
++                }
++                Sleep(5);continue;
++            }
++            if(renderSuspended) {
++                releaseLiveHistory();
++                gDLSS.ResetAfterDiscontinuity();
++                lastFrame=std::chrono::steady_clock::now();
++                renderSuspended=false;
++                gLog.Write(L"V30 presenter resumed in-place after Alt-Tab with temporal history reset.");
+             }
+-            focus_compat::Enable(true);gDLSS.Suspend(false);
++            focus_compat::Enable(true);
+             if(!visible){PostMessageW(outputWindow,WM_APP_OUTPUT_VISIBILITY,TRUE,0);visible=true;}
+             if(recreateSwapchain_.exchange(false))throw std::runtime_error("Output resized: press Start again to rebuild DLSS resources.");
+             if(stop_||paused_)continue;
+diff --git a/source/wgc_capture.cpp b/source/wgc_capture.cpp
+index 75a1646..37b4573 100644
+--- a/source/wgc_capture.cpp
++++ b/source/wgc_capture.cpp
+@@ -89,18 +89,46 @@ bool WgcCaptureBackend::Init(HWND target, ID3D11Device* device, LARGE_INTEGER qp
+ #endif
+ }
+ 
+-bool WgcCaptureBackend::WaitForFrame(HANDLE controlEvent) {
++bool WgcCaptureBackend::WaitForFrame(HANDLE controlEvent, DWORD timeoutMs, bool& timedOut) {
++    timedOut = false;
+ #if !V12_HAS_WGC
+-    (void)controlEvent;
++    (void)controlEvent; (void)timeoutMs;
+     return false;
+ #else
+     if (!frameEvent_ || !controlEvent) return false;
+     HANDLE waits[2]{controlEvent, frameEvent_};
+-    const DWORD result = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
++    const DWORD result = WaitForMultipleObjects(2, waits, FALSE, timeoutMs);
++    if (result == WAIT_TIMEOUT) { timedOut = true; return false; }
+     return result == WAIT_OBJECT_0 + 1;
+ #endif
+ }
+ 
++bool WgcCaptureBackend::DrainQueuedFrames(std::wstring& error) {
++#if !V12_HAS_WGC
++    error = L"WGC is not compiled in.";
++    return false;
++#else
++    if (!initialized_ || !framePool_) { error = L"WGC session is not initialized."; return false; }
++    try {
++        ReleaseFrame();
++        // The pool is two buffers deep, but drain a few extra iterations to cover
++        // races with FrameArrived while the game is being restored.
++        for (int i = 0; i < 8; ++i) {
++            auto frame = framePool_.TryGetNextFrame();
++            if (!frame) break;
++            try { frame.Close(); } catch (...) {}
++        }
++        if (frameEvent_) ResetEvent(frameEvent_);
++        return true;
++    } catch (winrt::hresult_error const& e) {
++        error = e.message().c_str();
++    } catch (...) {
++        error = L"Unknown WGC drain failure.";
++    }
++    return false;
++#endif
++}
++
+ bool WgcCaptureBackend::TryGetNextFrame(Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+                                         LARGE_INTEGER& sourceTimestamp, bool& sizeChanged,
+                                         std::wstring& error) {
+diff --git a/source/wgc_capture.h b/source/wgc_capture.h
+index 4b75108..2573d5f 100644
+--- a/source/wgc_capture.h
++++ b/source/wgc_capture.h
+@@ -3,6 +3,7 @@
+ #include <d3d11_4.h>
+ #include <wrl/client.h>
+ #include <string>
++#include <atomic>
+ 
+ #if __has_include(<winrt/base.h>) && __has_include(<winrt/Windows.Graphics.Capture.h>) && \
+     __has_include(<windows.graphics.capture.interop.h>) && __has_include(<windows.graphics.directx.direct3d11.interop.h>)
+@@ -23,7 +24,9 @@ class WgcCaptureBackend {
+ public:
+     bool Init(HWND target, ID3D11Device* device, LARGE_INTEGER qpcFrequency, std::wstring& error);
+     // Block on either WGC FrameArrived or the app control/stop event.
+-    bool WaitForFrame(HANDLE controlEvent);
++    bool WaitForFrame(HANDLE controlEvent, DWORD timeoutMs, bool& timedOut);
++    // Drop any queued pre-Alt-Tab frames while keeping the WGC session alive.
++    bool DrainQueuedFrames(std::wstring& error);
+     bool TryGetNextFrame(Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+                          LARGE_INTEGER& sourceTimestamp, bool& sizeChanged,
+                          std::wstring& error);

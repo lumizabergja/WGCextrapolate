@@ -1,0 +1,130 @@
+diff --git a/source/dlss_bridge.cpp b/source/dlss_bridge.cpp
+index b131a07..4993c35 100644
+--- a/source/dlss_bridge.cpp
++++ b/source/dlss_bridge.cpp
+@@ -19,6 +19,8 @@ cbuffer Settings : register(b0) {
+     uint hasCost;
+     uint sourceWidth;
+     uint sourceHeight;
++    uint ofaWidth;
++    uint ofaHeight;
+ };
+ 
+ int2 ClampPixel(int2 p) {
+@@ -41,12 +43,14 @@ float Confidence(int2 c) {
+     return 0.10 + 0.90*saturate(1.0-v);
+ }
+ float3 ColorAtCell(int2 c) {
+-    float2 sp=float2(c*(int)flowGrid)+float2((float)flowGrid*0.5,(float)flowGrid*0.5);
++    float2 op=float2(c*(int)flowGrid)+float2((float)flowGrid*0.5,(float)flowGrid*0.5);
++    float2 sp=(op+0.5)*float2(sourceWidth,sourceHeight)/max(float2(1,1),float2(ofaWidth,ofaHeight))-0.5;
+     return source.Load(int3(ClampSourcePixel(int2(sp)),0)).rgb;
+ }
+ float2 ResolveFlow(float2 pixel) {
+     float2 sp=(pixel+0.5)*float2(sourceWidth,sourceHeight)/float2(width,height)-0.5;
+-    float2 g=(sp+0.5)/max(1.0,(float)flowGrid)-0.5;
++    float2 op=(pixel+0.5)*float2(ofaWidth,ofaHeight)/float2(width,height)-0.5;
++    float2 g=(op+0.5)/max(1.0,(float)flowGrid)-0.5;
+     int2 b=int2(floor(g));
+     float2 f=frac(g);
+     float3 center=source.Load(int3(ClampSourcePixel(int2(sp)),0)).rgb;
+@@ -74,7 +78,7 @@ void ResolveNvof(uint3 id:SV_DispatchThreadID) {
+     float2 v=0.0;
+     if(!resetHistory) {
+         v=ResolveFlow(float2(id.xy));
+-        v*=float2(width,height)/max(float2(1,1),float2(sourceWidth,sourceHeight));
++        v*=float2(width,height)/max(float2(1,1),float2(ofaWidth,ofaHeight));
+         if(any(v!=v)||any(abs(v)>512.0)) v=0.0;
+     }
+     motion[id.xy]=v;
+@@ -87,6 +91,7 @@ RWTexture2D<float> depth : register(u2);
+ cbuffer Settings : register(b0) {
+     uint width; uint height; uint resetHistory; uint flowGrid;
+     uint flowWidth; uint flowHeight; uint hasCost; uint sourceWidth; uint sourceHeight;
++    uint ofaWidth; uint ofaHeight;
+ };
+ [numthreads(8,8,1)]
+ void FillDepth(uint3 id:SV_DispatchThreadID) {
+@@ -155,7 +160,7 @@ void DlssExperiment::UAV(ID3D12Resource* r,DXGI_FORMAT fmt,UINT slot) {
+     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=fmt;d.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
+     auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=slot*stride;device->CreateUnorderedAccessView(r,nullptr,&d,h);
+ }
+-void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resource* source0,ID3D12Resource* source1,ID3D12Resource* source2,UINT w,UINT h,bool, bool useFG,UINT multiplier,bool boost,UINT nvofGrid,UINT reflexMode,bool nvofCost) {
++void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resource* source0,ID3D12Resource* source1,ID3D12Resource* source2,UINT w,UINT h,bool, bool useFG,UINT multiplier,bool boost,UINT nvofGrid,UINT reflexMode,bool nvofCost,UINT nvofWidth,UINT nvofHeight) {
+     if (multiplier != 0 && (multiplier < 2 || multiplier > 6)) throw std::runtime_error("Select 2x through 6x fixed FG, or Dynamic MFG.");
+     device=dev;sr=false;fg=useFG;ow=w;oh=h;rw=w;rh=h;history=false;index=0;srEvaluated=false; reflexTiming=reflexMode; activeInputSet=0; nextInputSet=0; inputRecycleWaits=0; dynamicMfg=(multiplier==0); inputSetCount=(dynamicMfg || multiplier>=5) ? 4u : 3u;
+     DXGI_ADAPTER_DESC1 ad{};HR(adapter->GetDesc1(&ad),"Adapter desc");
+@@ -228,7 +233,7 @@ void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resourc
+     }
+     Texture(previous,rw,rh,DXGI_FORMAT_R16G16B16A16_FLOAT,read); // software-motion fallback only
+     auto sourceDesc=source0->GetDesc();
+-    nvof.Init(dev,source0,source1,source2,(UINT)sourceDesc.Width,sourceDesc.Height,nvofGrid,nvofCost,log);
++    nvof.Init(dev,source0,source1,source2,(UINT)sourceDesc.Width,sourceDesc.Height,nvofWidth,nvofHeight,nvofGrid,nvofCost,log);
+     constexpr UINT descriptorBlock=8;
+     constexpr UINT sourceSlots=3;
+     constexpr UINT flowSlots=NvofBridge::kFlowSlots;
+@@ -245,7 +250,7 @@ void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resourc
+     D3D12_DESCRIPTOR_RANGE ranges[2]{};
+     ranges[0]={D3D12_DESCRIPTOR_RANGE_TYPE_SRV,5,0,0,0};ranges[1]={D3D12_DESCRIPTOR_RANGE_TYPE_UAV,3,0,0,5};
+     D3D12_ROOT_PARAMETER parameters[2]{};parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    parameters[0].DescriptorTable={2,ranges};parameters[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[1].Constants={0,0,9};
++    parameters[0].DescriptorTable={2,ranges};parameters[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[1].Constants={0,0,11};
+     D3D12_STATIC_SAMPLER_DESC sampler{};sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+     sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;sampler.MaxLOD=D3D12_FLOAT32_MAX;
+     D3D12_ROOT_SIGNATURE_DESC rd{};rd.NumParameters=2;rd.pParameters=parameters;rd.NumStaticSamplers=1;rd.pStaticSamplers=&sampler;
+@@ -343,8 +348,9 @@ void DlssExperiment::RecordPreOFA(ID3D12GraphicsCommandList* list,UINT sourceInd
+     UINT settings[]={rw,rh,resetThisFrame?1u:0u,nvof.Available()?nvof.Grid():4u,
+                      nvof.Available()?nvof.FlowWidth():0u,nvof.Available()?nvof.FlowHeight():0u,
+                      nvof.Available()&&nvof.HasCost()?1u:0u,
+-                     nvof.Available()?nvof.SourceWidth():rw,nvof.Available()?nvof.SourceHeight():rh};
+-    list->SetComputeRoot32BitConstants(1,9,settings,0);
++                     nvof.Available()?nvof.SourceWidth():rw,nvof.Available()?nvof.SourceHeight():rh,
++                     nvof.Available()?nvof.OfaWidth():rw,nvof.Available()?nvof.OfaHeight():rh};
++    list->SetComputeRoot32BitConstants(1,11,settings,0);
+     Transition(list,in.depth.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     list->SetPipelineState(depthFillPSO.Get());
+     list->Dispatch((rw+7)/8,(rh+7)/8,1);
+@@ -364,8 +370,8 @@ void DlssExperiment::RecordMotionResolve(ID3D12GraphicsCommandList* list,ID3D12R
+     table.ptr+=SIZE_T(((activeInputSet*3u+(sourceIndex%3u))*NvofBridge::kFlowSlots+flowSlot)*8u)*stride;
+     list->SetComputeRootDescriptorTable(0,table);
+     UINT settings[]={rw,rh,resetThisFrame?1u:0u,nvof.Grid(),nvof.FlowWidth(),nvof.FlowHeight(),
+-                     nvof.HasCost()?1u:0u,nvof.SourceWidth(),nvof.SourceHeight()};
+-    list->SetComputeRoot32BitConstants(1,9,settings,0);
++                     nvof.HasCost()?1u:0u,nvof.SourceWidth(),nvof.SourceHeight(),nvof.OfaWidth(),nvof.OfaHeight()};
++    list->SetComputeRoot32BitConstants(1,11,settings,0);
+     Transition(list,in.motion.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     nvof.BeginRead(list);
+     list->SetPipelineState(nvofResolvePSO.Get());list->Dispatch((rw+7)/8,(rh+7)/8,1);
+@@ -408,8 +414,9 @@ void DlssExperiment::RecordPreprocess(ID3D12GraphicsCommandList* list,ID3D12Reso
+     UINT settings[]={rw,rh,resetThisFrame?1u:0u,nvof.Available()?nvof.Grid():4u,
+                      nvof.Available()?nvof.FlowWidth():0u,nvof.Available()?nvof.FlowHeight():0u,
+                      nvof.Available()&&nvof.HasCost()?1u:0u,
+-                     nvof.Available()?nvof.SourceWidth():rw,nvof.Available()?nvof.SourceHeight():rh};
+-    list->SetComputeRoot32BitConstants(1,9,settings,0);
++                     nvof.Available()?nvof.SourceWidth():rw,nvof.Available()?nvof.SourceHeight():rh,
++                     nvof.Available()?nvof.OfaWidth():rw,nvof.Available()?nvof.OfaHeight():rh};
++    list->SetComputeRoot32BitConstants(1,11,settings,0);
+ 
+     if(!nvof.Available()) {
+         Transition(list,in.current.Get(),read,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+diff --git a/source/dlss_bridge.h b/source/dlss_bridge.h
+index a8215e8..640f1ca 100644
+--- a/source/dlss_bridge.h
++++ b/source/dlss_bridge.h
+@@ -41,7 +41,7 @@ public:
+     std::wstring error;
+     void Load();
+     void BindDevice(ID3D12Device* d) {Check(setDevice(d),"slSetD3DDevice");}
+-    void Init(ID3D12Device*,IDXGIAdapter1*,ID3D12Resource*,ID3D12Resource*,ID3D12Resource*,UINT,UINT,bool,bool,UINT,bool,UINT,UINT,bool);
++    void Init(ID3D12Device*,IDXGIAdapter1*,ID3D12Resource*,ID3D12Resource*,ID3D12Resource*,UINT,UINT,bool,bool,UINT,bool,UINT,UINT,bool,UINT,UINT);
+     void PrepareFrame(bool sleepNow);
+     void SleepPreparedFrame();
+     bool ProducerPrepareMotion(UINT sourceIndex,UINT referenceIndex,uint64_t sequence,ID3D12Fence* captureFence,uint64_t captureValue,ID3D12Fence* historyFence,uint64_t historyValue);
+@@ -53,6 +53,7 @@ public:
+     bool MotionWouldBlockNow() const { return nvof.Available() && nvof.FlowPending(); }
+     void MarkMotionConsumed(ID3D12Fence* fence,uint64_t value) { nvof.MarkActiveConsumed(fence,value); }
+     bool HasHardwareMotion() const { return nvof.Available() && nvof.FlowReady(); }
++    bool HardwareMotionAvailable() const { return nvof.Available(); }
+     void RecordPreOFA(ID3D12GraphicsCommandList*,UINT sourceIndex);
+     void RecordMotionResolve(ID3D12GraphicsCommandList*,ID3D12Resource*,UINT,bool sharedCopyRead);
+     void RecordPreprocess(ID3D12GraphicsCommandList*,ID3D12Resource*,UINT,bool sharedCopyRead);

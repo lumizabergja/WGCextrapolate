@@ -1,0 +1,319 @@
+diff --git a/source/nvof_bridge.cpp b/source/nvof_bridge.cpp
+index 44f6613..9b74210 100644
+--- a/source/nvof_bridge.cpp
++++ b/source/nvof_bridge.cpp
+@@ -3,6 +3,7 @@
+ #include "nvOpticalFlowD3D12.h"
+ #include <algorithm>
+ #include <vector>
++#include <d3dcompiler.h>
+ 
+ using Microsoft::WRL::ComPtr;
+ struct NvofBridge::Api { NV_OF_D3D12_API_FUNCTION_LIST fn{}; };
+@@ -32,6 +33,125 @@ ComPtr<ID3D12Resource> NvofBridge::MakeTexture(DXGI_FORMAT fmt, UINT w, UINT h,
+     r->SetName(name); return r;
+ }
+ 
++ComPtr<ID3D12Resource> NvofBridge::MakeScaleTexture(UINT w, UINT h, const wchar_t* name) {
++    D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC d{}; d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width=w; d.Height=h;
++    d.DepthOrArraySize=1; d.MipLevels=1; d.Format=DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count=1;
++    d.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN; d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++    ComPtr<ID3D12Resource> r;
++    if (FAILED(device_->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r)))) return nullptr;
++    r->SetName(name); return r;
++}
++
++bool NvofBridge::InitScaler() {
++    for(UINT i=0;i<3;++i) {
++        if(!captureSources_[i]) return false;
++        const auto desc=captureSources_[i]->GetDesc();
++        if((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)==0) {
++            if(log_) log_(L"OFA resolution scaling requires simultaneous-access capture textures; selected backend/resource does not expose them.");
++            return false;
++        }
++        wchar_t name[64]{};
++        swprintf_s(name,L"NVOFA scaled source %u",i);
++        sources_[i]=MakeScaleTexture(width_,height_,name);
++        if(!sources_[i]) return false;
++    }
++
++    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
++    if(FAILED(device_->CreateCommandQueue(&qd,IID_PPV_ARGS(&scaleQueue_)))) return false;
++    if(FAILED(device_->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&scaleFence_)))) return false;
++    for(UINT i=0;i<3;++i) {
++        if(FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&scaleAllocators_[i])))) return false;
++        if(FAILED(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,scaleAllocators_[i].Get(),nullptr,IID_PPV_ARGS(&scaleLists_[i])))) return false;
++        if(FAILED(scaleLists_[i]->Close())) return false;
++    }
++
++    D3D12_DESCRIPTOR_HEAP_DESC sh{}; sh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; sh.NumDescriptors=3; sh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    if(FAILED(device_->CreateDescriptorHeap(&sh,IID_PPV_ARGS(&scaleSrvHeap_)))) return false;
++    scaleSrvStride_=device_->GetDescriptorHandleIncrementSize(sh.Type);
++    D3D12_DESCRIPTOR_HEAP_DESC rh{}; rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rh.NumDescriptors=3;
++    if(FAILED(device_->CreateDescriptorHeap(&rh,IID_PPV_ARGS(&scaleRtvHeap_)))) return false;
++    scaleRtvStride_=device_->GetDescriptorHandleIncrementSize(rh.Type);
++
++    auto srv=scaleSrvHeap_->GetCPUDescriptorHandleForHeapStart();
++    auto rtv=scaleRtvHeap_->GetCPUDescriptorHandleForHeapStart();
++    D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
++    sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels=1;
++    for(UINT i=0;i<3;++i) {
++        device_->CreateShaderResourceView(captureSources_[i].Get(),&sv,srv);
++        device_->CreateRenderTargetView(sources_[i].Get(),nullptr,rtv);
++        srv.ptr+=scaleSrvStride_; rtv.ptr+=scaleRtvStride_;
++    }
++
++    D3D12_DESCRIPTOR_RANGE range{}; range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors=1;
++    range.BaseShaderRegister=0; range.OffsetInDescriptorsFromTableStart=D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_ROOT_PARAMETER param{}; param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    param.DescriptorTable.NumDescriptorRanges=1; param.DescriptorTable.pDescriptorRanges=&range; param.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_STATIC_SAMPLER_DESC sampler{}; sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    sampler.MaxLOD=D3D12_FLOAT32_MAX; sampler.ShaderRegister=0; sampler.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC rs{}; rs.NumParameters=1; rs.pParameters=&param; rs.NumStaticSamplers=1; rs.pStaticSamplers=&sampler;
++    rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
++    ComPtr<ID3DBlob> sig,errors;
++    if(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&errors))) return false;
++    if(FAILED(device_->CreateRootSignature(0,sig->GetBufferPointer(),sig->GetBufferSize(),IID_PPV_ARGS(&scaleRoot_)))) return false;
++
++    static const char shader[] =
++        "Texture2D src:register(t0);SamplerState samp:register(s0);"
++        "struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
++        "V VS(uint id:SV_VertexID){V o;float2 p=float2((id==2)?3.0:-1.0,(id==1)?3.0:-1.0);"
++        "o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);return o;}"
++        "float4 PS(V i):SV_Target{return src.SampleLevel(samp,i.uv,0);}";
++    ComPtr<ID3DBlob> vs,ps;
++    if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vs,&errors))) return false;
++    errors.Reset();
++    if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&ps,&errors))) return false;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{}; pd.pRootSignature=scaleRoot_.Get();
++    pd.VS={vs->GetBufferPointer(),vs->GetBufferSize()}; pd.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
++    D3D12_RENDER_TARGET_BLEND_DESC blend{}; blend.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
++    for(auto& t:pd.BlendState.RenderTarget)t=blend;
++    pd.SampleMask=UINT_MAX; pd.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
++    pd.RasterizerState.DepthClipEnable=TRUE; pd.DepthStencilState.DepthEnable=FALSE; pd.DepthStencilState.StencilEnable=FALSE;
++    pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; pd.NumRenderTargets=1; pd.RTVFormats[0]=DXGI_FORMAT_B8G8R8A8_UNORM;
++    pd.SampleDesc.Count=1;
++    return SUCCEEDED(device_->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&scalePso_)));
++}
++
++bool NvofBridge::EnsureScaled(UINT sourceIndex, ID3D12Fence* captureFence, uint64_t captureValue) {
++    if(!scaledInput_) return true;
++    if(sourceIndex>=3 || !captureFence || !captureValue || !scaleQueue_ || !scaleFence_) return false;
++    if(scaledCaptureValue_[sourceIndex]==captureValue && scaleDoneValue_[sourceIndex]) return true;
++    const uint64_t prior=scaleDoneValue_[sourceIndex];
++    if(prior && scaleFence_->GetCompletedValue()<prior) return false;
++
++    if(FAILED(scaleAllocators_[sourceIndex]->Reset())) return false;
++    auto* list=scaleLists_[sourceIndex].Get();
++    if(FAILED(list->Reset(scaleAllocators_[sourceIndex].Get(),scalePso_.Get()))) return false;
++    D3D12_RESOURCE_BARRIER b{}; b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition={sources_[sourceIndex].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET};
++    list->ResourceBarrier(1,&b);
++    D3D12_VIEWPORT vp{0.0f,0.0f,float(width_),float(height_),0.0f,1.0f};
++    D3D12_RECT sc{0,0,LONG(width_),LONG(height_)};
++    list->RSSetViewports(1,&vp); list->RSSetScissorRects(1,&sc);
++    auto rtv=scaleRtvHeap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr+=SIZE_T(sourceIndex)*scaleRtvStride_;
++    list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
++    ID3D12DescriptorHeap* heaps[]={scaleSrvHeap_.Get()}; list->SetDescriptorHeaps(1,heaps);
++    list->SetGraphicsRootSignature(scaleRoot_.Get());
++    auto gpu=scaleSrvHeap_->GetGPUDescriptorHandleForHeapStart(); gpu.ptr+=SIZE_T(sourceIndex)*scaleSrvStride_;
++    list->SetGraphicsRootDescriptorTable(0,gpu);
++    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    list->DrawInstanced(3,1,0,0);
++    std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
++    list->ResourceBarrier(1,&b);
++    if(FAILED(list->Close())) return false;
++    if(FAILED(scaleQueue_->Wait(captureFence,captureValue))) return false;
++    ID3D12CommandList* lists[]={list}; scaleQueue_->ExecuteCommandLists(1,lists);
++    const uint64_t done=++scaleValue_;
++    if(FAILED(scaleQueue_->Signal(scaleFence_.Get(),done))) return false;
++    scaleDoneValue_[sourceIndex]=done; scaledCaptureValue_[sourceIndex]=captureValue;
++    return true;
++}
++
+ bool NvofBridge::WaitFenceCPU(uint64_t value) {
+     if (!ofaFence_ || ofaFence_->GetCompletedValue() >= value) return true;
+     HANDLE e=CreateEventW(nullptr,FALSE,FALSE,nullptr); if(!e) return false;
+@@ -50,10 +170,21 @@ bool NvofBridge::Register(ID3D12Resource* resource, void** handle) {
+ }
+ 
+ bool NvofBridge::Init(ID3D12Device* device, ID3D12Resource* liveSource0, ID3D12Resource* liveSource1,
+-                      ID3D12Resource* liveSource2, UINT width, UINT height, UINT requestedGrid, bool enableCost, Log log) {
++                      ID3D12Resource* liveSource2, UINT captureWidth, UINT captureHeight,
++                      UINT processWidth, UINT processHeight, UINT requestedGrid, bool enableCost, Log log) {
+     Shutdown(); log_=std::move(log); device_=device;
+-    sources_[0]=liveSource0; sources_[1]=liveSource1; sources_[2]=liveSource2; width_=width; height_=height;
+-    if(!sources_[0] || !sources_[1] || !sources_[2]) { if(log_)log_(L"NVOFA requires all three capture mailbox resources."); return false; }
++    captureSources_[0]=liveSource0; captureSources_[1]=liveSource1; captureSources_[2]=liveSource2;
++    captureWidth_=captureWidth; captureHeight_=captureHeight;
++    width_=processWidth ? std::min(processWidth,captureWidth) : captureWidth;
++    height_=processHeight ? std::min(processHeight,captureHeight) : captureHeight;
++    if(!width_ || !height_) { width_=captureWidth; height_=captureHeight; }
++    scaledInput_ = width_ != captureWidth_ || height_ != captureHeight_;
++    if(!captureSources_[0] || !captureSources_[1] || !captureSources_[2]) { if(log_)log_(L"NVOFA requires all three capture mailbox resources."); return false; }
++    if(scaledInput_) {
++        if(!InitScaler()) { if(log_)log_(L"NVOFA resolution scaler initialization failed; hardware motion disabled."); Shutdown(); return false; }
++    } else {
++        sources_[0]=captureSources_[0]; sources_[1]=captureSources_[1]; sources_[2]=captureSources_[2];
++    }
+     library_=LoadLibraryExW(L"nvofapi64.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+     if(!library_){ if(log_)log_(L"NVOFA unavailable: nvofapi64.dll not found; compute fallback active."); return false; }
+     auto create=reinterpret_cast<PfnCreateInstanceD3D12>(GetProcAddress(library_,"NvOFAPICreateInstanceD3D12"));
+@@ -95,7 +226,7 @@ bool NvofBridge::Init(ID3D12Device* device, ID3D12Resource* liveSource0, ID3D12R
+         if(std::find(costs.begin(),costs.end(),DXGI_FORMAT_R8_UINT)!=costs.end()) costFormat_=DXGI_FORMAT_R8_UINT;
+     }
+ 
+-    flowW_=(width+grid_-1)/grid_; flowH_=(height+grid_-1)/grid_;
++    flowW_=(width_+grid_-1)/grid_; flowH_=(height_+grid_-1)/grid_;
+     for(UINT i=0;i<kFlowSlots;++i) {
+         wchar_t flowName[64]{},costName[64]{};
+         swprintf_s(flowName,L"NVOFA forward flow ring %u",i);
+@@ -108,7 +239,7 @@ bool NvofBridge::Init(ID3D12Device* device, ID3D12Resource* liveSource0, ID3D12R
+     }
+     if(FAILED(device_->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&ofaFence_)))){Shutdown();return false;}
+ 
+-    NV_OF_INIT_PARAMS init{}; init.width=width; init.height=height; init.outGridSize=static_cast<NV_OF_OUTPUT_VECTOR_GRID_SIZE>(grid_);
++    NV_OF_INIT_PARAMS init{}; init.width=width_; init.height=height_; init.outGridSize=static_cast<NV_OF_OUTPUT_VECTOR_GRID_SIZE>(grid_);
+     init.hintGridSize=NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED; init.mode=NV_OF_MODE_OPTICALFLOW;
+     init.perfLevel=NV_OF_PERF_LEVEL_FAST;
+     init.enableExternalHints=NV_OF_FALSE; init.enableOutputCost=cost_[0]?NV_OF_TRUE:NV_OF_FALSE;
+@@ -133,7 +264,9 @@ bool NvofBridge::Init(ID3D12Device* device, ID3D12Resource* liveSource0, ID3D12R
+     { std::lock_guard lock(leadMutex_); leadCount_=0;leadSumMs_=leadMaxMs_=0.0; }
+     StartTiming();
+     if(log_)log_(L"NVOFA motion-only path: "+std::to_wstring(grid_)+L"x"+std::to_wstring(grid_)+
+-        L" grid, FAST preset, forward-only, triple-source + triple-flow rings, confidence cost="+
++        L" grid, "+std::to_wstring(width_)+L"x"+std::to_wstring(height_)+L" OFA input"+
++        (scaledInput_?L" (GPU downsampled from "+std::to_wstring(captureWidth_)+L"x"+std::to_wstring(captureHeight_)+L")":L" (native)")+
++        L", FAST preset, forward-only, triple-source + triple-flow rings, confidence cost="+
+         (cost_[0]?std::wstring(L"on"):std::wstring(L"off"))+L".");
+     return true;
+ }
+@@ -155,6 +288,15 @@ bool NvofBridge::SubmitFrame(UINT sourceIndex,UINT referenceIndex,uint64_t seque
+                              bool producerSubmit){
+     if(!ready_||!captureFence||sourceIndex>=3||referenceIndex>=3||sourceIndex==referenceIndex) return false;
+     std::lock_guard flowLock(flowMutex_);
++    if(scaledInput_) {
++        // After a history reset the first presented frame may not have needed OFA,
++        // so lazily create its reduced-resolution reference from the completed
++        // history resource before scaling the newest capture.
++        if(!scaleDoneValue_[referenceIndex]) {
++            if(!historyFence || !historyValue || !EnsureScaled(referenceIndex,historyFence,historyValue)) return false;
++        }
++        if(!EnsureScaled(sourceIndex,captureFence,captureValue)) return false;
++    }
+     const int slotIndex=FindReusableFlowSlotLocked();
+     if(slotIndex<0){++noOutput_;return false;}
+     FlowSlot& slot=flowSlots_[slotIndex];
+@@ -165,8 +307,12 @@ bool NvofBridge::SubmitFrame(UINT sourceIndex,UINT referenceIndex,uint64_t seque
+         for(uint32_t i=0;i<waitCount;++i) if(waits[i].fence==fence){waits[i].value=std::max<uint64_t>(waits[i].value,value);return;}
+         if(waitCount<4) waits[waitCount++]={fence,value};
+     };
+-    addWait(captureFence,captureValue);
+-    addWait(historyFence,historyValue);
++    if(scaledInput_) {
++        addWait(scaleFence_.Get(),std::max(scaleDoneValue_[sourceIndex],scaleDoneValue_[referenceIndex]));
++    } else {
++        addWait(captureFence,captureValue);
++        addWait(historyFence,historyValue);
++    }
+     const uint64_t sourceDependency=std::max(sourceUseValue_[sourceIndex],sourceUseValue_[referenceIndex]);
+     const uint64_t ofaDependency=std::max(sourceDependency,slot.ofaDoneValue);
+     addWait(ofaFence_.Get(),ofaDependency);
+@@ -236,7 +382,10 @@ bool NvofBridge::CanReuseSource(UINT sourceIndex) const {
+     if(!ready_||sourceIndex>=3||!ofaFence_) return true;
+     std::lock_guard lock(flowMutex_);
+     const uint64_t v=sourceUseValue_[sourceIndex];
+-    return !v || ofaFence_->GetCompletedValue()>=v;
++    const bool ofaFree=!v || ofaFence_->GetCompletedValue()>=v;
++    const uint64_t s=scaleDoneValue_[sourceIndex];
++    const bool scaleFree=!scaledInput_ || !s || (scaleFence_ && scaleFence_->GetCompletedValue()>=s);
++    return ofaFree && scaleFree;
+ }
+ 
+ bool NvofBridge::FlowPending() const {
+@@ -348,7 +497,20 @@ void NvofBridge::UnregisterAll(){
+ void NvofBridge::Shutdown(){
+     StopTiming();
+     ready_=false;ClearActive();UnregisterAll();
+-    for(auto& s:sources_)s.Reset();for(auto& f:flow_)f.Reset();for(auto& c:cost_)c.Reset();
++    if(scaleFence_ && scaleValue_ && scaleFence_->GetCompletedValue()<scaleValue_) {
++        HANDLE e=CreateEventW(nullptr,FALSE,FALSE,nullptr);
++        if(e) {
++            if(SUCCEEDED(scaleFence_->SetEventOnCompletion(scaleValue_,e))) WaitForSingleObject(e,3000);
++            CloseHandle(e);
++        }
++    }
++    for(auto& s:sources_)s.Reset(); for(auto& s:captureSources_)s.Reset();
++    for(auto& f:flow_)f.Reset();for(auto& c:cost_)c.Reset();
++    for(auto& a:scaleAllocators_)a.Reset(); for(auto& l:scaleLists_)l.Reset();
++    scalePso_.Reset();scaleRoot_.Reset();scaleSrvHeap_.Reset();scaleRtvHeap_.Reset();scaleQueue_.Reset();scaleFence_.Reset();
++    scaleValue_=0; std::fill(std::begin(scaleDoneValue_),std::end(scaleDoneValue_),0ull);
++    std::fill(std::begin(scaledCaptureValue_),std::end(scaledCaptureValue_),0ull);
++    scaledInput_=false; captureWidth_=captureHeight_=width_=height_=0;
+     if(api_&&session_&&api_->fn.nvOFDestroy)api_->fn.nvOFDestroy(static_cast<NvOFHandle>(session_));session_=nullptr;ofaFence_.Reset();device_.Reset();delete api_;api_=nullptr;
+     library_=nullptr;
+ }
+diff --git a/source/nvof_bridge.h b/source/nvof_bridge.h
+index 6f634e7..687b3eb 100644
+--- a/source/nvof_bridge.h
++++ b/source/nvof_bridge.h
+@@ -17,14 +17,18 @@ public:
+     static constexpr UINT kFlowSlots = 3;
+     ~NvofBridge();
+     bool Init(ID3D12Device* device, ID3D12Resource* liveSource0, ID3D12Resource* liveSource1,
+-              ID3D12Resource* liveSource2, UINT width, UINT height, UINT requestedGrid, bool enableCost, Log log);
++              ID3D12Resource* liveSource2, UINT captureWidth, UINT captureHeight,
++              UINT processWidth, UINT processHeight, UINT requestedGrid, bool enableCost, Log log);
+     void Shutdown();
+     bool Available() const { return ready_; }
+     bool FlowReady() const { return activeFlowSlot_.load(std::memory_order_acquire) >= 0; }
+     bool FlowPending() const;
+     UINT Grid() const { return grid_; }
+-    UINT SourceWidth() const { return width_; }
+-    UINT SourceHeight() const { return height_; }
++    UINT SourceWidth() const { return captureWidth_; }
++    UINT SourceHeight() const { return captureHeight_; }
++    UINT OfaWidth() const { return width_; }
++    UINT OfaHeight() const { return height_; }
++    bool UsesScaledInput() const { return scaledInput_; }
+     UINT FlowWidth() const { return flowW_; }
+     UINT FlowHeight() const { return flowH_; }
+     bool HasCost() const { return cost_[0] != nullptr; }
+@@ -61,11 +65,23 @@ private:
+     Microsoft::WRL::ComPtr<ID3D12Device> device_;
+     Microsoft::WRL::ComPtr<ID3D12Fence> ofaFence_;
+     uint64_t ofaValue_{};
+-    Microsoft::WRL::ComPtr<ID3D12Resource> sources_[3], flow_[kFlowSlots], cost_[kFlowSlots];
++    Microsoft::WRL::ComPtr<ID3D12Resource> captureSources_[3], sources_[3], flow_[kFlowSlots], cost_[kFlowSlots];
++    Microsoft::WRL::ComPtr<ID3D12CommandQueue> scaleQueue_;
++    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> scaleAllocators_[3];
++    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> scaleLists_[3];
++    Microsoft::WRL::ComPtr<ID3D12Fence> scaleFence_;
++    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> scaleSrvHeap_, scaleRtvHeap_;
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> scaleRoot_;
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> scalePso_;
++    uint64_t scaleValue_{};
++    uint64_t scaleDoneValue_[3]{};
++    uint64_t scaledCaptureValue_[3]{};
++    UINT scaleSrvStride_{}, scaleRtvStride_{};
++    bool scaledInput_{};
+     void* sourceHandles_[3]{};
+     void* flowHandles_[kFlowSlots]{};
+     void* costHandles_[kFlowSlots]{};
+-    UINT width_{}, height_{}, flowW_{}, flowH_{}, grid_{};
++    UINT captureWidth_{}, captureHeight_{}, width_{}, height_{}, flowW_{}, flowH_{}, grid_{};
+     DXGI_FORMAT costFormat_{DXGI_FORMAT_UNKNOWN};
+     bool ready_{};
+     uint64_t sourceUseValue_[3]{};
+@@ -108,6 +124,9 @@ private:
+     void StopTiming();
+     int FindReusableFlowSlotLocked();
+     Microsoft::WRL::ComPtr<ID3D12Resource> MakeTexture(DXGI_FORMAT fmt, UINT w, UINT h, const wchar_t* name);
++    Microsoft::WRL::ComPtr<ID3D12Resource> MakeScaleTexture(UINT w, UINT h, const wchar_t* name);
++    bool InitScaler();
++    bool EnsureScaled(UINT sourceIndex, ID3D12Fence* captureFence, uint64_t captureValue);
+     bool Register(ID3D12Resource* resource, void** handle);
+     bool WaitFenceCPU(uint64_t value);
+     void UnregisterAll();

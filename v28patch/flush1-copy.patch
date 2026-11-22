@@ -1,0 +1,24 @@
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -1243,7 +1243,7 @@
+                         : L"V26 producer active: DXGI DuplicateOutput compatibility fallback, three-slot latest-frame mailbox.");
+                 }
+                 gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+-                gLog.Write(L"V26 capture ordering: Copy -> capture-fence Signal -> immediate D3D11 Flush -> OFA submit -> release capture frame -> publish mailbox.");
++                gLog.Write(L"V28 capture ordering: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit -> release capture frame -> publish mailbox.");
+ 
+                 auto recreateDxgiDuplication=[&]()->bool {
+                     c.duplication.Reset();
+@@ -1437,8 +1437,10 @@
+                     c.context->CopySubresourceRegion(c.sharedTextures[slot].Get(),0,0,0,0,desktop.Get(),0,&box);
+                     const UINT64 ready=c.nextCaptureValue++;
+                     HR(c.context4->Signal(c.captureFence.Get(),ready),"Capture signal");
+-                    // Submit copy + fence immediately, before CPU-side OFA work.
+-                    c.context->Flush();
++                    // V28: submit only the D3D11 copy context instead of flushing the
++                    // entire immediate context. NVOFA itself is already native D3D12 and
++                    // waits on the shared capture fence below.
++                    c.context4->Flush1(D3D11_CONTEXT_TYPE_COPY, nullptr);
+                     const uint64_t publishedSequence=++sequence;
+                     c.mailboxes[slot].readyValue=ready;
+                     c.mailboxes[slot].sourceTimestamp=sourceTimestamp;
