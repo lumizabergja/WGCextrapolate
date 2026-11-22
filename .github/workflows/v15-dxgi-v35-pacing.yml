@@ -1,8 +1,8 @@
-name: V15 DXGI Exact V35 Pacing Windows x64
+name: V15 DXGI V35 Safe Pacing Windows x64
 on:
   push:
     branches:
-      - v15-dxgi-v35-exact-pacing-20261122
+      - v15-dxgi-v35-safe-pacing-20261122
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,6 +24,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'V15 source reconstruction failed' }
           python apply_v35_exact.py
           if ($LASTEXITCODE -ne 0) { throw 'Exact V35 pacing patch failed' }
+          python apply_v35_safe.py
+          if ($LASTEXITCODE -ne 0) { throw 'Nonblocking safe V35 patch failed' }
 
       - name: Compile Windows x64 using MSVC
         shell: pwsh
@@ -44,14 +46,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-V15-DXGI-V35-ExactPacing-Windows-x64.zip' -Force
-          if (!(Test-Path 'artifacts/FG-V15-DXGI-V35-ExactPacing-Windows-x64.zip')) { throw 'Artifact ZIP not produced' }
+          Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-V15-DXGI-V35-SafePacing-Windows-x64.zip' -Force
+          if (!(Test-Path 'artifacts/FG-V15-DXGI-V35-SafePacing-Windows-x64.zip')) { throw 'Artifact ZIP not produced' }
 
       - name: Upload Windows application
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: FG-V15-DXGI-V35-ExactPacing-Windows-x64
+          name: FG-V15-DXGI-V35-SafePacing-Windows-x64
           path: |
             artifacts/*.zip
             build.log
