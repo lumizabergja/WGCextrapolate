@@ -191,17 +191,17 @@ foreach ($name in @('sl.interposer.dll','sl.common.dll','sl.pcl.dll','sl.reflex.
 }
 $sha = (Get-FileHash 'FG-Extrap-V35.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
 $validation = @(
-  'V35 DXGI/WGC -> NvOFA -> custom extrapolation (Off-6x and Dynamic) -> DX12',
-  'UI: game selector + Refresh / capture / extrapolation / dynamic target / radius / feather; Native 4x4 NvOFA only',
-  'Stop behavior: completed-worker handoff modeled on V15 Clean V16; game exit preserves UI',
+  'V35 DXGI/WGC -> NvOFA 100/50/10 percent -> V15 Clean V16 full confidence-based extrapolation -> DX12',
+  'UI: fixed game dropdown + Refresh / capture / extrapolation / dynamic target / 100-50-10 percent OFA / radius / feather; 4x4 FAST grid',
+  'Stop signals worker, preserves game foreground; game exit stops capture and preserves UI',
   'Streamline Reflex + PCL ONLY; no DLSS-G plugin shipped',
   "Git commit: $env:APPVEYOR_REPO_COMMIT",
   "Executable SHA256: $sha",
   'Build verification: MSVC compiler returned success; no end-to-end GPU/game runtime test performed.'
 )
 [IO.File]::WriteAllLines('artifacts\payload\BUILD-VALIDATION.txt',$validation)
-Compress-Archive -Path 'artifacts\payload\*' -DestinationPath 'artifacts\FG-V35-Premium-UI-Fixed-Windows-x64.zip' -Force
-if (-not (Test-Path 'artifacts\FG-V35-Premium-UI-Fixed-Windows-x64.zip')) {
-  throw 'AppVeyor ZIP artifact was not produced'
+Compress-Archive -Path 'artifacts\payload\*' -DestinationPath 'artifacts\FG-V35-V15Full-StopSafe-Windows-x64.zip' -Force
+if (-not (Test-Path 'artifacts\FG-V35-V15Full-StopSafe-Windows-x64.zip')) {
+  throw 'Windows ZIP artifact was not produced'
 }
 Write-Host 'Build and packaging succeeded.'
