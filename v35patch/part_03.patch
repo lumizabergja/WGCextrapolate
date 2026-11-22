@@ -1,0 +1,117 @@
+void a
+     // redundant compute-queue capture wait in the hardware-motion path.
+@@ -1058,7 +1111,7 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     hr = d.preprocessQueue->Signal(d.preprocessFence.Get(), preprocessDone);
+     if (FAILED(hr)) return false;
+     d.preprocessFenceValues[preprocessAllocatorIndex] = preprocessDone;
+-    d.preprocessProfileValid[preprocessAllocatorIndex] = true;
++    d.preprocessProfileValid[preprocessAllocatorIndex] = profileThisFrame;
+ 
+     // NVOFA flow outputs are no longer needed once the compute resolve completes.
+     // Let the triple-flow ring recycle them at preprocess completion instead of
+@@ -1090,9 +1143,9 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     if (FAILED(hr)) return false;
+ 
+     const UINT queryBase = allocatorIndex * kGpuQueriesPerFrame;
+-    d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 0);
++    if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 0);
+     gDLSS.TagInputs(d.list.Get());
+-    d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
++    if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+ 
+     D3D12_RESOURCE_BARRIER backBarrier{};
+     backBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -1132,16 +1185,18 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     float jitterX = syntheticOffsetPixels / static_cast<float>(std::max(1u, d.sourceWidth));
+     d.list->SetGraphicsRoot32BitConstants(1, 1, &jitterX, 0);
+     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
++    if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
+ 
+     d.list->DrawInstanced(3, 1, 0, 0);
+-    d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
++    if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
+ 
+     } else {
+         // No draw on the fast path. Early copy timings are deliberately not
+         // reported as raster timings in the existing final-list profile.
+-        d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
+-        d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
++        if(profileThisFrame) {
++            d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
++            d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
++        }
+     }
+     D3D12_RESOURCE_BARRIER sourceBarrier{};
+     sourceBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -1155,15 +1210,17 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     backBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+     backBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     d.list->ResourceBarrier(1, &backBarrier);
+-    d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 4);
+-    if (!parallelCopy) {
+-        // Every resolved query must have been written, including fallback frames.
+-        d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 5);
+-        d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 6);
++    if(profileThisFrame) {
++        d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 4);
++        if (!parallelCopy) {
++            // Every resolved query must have been written, including fallback frames.
++            d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 5);
++            d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 6);
++        }
++        d.list->ResolveQueryData(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase,
++                                 kGpuQueriesPerFrame, d.gpuQueryReadback.Get(),
++                                 UINT64(queryBase) * sizeof(UINT64));
+     }
+-    d.list->ResolveQueryData(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase,
+-                             kGpuQueriesPerFrame, d.gpuQueryReadback.Get(),
+-                             UINT64(queryBase) * sizeof(UINT64));
+ 
+     hr = d.list->Close();
+     if (FAILED(hr)) return false;
+@@ -1185,8 +1242,8 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     hr = d.queue->Signal(d.frameFence.Get(), allocatorFenceValue);
+     if (FAILED(hr)) return false;
+     d.allocatorFenceValues[allocatorIndex] = allocatorFenceValue;
+-    d.profileHadCopy[allocatorIndex] = parallelCopy;
+-    d.gpuProfileValid[allocatorIndex] = true;
++    d.profileHadCopy[allocatorIndex] = profileThisFrame && parallelCopy;
++    d.gpuProfileValid[allocatorIndex] = profileThisFrame;
+ 
+     // History remains the last actually presented capture, independent of any
+     // producer-side speculative OFA work.
+@@ -1194,7 +1251,12 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     if (priorHistorySlot >= 0 && priorHistorySlot < static_cast<int>(kCaptureSlots) &&
+         priorHistorySlot != nextHistorySlot) {
+         c.lastReleaseDone[priorHistorySlot].store(renderDone, std::memory_order_release);
+-        c.mailboxes[priorHistorySlot].state.store(CaptureState::kFree, std::memory_order_release);
++        if(c.mailboxes[priorHistorySlot].ofaSubmitDone.load(std::memory_order_acquire)) {
++            gDLSS.DiscardPreparedMotion(c.mailboxes[priorHistorySlot].sequence.load(std::memory_order_acquire));
++            c.mailboxes[priorHistorySlot].state.store(CaptureState::kFree, std::memory_order_release);
++        } else {
++            c.mailboxes[priorHistorySlot].state.store(CaptureState::kDiscardPending, std::memory_order_release);
++        }
+     }
+     c.mailboxes[sourceSlot].state.store(CaptureState::kHistory, std::memory_order_release);
+     c.lastHistoryDone.store(renderDone, std::memory_order_release);
+@@ -1259,6 +1321,24 @@ void App::Worker(HWND target, HWND outputWindow) {
+     Dx12State d;
+     HANDLE mailboxEvent = nullptr;
+     std::thread captureProducer;
++    std::thread ofaSubmitWorker;
++    struct OfaSubmitJob {
++        UINT sourceSlot{};
++        UINT referenceSlot{};
++        uint64_t sequence{};
++        UINT64 captureValue{};
++        UINT64 historyValue{};
++    };
++    std::mutex ofaJobMutex;
++    std::condition_variable ofaJobCv;
++    std::deque<OfaSubmitJob> ofaJobs;
++    std::atomic<bool> ofaWorkerStop{false};
++    std::atomic<uint64_t> ofaWorkerSubmitted{0};
++    std::atomic<uint64_t> ofaWorkerSkipped{0};
++    // Pins protect a history texture during the short enqueue -> nvOFExecuteD3D12
++    // CPU window. 

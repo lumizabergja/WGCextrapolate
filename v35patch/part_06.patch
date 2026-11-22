@@ -1,0 +1,100 @@
+r_acquire)==producerHistoryDone &&
++                            c.mailboxes[historyIndex].state.load(std::memory_order_acquire)==CaptureState::kHistory;
++                        if(historyStillValid) {
++                            {
++                                std::lock_guard lock(ofaJobMutex);
++                                ofaJobs.push_back({slot,historyIndex,publishedSequence,ready,producerHistoryDone});
++                            }
++                            ofaQueued=true;
++                            ofaJobCv.notify_one();
++                        } else {
++                            ofaCpuPins[historyIndex].fetch_sub(1,std::memory_order_acq_rel);
++                        }
++                    }
++                    if(!ofaQueued)
++                        c.mailboxes[slot].ofaSubmitDone.store(true,std::memory_order_release);
+ 
+                     // Capture-frame release remains off the render critical path.
+ 
+@@ -1646,8 +1817,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     c.mailboxes[i].state.load(std::memory_order_acquire)==CaptureState::kReady &&
+                     c.mailboxes[i].sequence.load(std::memory_order_acquire)>bestSequence) { newer=true;break; }
+                 if(newer&&attempt==0) {
+-                    gDLSS.DiscardPreparedMotion(bestSequence);
+-                    c.mailboxes[best].state.store(CaptureState::kFree,std::memory_order_release);
++                    retireMailbox(static_cast<UINT>(best),bestSequence);
+                     producerDropped.fetch_add(1,std::memory_order_relaxed);
+                     continue;
+                 }
+@@ -1660,8 +1830,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     // sequence while we are discarding the old prepared flow.
+                     if(c.mailboxes[i].state.compare_exchange_strong(stale,CaptureState::kConsuming,
+                         std::memory_order_acq_rel,std::memory_order_acquire)) {
+-                        gDLSS.DiscardPreparedMotion(c.mailboxes[i].sequence.load(std::memory_order_acquire));
+-                        c.mailboxes[i].state.store(CaptureState::kFree,std::memory_order_release);
++                        retireMailbox(i,c.mailboxes[i].sequence.load(std::memory_order_acquire));
+                         producerDropped.fetch_add(1,std::memory_order_relaxed);
+                     }
+                 }
+@@ -1716,8 +1885,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+ 
+             HWND currentForeground=GetForegroundWindow();
+             if(IsIconic(target)||(currentForeground!=target&&currentForeground!=outputWindow&&GetAncestor(currentForeground,GA_ROOT)!=target)) {
+-                gDLSS.DiscardPreparedMotion(c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire));
+-                c.mailboxes[sourceSlot].state.store(CaptureState::kFree,std::memory_order_release);
++                retireMailbox(static_cast<UINT>(sourceSlot),c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire));
+                 continue;
+             }
+             // Complete optional sleep and allocator backpressure BEFORE the
+@@ -1738,17 +1906,23 @@ void App::Worker(HWND target, HWND outputWindow) {
+             };
+             waitReusable(d.frameFence.Get(),d.allocatorFenceValues[directIndex],false);
+             waitReusable(d.preprocessFence.Get(),d.preprocessFenceValues[computeIndex],true);
++            // V35: consume presentation backpressure before choosing the final
++            // capture. Waiting here prevents Present() from becoming the hidden
++            // queue-depth limiter and makes the subsequent latch as fresh as possible.
++            if(d.frameLatencyWaitable) {
++                const DWORD latencyWait=WaitForSingleObject(d.frameLatencyWaitable,250);
++                if(latencyWait==WAIT_FAILED)
++                    throw std::runtime_error("DXGI frame-latency waitable-object wait failed.");
++            }
+             if(stop_ || paused_) {
+-                gDLSS.DiscardPreparedMotion(c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire));
+-                c.mailboxes[sourceSlot].state.store(CaptureState::kFree,std::memory_order_release);
++                retireMailbox(static_cast<UINT>(sourceSlot),c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire));
+                 continue;
+             }
+             ++d.lateLatchChecks;
+             const uint64_t oldSequence=c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire);
+             const int fresher=claimLatestMailbox(oldSequence);
+             if(fresher>=0) {
+-                gDLSS.DiscardPreparedMotion(oldSequence);
+-                c.mailboxes[sourceSlot].state.store(CaptureState::kFree,std::memory_order_release);
++                retireMailbox(static_cast<UINT>(sourceSlot),oldSequence);
+                 sourceSlot=fresher;
+                 ++d.lateLatchReplaced;
+                 producerDropped.fetch_add(1,std::memory_order_relaxed);
+@@ -1878,6 +2052,13 @@ void App::Worker(HWND target, HWND outputWindow) {
+                 lastCapturedReport=capturedNow;lastDroppedReport=droppedNow;
+                 gLog.Write(L"V26 producer: "+std::to_wstring(capturedDelta)+L" captures, "+
+                            std::to_wstring(droppedDelta)+L" stale/dropped updates in report interval.");
++                const uint64_t ofaSubmitted=ofaWorkerSubmitted.exchange(0,std::memory_order_relaxed);
++                const uint64_t ofaSkipped=ofaWorkerSkipped.exchange(0,std::memory_order_relaxed);
++                size_t ofaPending=0;
++                { std::lock_guard lock(ofaJobMutex); ofaPending=ofaJobs.size(); }
++                gLog.Write(L"V35 OFA worker: submitted="+std::to_wstring(ofaSubmitted)+
++                           L", skipped/stale="+std::to_wstring(ofaSkipped)+
++                           L", queued="+std::to_wstring(ofaPending)+L".");
+                 PostStatus(L"Captured/base presents: "+std::to_wstring(unsigned(presented/elapsed))+L" FPS | "+gDLSS.Status());
+                 presented=0;lastReport=now;
+             }
+@@ -1891,6 +2072,9 @@ void App::Worker(HWND target, HWND outputWindow) {
+     if(workerControlEvent_)SetEvent(workerControlEvent_);
+     if(mailboxEvent)SetEvent(mailboxEvent);
+     if(captureProducer.joinable())captureProducer.join();
++    ofaWorkerStop.store(true,std::memory_order_release);
++    ofaJobCv.notify_all();
++    if(ofaSubmitWorker.joinable())ofaSubmitWorker.join();
+     if(mailboxEvent){CloseHandle(mailboxEvent);mailboxEvent=nullptr;}
+ 
+     if(d.queue) {

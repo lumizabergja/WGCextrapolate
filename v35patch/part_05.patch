@@ -1,0 +1,84 @@
+&,target,width,height]() {
+@@ -1338,7 +1478,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                 }
+                 gLog.Write(L"V27 Alt-Tab recovery: capture objects are suspended on deactivation and rebuilt in-place on resume; steady-state capture path is unchanged.");
+                 gLog.Write(L"V28 capture ordering retained: Copy -> capture-fence Signal -> D3D11 Flush1(COPY) -> native D3D12 OFA submit.");
+-                gLog.Write(L"V34 split-ready: publish color mailbox before OFA submit; early copy overlaps OFA submission/downsample; ReleaseFrame stays off critical path.");
++                gLog.Write(L"V35 split-ready: publish color mailbox before async OFA-worker submit; early copy/pre-OFA overlap submission/downsample; ReleaseFrame stays off critical path.");
+                 gLog.Write(L"V30: pre-OFA depth/setup runs before the OFA fence wait; Alt-Tab uses retained capture sessions and rebuilds only on real access loss/stall.");
+ 
+                 auto recreateDxgiDuplication=[&]()->bool {
+@@ -1493,15 +1633,22 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     // Prefer an unused slot. If render falls behind, overwrite an
+                     // unclaimed READY slot rather than queueing stale captured frames.
+                     for(UINT i=0;i<kCaptureSlots&&sourceSlot<0;++i) {
++                        if(ofaCpuPins[i].load(std::memory_order_acquire)!=0) continue;
+                         if(!gDLSS.CanReuseMotionSource(i)) continue;
+                         LONG expected=CaptureState::kFree;
+                         if(c.mailboxes[i].state.compare_exchange_strong(expected,CaptureState::kWriting,
+-                            std::memory_order_acq_rel,std::memory_order_acquire)) sourceSlot=static_cast<int>(i);
++                            std::memory_order_acq_rel,std::memory_order_acquire)) {
++                            // Close the race with a pin acquired after the first check.
++                            if(ofaCpuPins[i].load(std::memory_order_acquire)==0) sourceSlot=static_cast<int>(i);
++                            else c.mailboxes[i].state.store(CaptureState::kFree,std::memory_order_release);
++                        }
+                     }
+                     if(sourceSlot<0) {
+                         uint64_t oldest=~uint64_t{0}; int candidate=-1;
+                         for(UINT i=0;i<kCaptureSlots;++i) {
++                            if(ofaCpuPins[i].load(std::memory_order_acquire)!=0) continue;
+                             if(!gDLSS.CanReuseMotionSource(i)) continue;
++                            if(!c.mailboxes[i].ofaSubmitDone.load(std::memory_order_acquire)) continue;
+                             if(c.mailboxes[i].state.load(std::memory_order_acquire)==CaptureState::kReady &&
+                                c.mailboxes[i].sequence.load(std::memory_order_acquire)<oldest) {
+                                 oldest=c.mailboxes[i].sequence.load(std::memory_order_acquire); candidate=static_cast<int>(i);
+@@ -1512,9 +1659,13 @@ void App::Worker(HWND target, HWND outputWindow) {
+                             LONG expected=CaptureState::kReady;
+                             if(c.mailboxes[candidate].state.compare_exchange_strong(expected,CaptureState::kWriting,
+                                 std::memory_order_acq_rel,std::memory_order_acquire)) {
+-                                gDLSS.DiscardPreparedMotion(staleSequence);
+-                                sourceSlot=candidate;
+-                                producerDropped.fetch_add(1,std::memory_order_relaxed);
++                                if(ofaCpuPins[candidate].load(std::memory_order_acquire)==0) {
++                                    gDLSS.DiscardPreparedMotion(staleSequence);
++                                    sourceSlot=candidate;
++                                    producerDropped.fetch_add(1,std::memory_order_relaxed);
++                                } else {
++                                    c.mailboxes[candidate].state.store(CaptureState::kReady,std::memory_order_release);
++                                }
+                             }
+                         }
+                     }
+@@ -1569,7 +1720,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     c.mailboxes[slot].sequence.store(publishedSequence,std::memory_order_release);
+                     c.mailboxes[slot].ofaSubmitDone.store(false,std::memory_order_release);
+ 
+-                    // V34: publish COLOR readiness before producer-side OFA submission.
++                    // V35: publish COLOR readiness before asynchronous OFA-worker submission.
+                     // The renderer can start the independent early copy immediately while
+                     // the producer queues OFA (and optional OFA-resolution downsample).
+                     c.mailboxes[slot].state.store(CaptureState::kReady,std::memory_order_release);
+@@ -1582,14 +1733,34 @@ void App::Worker(HWND target, HWND outputWindow) {
+                         gLog.Write(L"V31 presenter shown after first fresh post-Alt-Tab capture.");
+                     }
+ 
+-                    // OFA waits on the already-submitted capture fence. ofaSubmitDone is
+-                    // a CPU-side submission-complete latch only; it never waits for OFA GPU completion.
++                    // V35: snapshot the last actually-presented reference and hand OFA
++                    // submission to the dedicated worker. Capture ReleaseFrame no longer
++                    // sits behind nvOFExecuteD3D12 or the optional OFA-resolution scaler.
+                     const int producerHistory=c.historySlot.load(std::memory_order_acquire);
+                     const UINT64 producerHistoryDone=c.lastHistoryDone.load(std::memory_order_acquire);
+-                    if(producerHistory>=0 && producerHistory<static_cast<int>(kCaptureSlots) && producerHistory!=sourceSlot)
+-                        gDLSS.ProducerPrepareMotion(slot,static_cast<UINT>(producerHistory),publishedSequence,
+-                            d.captureFence.Get(),ready,d.releaseFence.Get(),producerHistoryDone);
+-                    c.mailboxes[slot].ofaSubmitDone.store(true,std::memory_order_release);
++                    bool ofaQueued=false;
++                    if(producerHistory>=0 && producerHistory<static_cast<int>(kCaptureSlots) && producerHistory!=sourceSlot && producerHistoryDone) {
++                        const UINT historyIndex=static_cast<UINT>(producerHistory);
++                        ofaCpuPins[historyIndex].fetch_add(1,std::memory_order_acq_rel);
++                        // Validate after pinning: if history changed while the pin was
++                        // acquired, don't enqueue a pair built from mismatched frames.
++                        const bool historyStillValid=
++                            c.historySlot.load(std::memory_order_acquire)==producerHistory &&
++                            c.lastHistoryDone.load(std::memory_orde

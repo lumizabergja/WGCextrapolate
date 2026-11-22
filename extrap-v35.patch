@@ -1,0 +1,605 @@
+--- a/source/dlss_bridge.h
++++ b/source/dlss_bridge.h
+@@ -5,8 +5,6 @@
+ #include <d3dcompiler.h>
+ #include <wrl/client.h>
+ #include <sl.h>
+-#include <sl_dlss.h>
+-#include <sl_dlss_g.h>
+ #include <sl_reflex.h>
+ #include <sl_pcl.h>
+ #include <filesystem>
+@@ -63,6 +61,10 @@
+     void BeforeFrame(ID3D12CommandQueue*);
+     void DrainInputs(ID3D12CommandQueue*);
+     ID3D12Resource* InputColor(UINT i) const { return inputSets[i % inputSetCount].current.Get(); }
++    ID3D12Resource* MotionTexture() const { return inputSets[activeInputSet].motion.Get(); }
++    void MarkPredictionInUse(ID3D12Fence* fence,UINT64 value) {
++        auto& in=inputSets[activeInputSet]; in.completionFence=fence; in.completionValue=value;
++    }
+     UINT ActiveInputSet() const { return activeInputSet; }
+     void AfterPresent();
+     uint64_t ConsumeInputRecycleWaits() { auto v=inputRecycleWaits; inputRecycleWaits=0; return v; }
+@@ -91,7 +93,6 @@
+     ComPtr<ID3D12Device> device;
+     NvofBridge nvof;
+     UINT stride{};
+-    sl::DLSSGOptions activeOptions{};
+     bool suspended{};
+     bool framePrepared{};
+     bool frameSlept{};
+@@ -101,9 +102,6 @@
+     uint64_t inputRecycleWaits{};
+     uint64_t reflexSleepCount{};
+     double reflexSleepSumMs{}, reflexSleepMaxMs{};
+-    uint64_t reportCalls{}, reportPresents{};
+-    sl::Result reportResult{sl::Result::eOk};
+-    sl::DLSSGStatus reportStatus{};
+     PFun_slInit* init{};
+     PFun_slShutdown* shutdown{};
+     PFun_slSetD3DDevice* setDevice{};
+@@ -114,8 +112,6 @@
+     PFun_slSetTagForFrame* tags{};
+     PFun_slEvaluateFeature* evaluate{};
+     PFun_slFreeResources* freeResources{};
+-    PFun_slDLSSGSetOptions* fgOptions{};
+-    PFun_slDLSSGGetState* fgState{};
+     PFun_slReflexSetOptions* reflexOptions{};
+     PFun_slReflexSleep* reflexSleep{};
+     PFun_slPCLSetMarker* marker{};
+--- a/source/dlss_bridge.cpp
++++ b/source/dlss_bridge.cpp
+@@ -125,9 +125,6 @@
+ void DlssExperiment::Load() {
+     wchar_t path[32768]{}; GetModuleFileNameW(nullptr,path,32768);
+     auto dir=std::filesystem::path(path).parent_path().wstring();
+-    for (const wchar_t* file : {L"sl.interposer.dll", L"sl.common.dll", L"sl.pcl.dll",
+-                               L"sl.reflex.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll"})
+-        (void)file;
+     module=LoadLibraryExW((dir+L"\\sl.interposer.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+     if(!module) throw std::runtime_error("Cannot load sl.interposer.dll; extract the entire ZIP first.");
+     Export(init,"slInit"); Export(shutdown,"slShutdown"); Export(setDevice,"slSetD3DDevice");
+@@ -136,20 +133,20 @@
+     Export(evaluate,"slEvaluateFeature");Export(freeResources,"slFreeResources");
+     Export(factory,"CreateDXGIFactory1"); Export(createDevice,"D3D12CreateDevice");
+     const wchar_t* dirs[]={dir.c_str()};
+-    sl::Feature features[]={sl::kFeatureDLSS_G,sl::kFeatureReflex,sl::kFeaturePCL};
++    sl::Feature features[]={sl::kFeatureReflex,sl::kFeaturePCL};
+     sl::Preferences p{};p.pathsToPlugins=dirs;p.numPathsToPlugins=1;p.pathToLogsAndData=dir.c_str();
+-    p.logLevel=sl::LogLevel::eDefault;p.featuresToLoad=features;p.numFeaturesToLoad=3;
++    p.logLevel=sl::LogLevel::eDefault;p.featuresToLoad=features;p.numFeaturesToLoad=2;
+     p.flags=sl::PreferenceFlags::eDisableCLStateTracking|sl::PreferenceFlags::eUseFrameBasedResourceTagging|sl::PreferenceFlags::eUseDXGIFactoryProxy;
+-    p.engine=sl::EngineType::eCustom;p.engineVersion="DXGI-DX12 Simple Fixed FG";
++    p.engine=sl::EngineType::eCustom;p.engineVersion="DX12 Optical Flow Extrapolation";
+     p.projectId="e86d5d1d-b886-47ac-a90d-48708688358b";p.renderAPI=sl::RenderAPI::eD3D12;
+     Check(init(p,sl::kSDKVersion),"slInit");initialized=true;
+-    log(L"Streamline 2.14.1 initialized for DLSS Frame Generation only (no DLSS scaler).");
++    log(L"Streamline initialized with Reflex + PCL only; DLSS-G is not loaded.");
+ }
+ void DlssExperiment::Texture(ComPtr<ID3D12Resource>& r,UINT w,UINT h,DXGI_FORMAT f,D3D12_RESOURCE_STATES state) {
+     D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;
+     d.DepthOrArraySize=1;d.MipLevels=1;d.Format=f;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+-    HR(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"Create DLSS texture");
++    HR(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"Create motion texture");
+ }
+ void DlssExperiment::SRV(ID3D12Resource* r,DXGI_FORMAT fmt,UINT slot) {
+     D3D12_SHADER_RESOURCE_VIEW_DESC d{};d.Format=fmt;d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+@@ -161,70 +158,20 @@
+     auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=slot*stride;device->CreateUnorderedAccessView(r,nullptr,&d,h);
+ }
+ void DlssExperiment::Init(ID3D12Device* dev,IDXGIAdapter1* adapter,ID3D12Resource* source0,ID3D12Resource* source1,ID3D12Resource* source2,UINT w,UINT h,bool, bool useFG,UINT multiplier,bool boost,UINT nvofGrid,UINT reflexMode,bool nvofCost,UINT nvofWidth,UINT nvofHeight) {
+-    if (multiplier != 0 && (multiplier < 2 || multiplier > 6)) throw std::runtime_error("Select 2x through 6x fixed FG, or Dynamic MFG.");
+-    device=dev;sr=false;fg=useFG;ow=w;oh=h;rw=w;rh=h;history=false;index=0;srEvaluated=false; reflexTiming=reflexMode; activeInputSet=0; nextInputSet=0; inputRecycleWaits=0; dynamicMfg=(multiplier==0); inputSetCount=(dynamicMfg || multiplier>=5) ? 4u : 3u;
++    if (multiplier < 1 || multiplier > 6) throw std::runtime_error("Select Off (1x) through 6x extrapolation.");
++    device=dev;sr=false;fg=true;ow=w;oh=h;rw=w;rh=h;history=false;index=0;srEvaluated=false; reflexTiming=reflexMode; activeInputSet=0; nextInputSet=0; inputRecycleWaits=0; dynamicMfg=false; inputSetCount=(dynamicMfg || multiplier>=5) ? 4u : 3u;
+     DXGI_ADAPTER_DESC1 ad{};HR(adapter->GetDesc1(&ad),"Adapter desc");
+     sl::AdapterInfo ai{};ai.deviceLUID=(uint8_t*)&ad.AdapterLuid;ai.deviceLUIDSizeInBytes=sizeof(LUID);
+-    if(fg) {
+-        Check(supported(sl::kFeatureDLSS_G,ai),"DLSS Frame Generation support");
+-        Feature(fgOptions,sl::kFeatureDLSS_G,"slDLSSGSetOptions");Feature(fgState,sl::kFeatureDLSS_G,"slDLSSGGetState");
+-        Feature(reflexOptions,sl::kFeatureReflex,"slReflexSetOptions");Feature(reflexSleep,sl::kFeatureReflex,"slReflexSleep");
+-        Feature(marker,sl::kFeaturePCL,"slPCLSetMarker");
+-        sl::ReflexOptions ro{};
+-        ro.mode = reflexTiming==0 ? sl::ReflexMode::eOff : (boost ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency);
+-        Check(reflexOptions(ro),"Configure Reflex");
+-        if(reflexTiming==0) log(L"Presenter Reflex sleep: OFF (game Reflex remains independent).");
+-        else if(reflexTiming==1) log(boost ? L"Presenter Reflex: Pre-capture On + Boost" : L"Presenter Reflex: Pre-capture On");
+-        else log(boost ? L"Presenter Reflex: After-arrival On + Boost" : L"Presenter Reflex: After-arrival On");
+-        sl::DLSSGOptions go{};go.mode=sl::DLSSGMode::eOff;go.numBackBuffers=2;
+-        go.colorWidth=w;go.colorHeight=h;go.colorBufferFormat=DXGI_FORMAT_B8G8R8A8_UNORM;
+-        go.mvecDepthWidth=rw;go.mvecDepthHeight=rh;go.mvecBufferFormat=DXGI_FORMAT_R16G16_FLOAT;go.depthBufferFormat=DXGI_FORMAT_R32_FLOAT;
+-        go.hudLessBufferFormat=DXGI_FORMAT_R16G16B16A16_FLOAT;
+-        go.numFramesToGenerate = dynamicMfg ? 1u : multiplier - 1u;
+-        // V33: ask Streamline for the real runtime capabilities and a rough VRAM estimate
+-        // before enabling FG. This is startup-only and adds no steady-state work.
+-        go.flags = sl::DLSSGFlags::eRequestVRAMEstimate;
+-        sl::DLSSGState state{};Check(fgState(viewport,state,&go),"DLSS-G capabilities");
+-        const bool dynamicSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+-        const bool vsyncSupported = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
+-        if (dynamicMfg && !dynamicSupported)
+-            throw std::runtime_error("Dynamic MFG is not supported by this GPU/driver/runtime. Choose a fixed multiplier.");
+-        if (!dynamicMfg && multiplier - 1 > state.numFramesToGenerateMax)
+-            throw std::runtime_error("Selected " + std::to_string(multiplier) + "x FG exceeds runtime support (maximum " +
+-                std::to_string(state.numFramesToGenerateMax + 1) + "x). Choose a lower multiplier.");
+-        {
+-            const double vramMiB = double(state.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0);
+-            wchar_t caps[320]{};
+-            swprintf_s(caps,L"V33 DLSS-G capabilities: max fixed %ux; Dynamic MFG=%s; VSync support=%s; min dimension=%u; estimated FG VRAM %.1f MiB.",
+-                state.numFramesToGenerateMax + 1, dynamicSupported ? L"yes" : L"no",
+-                vsyncSupported ? L"yes" : L"no", state.minWidthOrHeight, vramMiB);
+-            log(caps);
+-        }
+-        go.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+-        if (dynamicMfg) {
+-            go.mode = sl::DLSSGMode::eDynamic;
+-            go.numFramesToGenerate = 1; // ignored by Dynamic MFG
+-            go.dynamicTargetFrameRate = 0.0f; // Streamline auto-detects display refresh
+-        } else {
+-            go.mode = sl::DLSSGMode::eOn;
+-            go.numFramesToGenerate = multiplier - 1;
+-        }
+-        activeOptions = go;
+-        suspended = false;
+-        framePrepared = false;
+-        reportCalls = reportPresents = 0;
+-        reportResult = sl::Result::eOk;
+-        reportStatus = sl::DLSSGStatus::eOk;
+-        Check(fgOptions(viewport,go), dynamicMfg ? "Enable NVIDIA Dynamic MFG" : "Enable fixed NVIDIA Frame Generation");
+-        if (dynamicMfg)
+-            log(L"V33 Dynamic MFG enabled: target frame rate auto-detects the active display refresh rate.");
+-        else
+-            log(L"Requested fixed " + std::to_wstring(multiplier) + L"x FG: " +
+-                std::to_wstring(go.numFramesToGenerate) + L" generated frames per captured frame. Runtime max generated frames=" +
+-                std::to_wstring(state.numFramesToGenerateMax));
+-        log(L"V33 Streamline input ring: " + std::to_wstring(inputSetCount) +
+-            L" sets (3 for 2x-4x; 4 for 5x/6x/Dynamic to reduce recycled-input waits).");
+-    }
++    // Reflex and PCL remain active. DLSS-G is deliberately neither loaded nor called.
++    Check(supported(sl::kFeatureReflex,ai),"Reflex feature support");
++    Feature(reflexOptions,sl::kFeatureReflex,"slReflexSetOptions");
++    Feature(reflexSleep,sl::kFeatureReflex,"slReflexSleep");
++    Feature(marker,sl::kFeaturePCL,"slPCLSetMarker");
++    sl::ReflexOptions ro{};
++    ro.mode = reflexTiming==0 ? sl::ReflexMode::eOff : (boost ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency);
++    Check(reflexOptions(ro),"Configure Streamline Reflex");
++    suspended=false; framePrepared=false;
++    log(reflexTiming==0 ? L"Reflex sleep disabled" : L"Streamline Reflex with Boost configured for captured frames");
+     auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     for(UINT i=0;i<inputSetCount;++i) {
+         Texture(inputSets[i].current,rw,rh,DXGI_FORMAT_R16G16B16A16_FLOAT,read);
+@@ -286,7 +233,7 @@
+         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
+         HR(dev->CreateComputePipelineState(&pd,IID_PPV_ARGS(&depthFillPSO)),"Depth pre-pass pipeline");
+     }
+-    log(L"Native-resolution FG input/output "+std::to_wstring(ow)+L"x"+std::to_wstring(oh)+L"; DLSS scaling is not loaded.");
++    log(L"Native capture and custom shader extrapolation "+std::to_wstring(ow)+L"x"+std::to_wstring(oh)+L"; NVIDIA DLSS-G disabled.");
+     log(nvof.Available()?L"Motion source: NVIDIA Optical Flow Accelerator; V26 flush-first capture + late OFA wait; async D3D12 preprocess queue active.":L"Motion source: original software estimator fallback; direct-source presenter remains active.");
+ }
+ void DlssExperiment::Marker(sl::PCLMarker m) { if(fg&&token&&marker) Check(marker(m,*token),"Reflex frame marker"); }
+@@ -327,17 +274,8 @@
+     framePrepared=false; frameSlept=false;
+     auto& in=inputSets[activeInputSet];
+     Marker(sl::PCLMarker::eSimulationStart);Marker(sl::PCLMarker::eSimulationEnd);
+-    sl::Constants c{};
+-    sl::float4x4 identity{};identity[0]={1,0,0,0};identity[1]={0,1,0,0};identity[2]={0,0,1,0};identity[3]={0,0,0,1};
+-    c.cameraViewToClip=identity;c.clipToCameraView=identity;c.clipToLensClip=identity;c.clipToPrevClip=identity;c.prevClipToClip=identity;
+-    c.jitterOffset={0,0};c.mvecScale={1.0f/rw,1.0f/rh};c.cameraPinholeOffset={0,0};
+-    c.cameraPos={0,0,0};c.cameraUp={0,1,0};c.cameraRight={1,0,0};c.cameraFwd={0,0,1};
+-    c.cameraNear=0.1f;c.cameraFar=1000;c.cameraFOV=1.04719755f;c.cameraAspectRatio=float(ow)/oh;
+-    c.motionVectorsInvalidValue=65504;c.depthInverted=sl::eFalse;c.cameraMotionIncluded=sl::eTrue;
+-    const bool nvofFlowReady=nvof.Available()&&nvof.FlowReady();
+-    const bool resetThisFrame=!history||(nvof.Available()&&!nvofFlowReady);
+-    c.motionVectors3D=sl::eFalse;c.reset=resetThisFrame?sl::eTrue:sl::eFalse;c.orthographicProjection=sl::eTrue;
+-    Check(constants(c,*token,viewport),"Set synthetic flat-plane constants");
++    // No DLSS-G constants: the vectors are consumed directly by our prediction shader.
++    const bool resetThisFrame=!history||(nvof.Available()&&!nvof.FlowReady());
+ 
+     const auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     ID3D12DescriptorHeap* hs[]={heap.Get()};list->SetDescriptorHeaps(1,hs);list->SetComputeRootSignature(root.Get());
+@@ -411,17 +349,9 @@
+     framePrepared = false; frameSlept = false;
+     auto& in=inputSets[activeInputSet];
+     Marker(sl::PCLMarker::eSimulationStart);Marker(sl::PCLMarker::eSimulationEnd);
+-    sl::Constants c{};
+-    sl::float4x4 identity{};identity[0]={1,0,0,0};identity[1]={0,1,0,0};identity[2]={0,0,1,0};identity[3]={0,0,0,1};
+-    c.cameraViewToClip=identity;c.clipToCameraView=identity;c.clipToLensClip=identity;c.clipToPrevClip=identity;c.prevClipToClip=identity;
+-    c.jitterOffset={0,0};c.mvecScale={1.0f/rw,1.0f/rh};c.cameraPinholeOffset={0,0};
+-    c.cameraPos={0,0,0};c.cameraUp={0,1,0};c.cameraRight={1,0,0};c.cameraFwd={0,0,1};
+-    c.cameraNear=0.1f;c.cameraFar=1000;c.cameraFOV=1.04719755f;c.cameraAspectRatio=float(ow)/oh;
+-    c.motionVectorsInvalidValue=65504;c.depthInverted=sl::eFalse;c.cameraMotionIncluded=sl::eTrue;
++    // No DLSS-G constants: the vectors are consumed directly by our prediction shader.
+     const bool nvofFlowReady=nvof.Available()&&nvof.FlowReady();
+     const bool resetThisFrame=!history||(nvof.Available()&&!nvofFlowReady);
+-    c.motionVectors3D=sl::eFalse;c.reset=resetThisFrame?sl::eTrue:sl::eFalse;c.orthographicProjection=sl::eTrue;
+-    Check(constants(c,*token,viewport),"Set synthetic flat-plane constants");
+ 
+     // V23 compute queue: keep compute-only resources in NON_PIXEL_SHADER_RESOURCE.
+     // The live capture source is handed off from COMMON to the compute queue here;
+@@ -480,28 +410,8 @@
+     history=true;
+ }
+ 
+-void DlssExperiment::TagInputs(ID3D12GraphicsCommandList* list) {
+-    auto& in=inputSets[activeInputSet];
+-    const auto read=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+-    sl::Extent input{};input.width=rw;input.height=rh;
+-    sl::Resource dr(sl::ResourceType::eTex2d,in.depth.Get(),read),mv(sl::ResourceType::eTex2d,in.motion.Get(),read);
+-    dr.width=mv.width=rw;dr.height=mv.height=rh;
+-    dr.nativeFormat=DXGI_FORMAT_R32_FLOAT;mv.nativeFormat=DXGI_FORMAT_R16G16_FLOAT;
+-    sl::ResourceTag inputs[]={
+-        {&dr,sl::kBufferTypeDepth,sl::eValidUntilPresent,&input},
+-        {&mv,sl::kBufferTypeMotionVectors,sl::eValidUntilPresent,&input}
+-    };
+-    Check(tags(*token,viewport,inputs,2,list),"Tag motion and depth buffers");
+-}
+-
+-void DlssExperiment::TagBackbuffer(ID3D12GraphicsCommandList* list,ID3D12Resource* backbuffer,D3D12_RESOURCE_STATES state) {
+-    if(!fg||!token) return;
+-    sl::Extent full{};full.width=ow;full.height=oh;
+-    sl::Resource back(sl::ResourceType::eTex2d,backbuffer,state);
+-    back.width=ow;back.height=oh;back.nativeFormat=DXGI_FORMAT_B8G8R8A8_UNORM;
+-    sl::ResourceTag tag{&back,sl::kBufferTypeBackbuffer,sl::eValidUntilPresent,&full};
+-    Check(tags(*token,viewport,&tag,1,list),"Tag final swapchain backbuffer");
+-}
++void DlssExperiment::TagInputs(ID3D12GraphicsCommandList*) { /* No DLSS-G resource tags */ }
++void DlssExperiment::TagBackbuffer(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES) { /* No DLSS-G tag */ }
+ void DlssExperiment::BeforeFrame(ID3D12CommandQueue* queue) {
+     // V18: do not blindly recycle the next round-robin Streamline input set.
+     // Prefer any set whose prior DLSS-G input consumption is already complete,
+@@ -526,49 +436,17 @@
+     for(UINT i=0;i<inputSetCount;++i) { auto& in=inputSets[i]; if(in.completionFence && in.completionValue)
+         HR(queue->Wait(in.completionFence.Get(),in.completionValue),"Drain FG input set"); }
+ }
+-void DlssExperiment::AfterPresent() {
+-    if (!fg) return;
+-    sl::DLSSGState state{};
+-    auto r = fgState(viewport, state, nullptr);
+-    if (r != sl::Result::eOk) { reportResult = r; return; }
+-    reportStatus = static_cast<sl::DLSSGStatus>(
+-        static_cast<unsigned>(reportStatus) | static_cast<unsigned>(state.status));
+-    ++reportCalls;
+-    reportPresents += state.numFramesActuallyPresented;
+-    inputSets[activeInputSet].completionFence = static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence);
+-    inputSets[activeInputSet].completionValue = state.lastPresentInputsProcessingCompletionFenceValue;
+-}
++void DlssExperiment::AfterPresent() { /* Prediction is presented directly on our DX12 swapchain. */ }
+ void DlssExperiment::Suspend(bool value) {
+-    if (!fg || !fgOptions || value == suspended) return;
+-    auto options = activeOptions;
+-    if (value) options.mode = sl::DLSSGMode::eOff;
+-    Check(fgOptions(viewport, options), "Suspend/resume fixed FG");
+-    suspended = value;
+-    framePrepared = false; frameSlept=false;
+-    history = false;
+-    nvof.ResetHistory();
++    suspended=value; framePrepared=false; frameSlept=false;
++    history=false; nvof.ResetHistory();
+ }
+ std::wstring DlssExperiment::Status() {
+-    std::wstring s = dynamicMfg ? L"Dynamic MFG requested" : L"Fixed " + std::to_wstring(activeOptions.numFramesToGenerate + 1) + L"x requested";
+-    if (reportResult != sl::Result::eOk)
+-        s += L" | SDK error=" + std::to_wstring(static_cast<int>(reportResult));
+-    else if (static_cast<unsigned>(reportStatus))
+-        s += L" | BLOCKED flags=" + std::to_wstring(static_cast<unsigned>(reportStatus));
+-    else if (reportCalls && reportPresents > reportCalls) {
+-        wchar_t text[100]{};
+-        swprintf_s(text, L" | SDK reports %.2fx presents", double(reportPresents) / double(reportCalls));
+-        s += text;
+-    } else
+-        s += L" | No extra frames reported; check sl.log";
+-    reportCalls = reportPresents = 0;
+-    reportResult = sl::Result::eOk;
+-    reportStatus = sl::DLSSGStatus::eOk;
+-    return s;
++    return nvof.Available() ? L"NvOFA motion / custom DX12 extrapolation / Reflex" :
++                              L"Software motion fallback / custom DX12 extrapolation / Reflex";
+ }
+ void DlssExperiment::Release() {
+     if(device) {
+-        if(fg&&fgOptions) {sl::DLSSGOptions o{};o.mode=sl::DLSSGMode::eOff;fgOptions(viewport,o);}
+-        if(freeResources) {if(sr)freeResources(sl::kFeatureDLSS,viewport);if(fg)freeResources(sl::kFeatureDLSS_G,viewport);}
+     }
+     nvof.Shutdown();
+     token=nullptr;framePrepared=false;frameSlept=false;history=false;previous.Reset();
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -32,7 +32,7 @@
+ 
+ namespace {
+ 
+-constexpr wchar_t kAppName[] = L"DX12 Presenter V35 - Low Latency OFA Worker";
++constexpr wchar_t kAppName[] = L"FG Extrap V35 - DXGI / WGC / NvOFA / Reflex";
+ constexpr wchar_t kControlClass[] = L"LoLDX12Presenter.Control";
+ constexpr wchar_t kPresenterClass[] = L"LoLDX12Presenter.Output";
+ constexpr UINT WM_APP_STATUS = WM_APP + 1;
+@@ -71,7 +71,7 @@
+         wchar_t path[MAX_PATH]{};
+         GetModuleFileNameW(nullptr, path, MAX_PATH);
+         std::filesystem::path p(path);
+-        p.replace_filename(L"DLSS-Presenter.log");
++        p.replace_filename(L"FG-Extrap-V35.log");
+         file_.open(p, std::ios::app);
+     }
+     void Write(const std::wstring& text) {
+@@ -263,6 +263,8 @@
+     bool CreatePipeline(Dx12State& d);
+     bool RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 copyReady,
+                      uint64_t frameSequence, float syntheticOffsetPixels = 0.0f);
++    bool PresentPrediction(Dx12State& d, UINT sourceSlot, float fraction);
++    void UpdateFrameSRVs(Dx12State& d, UINT allocatorIndex, UINT sourceSlot);
+     void DestroyDx12(Dx12State& d);
+     static BOOL CALLBACK EnumWindowsProc(HWND, LPARAM);
+     static LRESULT CALLBACK ControlProc(HWND, UINT, WPARAM, LPARAM);
+@@ -313,7 +315,7 @@
+     gDLSS.log=[](const std::wstring& text){gLog.Write(text);};
+     try { gDLSS.Load(); } catch(const std::exception& e) {
+         std::string msg=e.what();std::wstring wide(msg.begin(),msg.end());gLog.Write(wide);
+-        MessageBoxW(nullptr,wide.c_str(),L"DLSS initialization failed",MB_ICONERROR);gDLSS.Shutdown();return 1;
++        MessageBoxW(nullptr,wide.c_str(),L"Reflex initialization failed",MB_ICONERROR);gDLSS.Shutdown();return 1;
+     }
+     if (!RegisterClasses()) {gDLSS.Shutdown();return 1;}
+     control_ = CreateWindowExW(WS_EX_APPWINDOW, kControlClass, kAppName,
+@@ -369,11 +371,11 @@
+     SendDlgItemMessageW(control_,IDC_FULLSCREEN,BM_SETCHECK,BST_CHECKED,0);
+     CreateWindowW(L"BUTTON",L"Low latency / tearing",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,205,91,190,24,control_,reinterpret_cast<HMENU>(IDC_LOW_LATENCY),instance_,nullptr);
+     SendDlgItemMessageW(control_,IDC_LOW_LATENCY,BM_SETCHECK,BST_CHECKED,0);
+-    label(L"FG",410,94,30,22);
++    label(L"Extrap",397,94,60,22);
+     HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+         447,89,110,160,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
+-    for(const wchar_t* option:{L"2x",L"3x",L"4x",L"5x",L"6x",L"Dynamic MFG"}) SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+-    SendMessageW(multiplier,CB_SETCURSEL,2,0);
++    for(const wchar_t* option:{L"Off (1x)",L"2x",L"3x",L"4x",L"5x",L"6x"}) SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
++    SendMessageW(multiplier,CB_SETCURSEL,3,0);
+     label(L"Capture",18,132,60,22);
+     HWND backend=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+         85,127,250,120,control_,reinterpret_cast<HMENU>(IDC_CAPTURE_BACKEND),instance_,nullptr);
+@@ -405,7 +407,7 @@
+     SendMessageW(reflex,CB_SETCURSEL,1,0);
+     CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,180,36,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
+     CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,210,248,110,36,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
+-    status_=label(L"Choose capture backend, FG multiplier, OFA resolution and Reflex timing, then Start.",18,300,540,65);
++    status_=label(L"Choose capture, extrapolation factor, optical-flow resolution and Reflex timing; Start.",18,300,540,65);
+     label(L"F11 fullscreen | F8 pause | F10 stop",18,388,540,22);
+ }
+ 
+@@ -458,10 +460,10 @@
+     fullscreen_ = SendDlgItemMessageW(control_, IDC_FULLSCREEN, BM_GETCHECK, 0, 0) == BST_CHECKED;
+     LRESULT selectedMultiplier = SendDlgItemMessageW(control_, IDC_MULTIPLIER, CB_GETCURSEL, 0, 0);
+     if (selectedMultiplier < 0 || selectedMultiplier > 5) {
+-        SetWindowTextW(status_, L"Choose 2x-6x or Dynamic MFG before starting."); return;
+-    }
+-    // 0 is an internal sentinel for Streamline Dynamic MFG. Fixed selections map to 2..6.
+-    multiplier_ = selectedMultiplier == 5 ? 0u : static_cast<UINT>(selectedMultiplier) + 2u;
++        SetWindowTextW(status_, L"Choose Off or 2x-6x before starting."); return;
++    }
++    // Off = 1x (real frames only); 2x through 6x produce 1-5 prediction frames.
++    multiplier_ = static_cast<UINT>(selectedMultiplier) + 1u;
+     lowLatency_ = SendDlgItemMessageW(control_,IDC_LOW_LATENCY,BM_GETCHECK,0,0)==BST_CHECKED;
+     LRESULT selectedBackend = SendDlgItemMessageW(control_, IDC_CAPTURE_BACKEND, CB_GETCURSEL, 0, 0);
+     if (selectedBackend < 0 || selectedBackend > 1) {
+@@ -691,7 +693,7 @@
+ bool App::CreatePipeline(Dx12State& d) {
+     D3D12_DESCRIPTOR_RANGE range{};
+     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    range.NumDescriptors = 1;
++    range.NumDescriptors = 2;
+     range.BaseShaderRegister = 0;
+     range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+     D3D12_ROOT_PARAMETER params[2]{};
+@@ -702,7 +704,7 @@
+     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     params[1].Constants.ShaderRegister = 0;
+     params[1].Constants.RegisterSpace = 0;
+-    params[1].Constants.Num32BitValues = 1;
++    params[1].Constants.Num32BitValues = 3;
+     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     D3D12_STATIC_SAMPLER_DESC sampler{};
+     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+@@ -723,13 +725,18 @@
+     if (FAILED(hr)) { PostStatus(L"DX12 root signature creation failed: " + WinError(hr)); return false; }
+ 
+     static const char shader[] =
+-        "Texture2D src : register(t0); SamplerState samp : register(s0);"
+-        "cbuffer FrameAdjust : register(b0) { float jitterX; };"
++        "Texture2D src : register(t0); Texture2D<float2> flow : register(t1); SamplerState samp : register(s0);"
++        "cbuffer Predict : register(b0) { float fraction; float sourceW; float sourceH; };"
+         "struct V { float4 p:SV_Position; float2 uv:TEXCOORD0; };"
+         "V VS(uint id:SV_VertexID) { V o;"
+         "float2 p=float2((id==2)?3.0:-1.0,(id==1)?3.0:-1.0);"
+         "o.p=float4(p,0,1); o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5); return o; }"
+-        "float4 PS(V i):SV_Target { return src.Sample(samp,i.uv+float2(jitterX,0)); }";
++        "float4 PS(V i):SV_Target {"
++        "[branch] if(fraction<=0.0) return src.Sample(samp,i.uv);"
++        "float2 v=flow.SampleLevel(samp,i.uv,0);"
++        "v=clamp(v,float2(-128,-128),float2(128,128));"
++        "float2 uv=saturate(i.uv+v*(fraction/float2(sourceW,sourceH)));"
++        "return src.Sample(samp,uv); }";
+     ComPtr<ID3DBlob> vs, ps;
+     hr = D3DCompile(shader, sizeof(shader)-1, nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &errors);
+     if (FAILED(hr)) { PostStatus(L"DX12 vertex shader compile failed: " + WinError(hr)); return false; }
+@@ -853,7 +860,7 @@
+     if (FAILED(hr)) return false;
+     d.rtvStride = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+     D3D12_DESCRIPTOR_HEAP_DESC srv{};
+-    srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; srv.NumDescriptors = kCaptureSlots;
++    srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; srv.NumDescriptors = kAllocatorCount*2;
+     srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+     hr = d.device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&d.srvHeap));
+     if (FAILED(hr)) return false;
+@@ -938,6 +945,21 @@
+     return true;
+ }
+ 
++void App::UpdateFrameSRVs(Dx12State& d, UINT allocatorIndex, UINT sourceSlot) {
++    D3D12_SHADER_RESOURCE_VIEW_DESC color{};
++    color.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
++    color.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
++    color.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    color.Texture2D.MipLevels=1;
++    auto cpu=d.srvHeap->GetCPUDescriptorHandleForHeapStart();
++    cpu.ptr += SIZE_T(allocatorIndex*2u)*d.srvStride;
++    d.device->CreateShaderResourceView(d.sharedTextures[sourceSlot].Get(),&color,cpu);
++    cpu.ptr+=d.srvStride;
++    auto motion=color;
++    motion.Format=DXGI_FORMAT_R16G16_FLOAT;
++    d.device->CreateShaderResourceView(gDLSS.MotionTexture(),&motion,cpu);
++}
++
+ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 copyReady,
+                       uint64_t frameSequence, float syntheticOffsetPixels) {
+     sourceSlot %= kCaptureSlots;
+@@ -1144,6 +1166,7 @@
+ 
+     const UINT queryBase = allocatorIndex * kGpuQueriesPerFrame;
+     if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 0);
++    UpdateFrameSRVs(d, allocatorIndex, sourceSlot);
+     gDLSS.TagInputs(d.list.Get());
+     if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+ 
+@@ -1180,10 +1203,10 @@
+     ID3D12DescriptorHeap* heaps[] = { d.srvHeap.Get() };
+     d.list->SetDescriptorHeaps(1, heaps);
+     auto colorTable = d.srvHeap->GetGPUDescriptorHandleForHeapStart();
+-    colorTable.ptr += SIZE_T(sourceSlot) * d.srvStride;
++    colorTable.ptr += SIZE_T(allocatorIndex*2u) * d.srvStride;
+     d.list->SetGraphicsRootDescriptorTable(0, colorTable);
+-    float jitterX = syntheticOffsetPixels / static_cast<float>(std::max(1u, d.sourceWidth));
+-    d.list->SetGraphicsRoot32BitConstants(1, 1, &jitterX, 0);
++    float params[]={0.0f,float(d.sourceWidth),float(d.sourceHeight)};
++    d.list->SetGraphicsRoot32BitConstants(1, 3, params, 0);
+     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
+ 
+@@ -1290,6 +1313,52 @@
+     if (FAILED(hr)) return false;
+     gDLSS.AfterPresent();
+     return true;
++}
++
++bool App::PresentPrediction(Dx12State& d, UINT sourceSlot, float fraction) {
++    const UINT allocatorIndex=d.nextAllocator++ % kAllocatorCount;
++    const UINT64 previous=d.allocatorFenceValues[allocatorIndex];
++    if(previous && d.frameFence->GetCompletedValue()<previous) {
++        HR(d.frameFence->SetEventOnCompletion(previous,d.frameEvent),"Prediction allocator fence");
++        if(WaitForSingleObject(d.frameEvent,3000)!=WAIT_OBJECT_0) return false;
++    }
++    ConsumeGpuProfile(d,allocatorIndex);
++    HR(d.allocators[allocatorIndex]->Reset(),"Prediction reset allocator");
++    HR(d.list->Reset(d.allocators[allocatorIndex].Get(),d.pipeline.Get()),"Prediction reset list");
++    UpdateFrameSRVs(d,allocatorIndex,sourceSlot);
++    ID3D12Resource* source=d.sharedTextures[sourceSlot].Get();
++    ID3D12Resource* motion=gDLSS.MotionTexture();
++    const UINT frame=d.swapchain->GetCurrentBackBufferIndex();
++    Transition(d.list.Get(),source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    Transition(d.list.Get(),motion,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    Transition(d.list.Get(),d.backBuffers[frame].Get(),D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv=d.rtvHeap->GetCPUDescriptorHandleForHeapStart();
++    rtv.ptr+=SIZE_T(frame)*d.rtvStride;
++    d.list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
++    D3D12_VIEWPORT vp{0,0,float(d.width),float(d.height),0,1};
++    D3D12_RECT scissor{0,0,LONG(d.width),LONG(d.height)};
++    d.list->RSSetViewports(1,&vp); d.list->RSSetScissorRects(1,&scissor);
++    d.list->SetGraphicsRootSignature(d.rootSignature.Get());
++    ID3D12DescriptorHeap* heaps[]={d.srvHeap.Get()};d.list->SetDescriptorHeaps(1,heaps);
++    auto table=d.srvHeap->GetGPUDescriptorHandleForHeapStart();
++    table.ptr+=SIZE_T(allocatorIndex*2u)*d.srvStride;
++    d.list->SetGraphicsRootDescriptorTable(0,table);
++    float params[]={fraction,float(d.sourceWidth),float(d.sourceHeight)};
++    d.list->SetGraphicsRoot32BitConstants(1,3,params,0);
++    d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    d.list->DrawInstanced(3,1,0,0);
++    Transition(d.list.Get(),motion,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    Transition(d.list.Get(),source,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
++    Transition(d.list.Get(),d.backBuffers[frame].Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
++    HR(d.list->Close(),"Prediction close list");
++    ID3D12CommandList* lists[]={d.list.Get()}; d.queue->ExecuteCommandLists(1,lists);
++    const UINT64 fenceValue=d.nextAllocatorFenceValue++;
++    HR(d.queue->Signal(d.frameFence.Get(),fenceValue),"Prediction signal fence");
++    d.allocatorFenceValues[allocatorIndex]=fenceValue;
++    gDLSS.MarkPredictionInUse(d.frameFence.Get(),fenceValue);
++    const UINT sync=d.allowTearing?0:1;
++    const UINT flags=d.allowTearing?DXGI_PRESENT_ALLOW_TEARING:0;
++    return SUCCEEDED(d.swapchain->Present(sync,flags));
+ }
+ 
+ void App::DestroyDx12(Dx12State& d) {
+@@ -1406,13 +1475,6 @@
+         gDLSS.Init(d.device.Get(),c.adapter.Get(),d.sharedTextures[0].Get(),d.sharedTextures[1].Get(),d.sharedTextures[2].Get(),
+                    output.right,output.bottom,false,true,multiplier_,true,nvofGrid_,reflexTiming_,nvofCost_,nvofWidth_,nvofHeight_);
+         if(!CreateSwapchain(outputWindow,lowLatency_,d,false)) throw std::runtime_error("Swapchain creation failed.");
+-        D3D12_SHADER_RESOURCE_VIEW_DESC view{};view.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+-        view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.Texture2D.MipLevels=1;
+-        auto colorCpu=d.srvHeap->GetCPUDescriptorHandleForHeapStart();
+-        for(UINT i=0;i<kCaptureSlots;++i){
+-            d.device->CreateShaderResourceView(d.sharedTextures[i].Get(),&view,colorCpu); colorCpu.ptr+=d.srvStride;
+-        }
+-
+         mailboxEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+         if(!mailboxEvent) throw std::runtime_error("Could not create V26 capture-mailbox event.");
+ 
+@@ -1853,7 +1915,7 @@
+                     releaseLiveHistory();
+                     gDLSS.ResetAfterDiscontinuity();
+                     renderSuspended=true;
+-                    gLog.Write(L"V30 presenter soft-suspended for Alt-Tab; Streamline/DLSS-G instance retained.");
++                    gLog.Write(L"V30 presenter soft-suspended for Alt-Tab; Reflex runtime retained.");
+                 }
+                 Sleep(5);continue;
+             }
+@@ -1865,7 +1927,7 @@
+                 gLog.Write(L"V30 presenter resumed in-place after Alt-Tab with temporal history reset.");
+             }
+             focus_compat::Enable(true);
+-            if(recreateSwapchain_.exchange(false))throw std::runtime_error("Output resized: press Start again to rebuild DLSS resources.");
++            if(recreateSwapchain_.exchange(false))throw std::runtime_error("Output resized: press Start again to rebuild extrapolation resources.");
+             if(stop_||paused_)continue;
+ 
+             // In V17 this mode sleeps before waiting for a published capture, not
+@@ -1935,8 +1997,44 @@
+             const uint64_t frameSequence=c.mailboxes[sourceSlot].sequence.load(std::memory_order_acquire);
+             d.captureTimestamp=c.mailboxes[sourceSlot].sourceTimestamp;
+             if(!RenderFrame(c,d,static_cast<UINT>(sourceSlot),ready,frameSequence))
+-                throw std::runtime_error("Present failed. Check NVIDIA Streamline logs.");
++                throw std::runtime_error("Real-frame DX12 present failed.");
+             ++presented;
++            // The latest REAL frame always wins. Extrapolate only during idle intervals.
++            // A new capture causes immediate exit to the normal real-frame path.
++            static LARGE_INTEGER priorRealQpc{};
++            static double realIntervalMs=16.667;
++            const LARGE_INTEGER thisCapture=d.captureTimestamp;
++            if(priorRealQpc.QuadPart>0 && thisCapture.QuadPart>priorRealQpc.QuadPart && d.qpcFrequency.QuadPart>0) {
++                const double measured=1000.0*double(thisCapture.QuadPart-priorRealQpc.QuadPart)/double(d.qpcFrequency.QuadPart);
++                if(measured>=4.0 && measured<=80.0)
++                    realIntervalMs=std::clamp(realIntervalMs*0.75+measured*0.25,6.0,50.0);
++            }
++            priorRealQpc=thisCapture;
++            const auto startPredictions=std::chrono::steady_clock::now();
++            auto hasNewCapture=[&]() {
++                for(UINT i=0;i<kCaptureSlots;++i)
++                    if(c.mailboxes[i].state.load(std::memory_order_acquire)==CaptureState::kReady) return true;
++                return false;
++            };
++            for(UINT fake=1;fake<multiplier_ && !stop_&&!paused_;++fake) {
++                auto due=startPredictions+std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                    std::chrono::duration<double,std::milli>(realIntervalMs*double(fake)/double(multiplier_)));
++                if(hasNewCapture()) break;
++                auto waitMs=std::chrono::duration_cast<std::chrono::milliseconds>(due-std::chrono::steady_clock::now()).count();
++                if(waitMs>0) WaitForSingleObject(mailboxEvent,DWORD(std::min<int64_t>(waitMs,50)));
++                while(std::chrono::steady_clock::now()<due && !stop_&&!paused_&&!hasNewCapture()) {
++                    // ~0.5 ms bounded final pacing (not a busy wait).
++                    Sleep(0);
++                }
++                if(stop_||paused_||hasNewCapture()||!IsWindow(target)||IsIconic(target)) break;
++                if(d.frameLatencyWaitable) {
++                    // Max queued presents remains one; do not overwrite an unconsumed backbuffer.
++                    WaitForSingleObject(d.frameLatencyWaitable,10);
++                }
++                if(hasNewCapture()) break;
++                if(!PresentPrediction(d,UINT(sourceSlot),float(fake)/float(multiplier_)))
++                    throw std::runtime_error("Extrapolated present failed.");
++            }
+ 
+             now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-lastReport).count();
+             if(elapsed>=1.0) {

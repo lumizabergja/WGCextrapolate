@@ -1,0 +1,114 @@
+paredMotion(frameSequence);
+-                if(gDLSS.PrepareMotion(sourceSlot,static_cast<UINT>(expectedHistory),frameSequence,
+-                                       d.captureFence.Get(),copyReady,d.releaseFence.Get(),priorHistoryDone))
+-                    gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
+-            }
+-        }
+-    }
+-
+     // V26 stage 1: record and submit motion/depth preprocessing on a dedicated
+     // compute queue. This queue waits directly on capture + NVOFA fences. The
+     // presenter queue sees only one final preprocess-fence dependency.
+@@ -1002,33 +1015,78 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+ 
+     HRESULT hr = d.preprocessAllocators[preprocessAllocatorIndex]->Reset();
+     if (FAILED(hr)) return false;
++    hr = d.preOFAAllocators[preprocessAllocatorIndex]->Reset();
++    if (FAILED(hr)) return false;
+ 
+     // DLSS-G input-set reuse must be synchronized on the queue that writes those
+     // inputs, not merely on the final presenter queue.
+     gDLSS.BeforeFrame(d.preprocessQueue.Get());
+ 
+-    const bool splitPreprocess = gDLSS.HasHardwareMotion();
+-    if (splitPreprocess) {
+-        hr = d.preOFAList->Reset(d.preprocessAllocators[preprocessAllocatorIndex].Get(), nullptr);
++    // V35: record and submit depth/constants setup before waiting for the OFA
++    // worker's CPU submission latch. This work is independent of OFA output and
++    // can overlap both nvOFExecuteD3D12 and reduced-resolution scaling.
++    const bool preOFAEligible = gDLSS.HardwareMotionAvailable();
++    if (preOFAEligible) {
++        hr = d.preOFAList->Reset(d.preOFAAllocators[preprocessAllocatorIndex].Get(), nullptr);
+         if (FAILED(hr)) return false;
+         gDLSS.RecordPreOFA(d.preOFAList.Get(), sourceSlot);
+         hr = d.preOFAList->Close();
+         if (FAILED(hr)) return false;
++        ID3D12CommandList* preLists[] = { d.preOFAList.Get() };
++        d.preprocessQueue->ExecuteCommandLists(1, preLists);
+     }
+ 
++    // V35 late OFA-join path: color publication happens before producer-side OFA submission.
++    // The early color copy above can therefore run while nvOFExecuteD3D12 (and, for
++    // reduced OFA resolutions, the GPU downsample) is being queued. The independent pre-OFA work is already submitted; only the motion-resolve
++    // path waits for the worker's CPU submission decision.
++    const int expectedHistory = priorHistorySlot;
++    const UINT64 priorHistoryDone = c.lastHistoryDone.load(std::memory_order_acquire);
++    if (gDLSS.HardwareMotionAvailable() && expectedHistory >= 0 &&
++        expectedHistory < static_cast<int>(kCaptureSlots) && expectedHistory != static_cast<int>(sourceSlot)) {
++        unsigned spins=0;
++        LARGE_INTEGER submitWaitStart{},submitWaitNow{}; QueryPerformanceCounter(&submitWaitStart);
++        bool submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
++        while(!submitComplete) {
++            if(spins++ < 256) YieldProcessor(); else SwitchToThread();
++            submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
++            if((spins & 63u)==0u && d.qpcFrequency.QuadPart>0) {
++                QueryPerformanceCounter(&submitWaitNow);
++                if(1000.0*double(submitWaitNow.QuadPart-submitWaitStart.QuadPart)/double(d.qpcFrequency.QuadPart)>5.0)
++                    break;
++            }
++        }
++        if(submitComplete) {
++            bool prepared=gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
++            if(!prepared) {
++                gDLSS.DiscardPreparedMotion(frameSequence);
++                if(gDLSS.PrepareMotion(sourceSlot,static_cast<UINT>(expectedHistory),frameSequence,
++                                       d.captureFence.Get(),copyReady,d.releaseFence.Get(),priorHistoryDone))
++                    gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
++            }
++        }
++    }
++
++    const bool splitPreprocess = gDLSS.HasHardwareMotion();
++
+     hr = d.preprocessList->Reset(d.preprocessAllocators[preprocessAllocatorIndex].Get(), nullptr);
+     if (FAILED(hr)) return false;
+     const UINT preprocessQueryBase = preprocessAllocatorIndex * kPreprocessQueriesPerFrame;
+-    d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 0);
++    if(profileThisFrame)
++        d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 0);
+     if (splitPreprocess)
+         gDLSS.RecordMotionResolve(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
++    else if (preOFAEligible)
++        gDLSS.RecordMotionFallbackAfterPreOFA(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
+     else
+         gDLSS.RecordPreprocess(d.preprocessList.Get(), d.sharedTextures[sourceSlot].Get(), sourceSlot, parallelCopy);
+-    d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 1);
+-    d.preprocessList->ResolveQueryData(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+-                                       preprocessQueryBase, kPreprocessQueriesPerFrame,
+-                                       d.preprocessQueryReadback.Get(),
+-                                       UINT64(preprocessQueryBase) * sizeof(UINT64));
++    if(profileThisFrame) {
++        d.preprocessList->EndQuery(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, preprocessQueryBase + 1);
++        d.preprocessList->ResolveQueryData(d.preprocessQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                           preprocessQueryBase, kPreprocessQueriesPerFrame,
++                                           d.preprocessQueryReadback.Get(),
++                                           UINT64(preprocessQueryBase) * sizeof(UINT64));
++    }
+     hr = d.preprocessList->Close();
+     if (FAILED(hr)) return false;
+ 
+@@ -1036,13 +1094,8 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     if (d.captureFence->GetCompletedValue() < copyReady) ++d.captureFencePending;
+     if (gDLSS.MotionWouldBlockNow()) ++d.nvofFencePending;
+ 
+-    // V30 split preprocessing: depth/constants setup is independent of NVOFA.
+-    // Submit that work before the OFA fence wait, then wait only immediately
+-    // before the motion-vector resolve that actually consumes OFA output.
+-    if (splitPreprocess) {
+-        ID3D12CommandList* preLists[] = { d.preOFAList.Get() };
+-        d.preprocessQueue->ExecuteCommandLists(1, preLists);
+-    }
++    // V35: pre-OFA depth/constants work was submitted before the CPU-side OFA
++    // submission join above. Only the motion-vector resolve waits on OFA output.
+     // V31: a prepared native NVOFA output fence already depends on copyReady
+     // (the OFA execute submission waits on the same capture fence). A

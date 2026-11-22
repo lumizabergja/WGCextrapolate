@@ -1,0 +1,109 @@
+         desc.Scaling = DXGI_SCALING_STRETCH;
+         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+-        desc.Flags = d.allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
++        desc.Flags = (d.allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
++            (d.frameLatencyWaitableEnabled ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0);
+         ComPtr<IDXGISwapChain1> swap;
+         HRESULT hr = d.factory->CreateSwapChainForHwnd(d.queue.Get(), presenter, &desc,
+             nullptr, nullptr, &swap);
+@@ -784,6 +801,25 @@ bool App::CreateSwapchain(HWND presenter, bool lowLatency, Dx12State& d, bool re
+         d.factory->MakeWindowAssociation(presenter, DXGI_MWA_NO_ALT_ENTER);
+         hr = swap.As(&d.swapchain);
+         if (FAILED(hr)) return false;
++        if (d.frameLatencyWaitableEnabled) {
++            ComPtr<IDXGISwapChain2> latencySwap;
++            hr = d.swapchain.As(&latencySwap);
++            if (FAILED(hr) || !latencySwap) {
++                PostStatus(L"DXGI frame-latency waitable swapchain unavailable.");
++                return false;
++            }
++            hr = latencySwap->SetMaximumFrameLatency(1);
++            if (FAILED(hr)) {
++                PostStatus(L"DXGI SetMaximumFrameLatency(1) failed: " + WinError(hr));
++                return false;
++            }
++            d.frameLatencyWaitable = latencySwap->GetFrameLatencyWaitableObject();
++            if (!d.frameLatencyWaitable) {
++                PostStatus(L"DXGI frame-latency waitable object was not created.");
++                return false;
++            }
++            gLog.Write(L"V35 swapchain: FRAME_LATENCY_WAITABLE_OBJECT enabled, maximum frame latency = 1.");
++        }
+     }
+     D3D12_CPU_DESCRIPTOR_HANDLE handle = d.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+     for (UINT i = 0; i < kFrameCount; ++i) {
+@@ -829,6 +865,9 @@ bool App::InitDx12(HWND, CaptureState& c, uint32_t sourceWidth,
+         hr = d.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+             IID_PPV_ARGS(&d.preprocessAllocators[i]));
+         if (FAILED(hr)) return false;
++        hr = d.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
++            IID_PPV_ARGS(&d.preOFAAllocators[i]));
++        if (FAILED(hr)) return false;
+     }
+     hr = d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+         d.allocators[0].Get(), nullptr, IID_PPV_ARGS(&d.list));
+@@ -842,7 +881,7 @@ bool App::InitDx12(HWND, CaptureState& c, uint32_t sourceWidth,
+         d.transferAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.transferCopyList)), "Create transfer copy list");
+     HR(d.transferCopyList->Close(), "Close transfer copy list");
+     hr = d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+-        d.preprocessAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.preOFAList));
++        d.preOFAAllocators[0].Get(), nullptr, IID_PPV_ARGS(&d.preOFAList));
+     if (FAILED(hr)) return false;
+     d.preOFAList->Close();
+     hr = d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+@@ -903,6 +942,9 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+                       uint64_t frameSequence, float syntheticOffsetPixels) {
+     sourceSlot %= kCaptureSlots;
+     const int priorHistorySlot = c.historySlot.load(std::memory_order_acquire);
++    // V35 production profiling: keep diagnostics, but sample one frame in 16 so
++    // timestamp writes/readback resolves are no longer on every present.
++    const bool profileThisFrame = ((d.profileFrameCounter++ & 15ull) == 0ull);
+     const UINT frame = d.swapchain->GetCurrentBackBufferIndex();
+     const auto sourceDesc = d.sharedTextures[sourceSlot]->GetDesc();
+     const auto backDesc = d.backBuffers[frame]->GetDesc();
+@@ -928,13 +970,15 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+         const UINT copyQueryBase = transferIndex * kGpuQueriesPerFrame;
+         HR(d.transferAllocators[transferIndex]->Reset(), "Reset transfer allocator");
+         HR(d.transferCopyList->Reset(d.transferAllocators[transferIndex].Get(), nullptr), "Reset transfer copy");
+-        d.transferCopyList->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, copyQueryBase+5);
++        if(profileThisFrame)
++            d.transferCopyList->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, copyQueryBase+5);
+         Transition(d.transferCopyList.Get(), d.backBuffers[frame].Get(),
+                    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+         d.transferCopyList->CopyResource(d.backBuffers[frame].Get(), d.sharedTextures[sourceSlot].Get());
+         Transition(d.transferCopyList.Get(), d.backBuffers[frame].Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+-        d.transferCopyList->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, copyQueryBase+6);
++        if(profileThisFrame)
++            d.transferCopyList->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, copyQueryBase+6);
+         HR(d.transferCopyList->Close(), "Close transfer copy");
+         HR(d.queue->Wait(d.captureFence.Get(), copyReady), "Early copy capture wait");
+         // Capture completion is the sole dependency of the color copy.
+@@ -949,37 +993,6 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+         ++d.rasterFrames;
+     }
+ 
+-    // V34 split-ready path: color publication happens before producer-side OFA submission.
+-    // The early color copy above can therefore run while nvOFExecuteD3D12 (and, for
+-    // reduced OFA resolutions, the GPU downsample) is being queued. Only the motion
+-    // path waits for the producer's submission decision.
+-    const int expectedHistory = priorHistorySlot;
+-    const UINT64 priorHistoryDone = c.lastHistoryDone.load(std::memory_order_acquire);
+-    if (gDLSS.HardwareMotionAvailable() && expectedHistory >= 0 &&
+-        expectedHistory < static_cast<int>(kCaptureSlots) && expectedHistory != static_cast<int>(sourceSlot)) {
+-        unsigned spins=0;
+-        LARGE_INTEGER submitWaitStart{},submitWaitNow{}; QueryPerformanceCounter(&submitWaitStart);
+-        bool submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
+-        while(!submitComplete) {
+-            if(spins++ < 256) YieldProcessor(); else SwitchToThread();
+-            submitComplete=c.mailboxes[sourceSlot].ofaSubmitDone.load(std::memory_order_acquire);
+-            if((spins & 63u)==0u && d.qpcFrequency.QuadPart>0) {
+-                QueryPerformanceCounter(&submitWaitNow);
+-                if(1000.0*double(submitWaitNow.QuadPart-submitWaitStart.QuadPart)/double(d.qpcFrequency.QuadPart)>5.0)
+-                    break;
+-            }
+-        }
+-        if(submitComplete) {
+-            bool prepared=gDLSS.SelectPreparedMotion(frameSequence,expectedHistory);
+-            if(!prepared) {
+-                gDLSS.DiscardPre

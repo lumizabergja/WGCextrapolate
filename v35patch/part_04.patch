@@ -1,0 +1,107 @@
+ After a successful submit NvofBridge::sourceUseValue_ protects
++    // that resource until the OFA GPU fence completes.
++    std::atomic<uint32_t> ofaCpuPins[kCaptureSlots]{};
+     std::atomic<bool> captureFailed{false};
+     std::string captureFailureMessage;
+     std::atomic<uint64_t> producerCaptured{0};
+@@ -1269,20 +1349,36 @@ void App::Worker(HWND target, HWND outputWindow) {
+     std::atomic<uint64_t> captureReleaseTicks{0};
+     std::atomic<uint64_t> captureReleaseMaxTicks{0};
+ 
++    // A mailbox cannot be recycled while the asynchronous OFA submit worker may
++    // still be referencing its source texture. Pending discards are finalized by
++    // the OFA worker immediately after the CPU-side nvOF submission attempt ends.
++    auto retireMailbox = [&](UINT slot, uint64_t sequence) {
++        if(slot>=kCaptureSlots) return;
++        auto& mailbox=c.mailboxes[slot];
++        if(!mailbox.ofaSubmitDone.load(std::memory_order_acquire)) {
++            mailbox.state.store(CaptureState::kDiscardPending,std::memory_order_release);
++            return;
++        }
++        gDLSS.DiscardPreparedMotion(sequence);
++        mailbox.state.store(CaptureState::kFree,std::memory_order_release);
++    };
++
+     auto releaseLiveHistory = [&]() {
+         const int held = c.historySlot.exchange(-1,std::memory_order_acq_rel);
+         if (held >= 0 && held < static_cast<int>(kCaptureSlots)) {
+             const UINT64 done = c.lastHistoryDone.load(std::memory_order_acquire);
+             if (done) c.lastReleaseDone[held].store(done,std::memory_order_release);
+             LONG expected = CaptureState::kHistory;
+-            c.mailboxes[held].state.compare_exchange_strong(expected,CaptureState::kFree,
+-                std::memory_order_acq_rel,std::memory_order_acquire);
++            if(c.mailboxes[held].state.compare_exchange_strong(expected,CaptureState::kConsuming,
++                std::memory_order_acq_rel,std::memory_order_acquire)) {
++                retireMailbox(static_cast<UINT>(held),c.mailboxes[held].sequence.load(std::memory_order_acquire));
++            }
+         }
+         for (UINT i=0;i<kCaptureSlots;++i) {
+             LONG expected=CaptureState::kReady;
+-            if(c.mailboxes[i].state.compare_exchange_strong(expected,CaptureState::kFree,
++            if(c.mailboxes[i].state.compare_exchange_strong(expected,CaptureState::kConsuming,
+                 std::memory_order_acq_rel,std::memory_order_acquire)) {
+-                gDLSS.DiscardPreparedMotion(c.mailboxes[i].sequence.load(std::memory_order_acquire));
++                retireMailbox(i,c.mailboxes[i].sequence.load(std::memory_order_acquire));
+                 producerDropped.fetch_add(1,std::memory_order_relaxed);
+             }
+         }
+@@ -1290,7 +1386,7 @@ void App::Worker(HWND target, HWND outputWindow) {
+     };
+ 
+     try {
+-        gLog.Write(L"V34 split-ready + OFA-resolution build. Backend: " + std::wstring(useWgc_ ? L"WGC" : L"DXGI DuplicateOutput1") +
++        gLog.Write(L"V35 low-latency OFA-worker + OFA-resolution build. Backend: " + std::wstring(useWgc_ ? L"WGC" : L"DXGI DuplicateOutput1") +
+                    L" / DX12. Selected FG mode: " + (multiplier_ ? std::to_wstring(multiplier_) + L"x fixed" : std::wstring(L"Dynamic MFG (display refresh)")) +
+                    L". NVOFA grid request: " + std::to_wstring(nvofGrid_) + L"x" + std::to_wstring(nvofGrid_) + L" FAST. OFA resolution request: " +
+                    (nvofWidth_ ? std::to_wstring(nvofWidth_) + L"x" + std::to_wstring(nvofHeight_) : std::wstring(L"native")) + L".");
+@@ -1320,6 +1416,50 @@ void App::Worker(HWND target, HWND outputWindow) {
+         mailboxEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+         if(!mailboxEvent) throw std::runtime_error("Could not create V26 capture-mailbox event.");
+ 
++        // V35: native OFA submission is isolated from the capture producer. The
++        // capture thread only publishes/enqueues and immediately returns to
++        // ReleaseFrame/acquire-next-frame work. This worker performs no CPU wait
++        // for OFA completion; nvOF's fence dependencies remain GPU-side.
++        ofaSubmitWorker=std::thread([&]() {
++            SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
++            for(;;) {
++                OfaSubmitJob job{};
++                {
++                    std::unique_lock lock(ofaJobMutex);
++                    ofaJobCv.wait(lock,[&]{return ofaWorkerStop.load(std::memory_order_acquire)||!ofaJobs.empty();});
++                    if(ofaWorkerStop.load(std::memory_order_acquire)&&ofaJobs.empty()) break;
++                    job=ofaJobs.front();
++                    ofaJobs.pop_front();
++                }
++                if(job.sourceSlot>=kCaptureSlots) continue;
++                auto& mailbox=c.mailboxes[job.sourceSlot];
++                const uint64_t liveSequence=mailbox.sequence.load(std::memory_order_acquire);
++                const LONG liveState=mailbox.state.load(std::memory_order_acquire);
++                const int liveHistory=c.historySlot.load(std::memory_order_acquire);
++                const UINT64 liveHistoryDone=c.lastHistoryDone.load(std::memory_order_acquire);
++                bool submitted=false;
++                if(liveSequence==job.sequence && liveState!=CaptureState::kFree &&
++                   liveState!=CaptureState::kWriting && liveState!=CaptureState::kDiscardPending &&
++                   liveHistory==static_cast<int>(job.referenceSlot) && liveHistoryDone==job.historyValue) {
++                    submitted=gDLSS.ProducerPrepareMotion(job.sourceSlot,job.referenceSlot,job.sequence,
++                        d.captureFence.Get(),job.captureValue,d.releaseFence.Get(),job.historyValue);
++                }
++                if(submitted) ofaWorkerSubmitted.fetch_add(1,std::memory_order_relaxed);
++                else ofaWorkerSkipped.fetch_add(1,std::memory_order_relaxed);
++                ofaCpuPins[job.referenceSlot].fetch_sub(1,std::memory_order_acq_rel);
++                mailbox.ofaSubmitDone.store(true,std::memory_order_release);
++                if(mailbox.sequence.load(std::memory_order_acquire)==job.sequence &&
++                   mailbox.state.load(std::memory_order_acquire)==CaptureState::kDiscardPending) {
++                    gDLSS.DiscardPreparedMotion(job.sequence);
++                    LONG expected=CaptureState::kDiscardPending;
++                    mailbox.state.compare_exchange_strong(expected,CaptureState::kFree,
++                        std::memory_order_acq_rel,std::memory_order_acquire);
++                    SetEvent(mailboxEvent);
++                }
++            }
++        });
++        gLog.Write(L"V35 OFA submit worker active: capture publication/release is decoupled from nvOF CPU submission.");
++
+         // Dedicated capture producer. It owns all post-initialization D3D11/DXGI/WGC
+         // capture work. The render worker only consumes already-published mailboxes.
+         captureProducer=std::thread([
