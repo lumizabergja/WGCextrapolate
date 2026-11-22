@@ -51,6 +51,14 @@ Apply-Patch 'v35-current.patch' 'V35'
 Apply-Patch 'extrap-v35.patch' 'Custom extrapolation'
 Apply-Patch 'ui-v35.patch' 'Simplified UI with crosshair radius and feather'
 Apply-Patch 'premium-v35.patch' 'Premium GDI+ interface and persistent application window'
+# Apply the V15 Clean V16 center-mask and lifecycle port to the reconstructed source.
+$encoded=(Get-Content 'ci/v15-crosshair-update.py.gz.b64' -Raw).Trim()
+[IO.File]::WriteAllBytes('ci/v15-crosshair-update.py.gz',[Convert]::FromBase64String($encoded))
+& python -c "import gzip,pathlib;pathlib.Path('ci/v15-crosshair-update.py').write_bytes(gzip.decompress(pathlib.Path('ci/v15-crosshair-update.py.gz').read_bytes()))"
+if ($LASTEXITCODE -ne 0) { throw 'V15 source-update unpack failed' }
+& python 'ci/v15-crosshair-update.py'
+if ($LASTEXITCODE -ne 0) { throw 'V15 center-mask/native-only/Stop patch failed' }
+
 
 # GDI+ imaging interfaces inherit IUnknown, which must be declared before
 # gdiplus.h is parsed. Include objidl.h explicitly on the Windows SDK runner.
@@ -76,6 +84,13 @@ if ($main -notmatch 'DrawPremiumUI' -or $main -notmatch 'RequestStop' -or
   throw 'Premium UI or non-closing capture Stop lifecycle is missing'
 }
 if (-not (Test-Path 'source/premium_ui.h')) { throw 'Premium themed controls header missing' }
+if ($main -notmatch 'workerFinished_' -or $main -notmatch 'FinalizeFinishedSession' -or
+    $main -notmatch 'float centerMask' -or $main -notmatch 'float\(d.width\),float\(d.height\)') {
+  throw 'V15 center-mask/persistent Stop lifecycle validation failed'
+}
+if ($main -match 'ofaPercent_' -or $main -match 'CB_GETCURSEL,0,0\).*IDC_NVOF_RESOLUTION') {
+  throw 'OFA resolution scaling/UI selector was not fully removed'
+}
 if ($main -notmatch 'SetMaximumFrameLatency\(1\)') {
   throw 'V35 low-latency swapchain setting is missing'
 }
@@ -136,7 +151,7 @@ if errorlevel 1 exit /b 1
 cd /d "$root\source"
 rc /nologo /fo app.res app.rc
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /I "$slInclude" /I "$ofaInclude" main.cpp dlss_bridge.cpp nvof_bridge.cpp wgc_capture.cpp app.res /Fe:"$root\FG-Extrap-V35.exe" /link /SUBSYSTEM:WINDOWS d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib comctl32.lib shell32.lib ole32.lib user32.lib gdi32.lib wintrust.lib crypt32.lib windowsapp.lib
+cl /nologo /utf-8 /std:c++20 /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /I "$slInclude" /I "$ofaInclude" main.cpp dlss_bridge.cpp nvof_bridge.cpp wgc_capture.cpp app.res /Fe:"$root\FG-Extrap-V35.exe" /link /SUBSYSTEM:WINDOWS d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib comctl32.lib shell32.lib ole32.lib user32.lib gdi32.lib wintrust.lib crypt32.lib windowsapp.lib
 if errorlevel 1 exit /b 1
 "@
 [IO.File]::WriteAllText('compile-v35-appveyor.cmd', $batch, [Text.Encoding]::ASCII)
@@ -159,8 +174,8 @@ foreach ($name in @('sl.interposer.dll','sl.common.dll','sl.pcl.dll','sl.reflex.
 $sha = (Get-FileHash 'FG-Extrap-V35.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
 $validation = @(
   'V35 DXGI/WGC -> NvOFA -> custom extrapolation (Off-6x and Dynamic) -> DX12',
-  'UI: game selector + Refresh / capture / extrapolation / dynamic target / OFA percentage / radius / feather',
-  'Stop and game process exit: keep app open',
+  'UI: game selector + Refresh / capture / extrapolation / dynamic target / radius / feather; Native 4x4 NvOFA only',
+  'Stop behavior: completed-worker handoff modeled on V15 Clean V16; game exit preserves UI',
   'Streamline Reflex + PCL ONLY; no DLSS-G plugin shipped',
   "Git commit: $env:APPVEYOR_REPO_COMMIT",
   "Executable SHA256: $sha",
