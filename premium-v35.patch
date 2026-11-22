@@ -1,0 +1,587 @@
+diff --git a/source/main.cpp b/source/main.cpp
+index fad841c..05dac89 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -1,5 +1,8 @@
+ #include <windows.h>
++#include <windowsx.h>
+ #include <commctrl.h>
++#include <dwmapi.h>
++#include "premium_ui.h"
+ #include <d3d11_4.h>
+ #include <d3d12.h>
+ #include <d3dcompiler.h>
+@@ -32,7 +35,7 @@ using Microsoft::WRL::ComPtr;
+ 
+ namespace {
+ 
+-constexpr wchar_t kAppName[] = L"FG Extrap V35 - Low Latency";
++constexpr wchar_t kAppName[] = L"FG Extrapolation V35 | Premium Edition";
+ constexpr wchar_t kControlClass[] = L"LoLDX12Presenter.Control";
+ constexpr wchar_t kPresenterClass[] = L"LoLDX12Presenter.Output";
+ constexpr UINT WM_APP_STATUS = WM_APP + 1;
+@@ -249,6 +252,10 @@ public:
+ private:
+     bool RegisterClasses();
+     void CreateControls();
++    void LayoutPremiumControls();
++    void DrawPremiumUI(HDC hdc);
++    bool PremiumHit(float x, float y);
++    void RequestStop();
+     void RefreshTargets();
+     void Start();
+     void Stop();
+@@ -276,6 +283,10 @@ private:
+     HWND presenter_{};
+     HWND targetCombo_{};
+     HWND status_{};
++    HBRUSH editBrush_{};
++    ULONG_PTR gdiplusToken_{};
++    int hover_{-1};
++    bool explicitExit_{false};
+     HWND target_{};
+     HANDLE targetProcess_{};
+     std::thread worker_;
+@@ -324,12 +335,24 @@ int App::Run(HINSTANCE instance) {
+         std::string msg=e.what();std::wstring wide(msg.begin(),msg.end());gLog.Write(wide);
+         MessageBoxW(nullptr,wide.c_str(),L"Reflex initialization failed",MB_ICONERROR);gDLSS.Shutdown();return 1;
+     }
+-    if (!RegisterClasses()) {gDLSS.Shutdown();return 1;}
++    Gdiplus::GdiplusStartupInput gdiplusInput;
++    if(Gdiplus::GdiplusStartup(&gdiplusToken_,&gdiplusInput,nullptr)!=Gdiplus::Ok) {
++        gDLSS.Shutdown();MessageBoxW(nullptr,L"Could not initialize premium UI rendering.",kAppName,MB_ICONERROR);return 1;
++    }
++    editBrush_=CreateSolidBrush(RGB(27,23,43));
++    if (!RegisterClasses()) {gDLSS.Shutdown();Gdiplus::GdiplusShutdown(gdiplusToken_);return 1;}
+     control_ = CreateWindowExW(WS_EX_APPWINDOW, kControlClass, kAppName,
+         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 490, nullptr, nullptr, instance_, nullptr);
+-    if (!control_) {gDLSS.Shutdown();return 1;}
++        CW_USEDEFAULT, CW_USEDEFAULT, 1180, 775, nullptr, nullptr, instance_, nullptr);
++    if (!control_) {gDLSS.Shutdown();DeleteObject(editBrush_);Gdiplus::GdiplusShutdown(gdiplusToken_);return 1;}
++    // Native titlebar with subdued dark-purple glass; Windows 11 supports these DWM flags.
++    BOOL dark=TRUE;
++    DwmSetWindowAttribute(control_,20,&dark,sizeof(dark));
++    COLORREF caption=RGB(18,13,34);DwmSetWindowAttribute(control_,35,&caption,sizeof(caption));
++    COLORREF captionText=RGB(242,232,253);DwmSetWindowAttribute(control_,36,&captionText,sizeof(captionText));
++    DWORD corner=2;DwmSetWindowAttribute(control_,33,&corner,sizeof(corner));
+     CreateControls();
++    LayoutPremiumControls();
+     RefreshTargets();
+     ShowWindow(control_, SW_SHOW);
+     UpdateWindow(control_);
+@@ -344,6 +367,8 @@ int App::Run(HINSTANCE instance) {
+     }
+     Stop();
+     gDLSS.Shutdown();
++    if(editBrush_) {DeleteObject(editBrush_);editBrush_=nullptr;}
++    if(gdiplusToken_) {Gdiplus::GdiplusShutdown(gdiplusToken_);gdiplusToken_=0;}
+     return static_cast<int>(msg.wParam);
+ }
+ 
+@@ -354,7 +379,7 @@ bool App::RegisterClasses() {
+     control.hInstance = instance_;
+     control.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+     control.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+-    control.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
++    control.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+     control.lpszClassName = kControlClass;
+     if (!RegisterClassExW(&control)) return false;
+     WNDCLASSEXW presenter{sizeof(presenter)};
+@@ -368,57 +393,120 @@ bool App::RegisterClasses() {
+ }
+ 
+ void App::CreateControls() {
+-    auto label = [&](const wchar_t* text, int x, int y, int w, int h) {
+-        return CreateWindowW(L"STATIC",text,WS_CHILD|WS_VISIBLE,x,y,w,h,control_,nullptr,instance_,nullptr);
+-    };
+-    label(L"Game window",18,17,120,24);
+-    targetCombo_=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        18,42,455,260,control_,reinterpret_cast<HMENU>(IDC_TARGET),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Refresh",WS_CHILD|WS_VISIBLE,484,41,123,27,control_,reinterpret_cast<HMENU>(IDC_REFRESH),instance_,nullptr);
+-
+-    label(L"Capture API",18,88,150,24);
+-    HWND backend=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        192,86,310,160,control_,reinterpret_cast<HMENU>(IDC_CAPTURE_BACKEND),instance_,nullptr);
++    // Interactive native controls are retained for reliable window selection and
++    // keyboard access. The other options are visually presented as segmented
++    // controls, while invisible combo boxes preserve the existing V35 settings API.
++    targetCombo_=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|
++        CBS_OWNERDRAWFIXED|WS_VSCROLL,50,185,342,340,control_,
++        reinterpret_cast<HMENU>(IDC_TARGET),instance_,nullptr);
++    HWND refresh=CreateWindowW(L"BUTTON",L"Refresh",WS_CHILD,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_REFRESH),instance_,nullptr);
++    HWND start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
++    HWND stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_DISABLED,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
++    (void)refresh;(void)start;(void)stop;
++    HWND backend=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|CBS_DROPDOWNLIST,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_CAPTURE_BACKEND),instance_,nullptr);
+     for(const wchar_t* option:{L"DXGI Desktop Duplication",L"Windows Graphics Capture (WGC)"})
+         SendMessageW(backend,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(backend,CB_SETCURSEL,0,0);
+-
+-    label(L"Extrapolation",18,124,150,24);
+-    HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        192,122,185,240,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
++    HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|CBS_DROPDOWNLIST,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
+     for(const wchar_t* option:{L"Off (1x)",L"2x",L"3x",L"4x",L"5x",L"6x",L"Dynamic target"})
+         SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(multiplier,CB_SETCURSEL,3,0);
+-    label(L"Target FPS",402,125,90,23);
+-    HWND dyn=CreateWindowW(L"EDIT",L"240",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER|WS_DISABLED,
+-        509,121,98,27,control_,reinterpret_cast<HMENU>(IDC_DYNAMIC_TARGET),instance_,nullptr);
+-    SendMessageW(dyn,EM_SETLIMITTEXT,4,0);
+-
+-    label(L"NvOFA resolution",18,162,160,24);
+-    HWND ofRes=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        192,159,185,120,control_,reinterpret_cast<HMENU>(IDC_NVOF_RESOLUTION),instance_,nullptr);
++    HWND ofRes=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|CBS_DROPDOWNLIST,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_NVOF_RESOLUTION),instance_,nullptr);
+     for(const wchar_t* option:{L"100%",L"50%",L"10%"})
+         SendMessageW(ofRes,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(ofRes,CB_SETCURSEL,0,0);
+-    label(L"NvOFA 4x4 FAST / confidence OFF",389,163,225,24);
+-
+-    label(L"Crosshair radius (px)",18,203,165,24);
+-    HWND radius=CreateWindowW(L"EDIT",L"12",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER,
+-        192,199,90,28,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_RADIUS),instance_,nullptr);
++    // Only dynamic target is editable when Dynamic is selected.
++    HWND dyn=CreateWindowW(L"EDIT",L"240",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER|WS_DISABLED,
++        1005,306,97,31,control_,reinterpret_cast<HMENU>(IDC_DYNAMIC_TARGET),instance_,nullptr);
++    SendMessageW(dyn,EM_SETLIMITTEXT,4,0);
++    HWND radius=CreateWindowW(L"EDIT",L"12",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
++        858,459,94,32,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_RADIUS),instance_,nullptr);
+     SendMessageW(radius,EM_SETLIMITTEXT,3,0);
+-    label(L"Feather (px)",319,203,115,24);
+-    HWND feather=CreateWindowW(L"EDIT",L"8",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER,
+-        452,199,90,28,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_FEATHER),instance_,nullptr);
++    HWND feather=CreateWindowW(L"EDIT",L"8",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
++        1010,459,94,32,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_FEATHER),instance_,nullptr);
+     SendMessageW(feather,EM_SETLIMITTEXT,3,0);
+-    label(L"Only predicted frames are protected; real frames stay untouched.",18,239,580,22);
+-
+-    CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+-        18,275,282,39,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,
+-        316,275,291,39,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
+-    status_=label(L"Idle - choose a game window and press Start.",18,331,580,64);
+-    label(L"Fullscreen ON | Low-latency ON | NvOFA grid 4x4 | Reflex + Boost ON",18,398,594,22);
+-    label(L"F11 fullscreen  |  F8 pause  |  F10 stop",18,423,580,22);
++    // Hidden model/status text is rendered inside the branded custom status ribbon.
++    status_=CreateWindowW(L"STATIC",L"Idle - choose a game window and press Start.",WS_CHILD,
++        0,0,1,1,control_,reinterpret_cast<HMENU>(IDC_STATUS),instance_,nullptr);
++    HFONT font=CreateFontW(-18,0,0,0,FW_MEDIUM,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
++        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
++    // Small lifetime-scoped font: the controls exist until the top-level window closes.
++    for(HWND ctl:{targetCombo_,dyn,radius,feather}) SendMessageW(ctl,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
++}
++
++void App::LayoutPremiumControls() {
++    if(!control_||!targetCombo_)return;
++    RECT bounds{};GetClientRect(control_,&bounds);
++    const float scale=std::min(float(bounds.right)/premium::kDesignWidth,
++                               float(bounds.bottom)/premium::kDesignHeight);
++    const auto put=[&](int id,premium::HitRect rect,int popupExtra=0){
++        if(HWND ctl=GetDlgItem(control_,id))
++            SetWindowPos(ctl,nullptr,int(rect.x*scale),int(rect.y*scale),
++                int(rect.w*scale),int((rect.h+popupExtra)*scale),SWP_NOZORDER|SWP_NOACTIVATE);
++    };
++    put(IDC_TARGET,premium::kTarget,280);
++    put(IDC_DYNAMIC_TARGET,premium::kTargetFps);
++    put(IDC_CROSSHAIR_RADIUS,premium::kRadius);
++    put(IDC_CROSSHAIR_FEATHER,premium::kFeather);
++}
++
++void App::DrawPremiumUI(HDC hdc) {
++    RECT r{};GetClientRect(control_,&r);
++    wchar_t status[260]{};
++    if(status_)GetWindowTextW(status_,status,260);
++    const int backend=int(SendDlgItemMessageW(control_,IDC_CAPTURE_BACKEND,CB_GETCURSEL,0,0));
++    const int multiplier=int(SendDlgItemMessageW(control_,IDC_MULTIPLIER,CB_GETCURSEL,0,0));
++    const int res=int(SendDlgItemMessageW(control_,IDC_NVOF_RESOLUTION,CB_GETCURSEL,0,0));
++    premium::Paint(hdc,r.right,r.bottom,std::clamp(backend,0,1),std::clamp(multiplier,0,6),
++                   std::clamp(res,0,2),running_,multiplier==6,status,hover_);
++}
++
++void App::RequestStop() {
++    if(!running_)return;
++    stop_=true;
++    if(workerControlEvent_)SetEvent(workerControlEvent_);
++    if(HWND stop=GetDlgItem(control_,IDC_STOP))EnableWindow(stop,FALSE);
++    if(status_)SetWindowTextW(status_,L"Stopping capture... the control panel stays open.");
++    InvalidateRect(control_,nullptr,FALSE);
++}
++
++bool App::PremiumHit(float x,float y) {
++    if(premium::kRefresh.Contains(x,y)){
++        if(!running_)RefreshTargets();return true;
++    }
++    if(premium::kStart.Contains(x,y)){
++        if(!running_)Start();InvalidateRect(control_,nullptr,FALSE);return true;
++    }
++    if(premium::kStop.Contains(x,y)){
++        if(running_)RequestStop();return true;
++    }
++    if(running_)return false;
++    const auto change=[&](int controlId,int selection){
++        SendDlgItemMessageW(control_,controlId,CB_SETCURSEL,selection,0);
++        InvalidateRect(control_,nullptr,FALSE);
++    };
++    if(premium::kCapture.Contains(x,y)) {
++        const int value=std::clamp(int((x-premium::kCapture.x)*2/premium::kCapture.w),0,1);
++        change(IDC_CAPTURE_BACKEND,value);return true;
++    }
++    if(premium::kFactor.Contains(x,y)){
++        const int button=std::clamp(int((x-premium::kFactor.x)*7/premium::kFactor.w),0,6);
++        static constexpr int kIndices[]={0,6,1,2,3,4,5};
++        change(IDC_MULTIPLIER,kIndices[button]);
++        EnableWindow(GetDlgItem(control_,IDC_DYNAMIC_TARGET),button==1);
++        InvalidateRect(control_,nullptr,FALSE);return true;
++    }
++    if(premium::kResolution.Contains(x,y)){
++        const int value=std::clamp(int((x-premium::kResolution.x)*3/premium::kResolution.w),0,2);
++        change(IDC_NVOF_RESOLUTION,value);return true;
++    }
++    return false;
+ }
+ 
+ BOOL CALLBACK App::EnumWindowsProc(HWND hwnd, LPARAM param) {
+@@ -531,6 +619,8 @@ void App::Start() {
+         EnableWindow(GetDlgItem(control_,id),FALSE);
+     EnableWindow(GetDlgItem(control_,IDC_STOP),TRUE);
+     worker_ = std::thread(&App::Worker, this, target, presenter_);
++    SetWindowTextW(status_,L"Capture initializing...");
++    InvalidateRect(control_,nullptr,FALSE);
+ }
+ 
+ void App::Stop() {
+@@ -545,6 +635,10 @@ void App::Stop() {
+     target_ = nullptr;
+     if(targetProcess_) { CloseHandle(targetProcess_);targetProcess_=nullptr; }
+     running_ = false;
++    if(control_ && IsWindow(control_)) {
++        ShowWindow(control_,SW_SHOW);
++        InvalidateRect(control_,nullptr,FALSE);
++    }
+ }
+ 
+ void App::UpdateIdleControls() {
+@@ -554,6 +648,7 @@ void App::UpdateIdleControls() {
+     EnableWindow(GetDlgItem(control_,IDC_DYNAMIC_TARGET),
+         SendDlgItemMessageW(control_,IDC_MULTIPLIER,CB_GETCURSEL,0,0)==6);
+     EnableWindow(GetDlgItem(control_,IDC_STOP),FALSE);
++    InvalidateRect(control_,nullptr,FALSE);
+ }
+ 
+ bool App::CreatePresenter(HWND target, bool fullscreen) {
+@@ -637,7 +732,7 @@ bool App::InitCapture(HWND target, CaptureState& c, uint32_t& width, uint32_t& h
+         }
+         if (c.output) break;
+     }
+-    if (!c.output) { PostStatus(L"Could not find the monitor containing League."); return false; }
++    if (!c.output) { PostStatus(L"Could not find the selected game monitor."); return false; }
+     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+     D3D_FEATURE_LEVEL obtained{};
+     hr = D3D11CreateDevice(c.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+@@ -2222,63 +2317,109 @@ void App::Worker(HWND target, HWND outputWindow) {
+     DestroyDx12(d);
+     gDLSS.Release();
+     if(!focus_compat::Remove())gLog.Write(L"Could not fully restore local focus import. Close this app before another test.");
+-    gDLSS.EndRuntime();
++    // Streamline runtime stays initialized between sessions. Unloading it here
++    // previously made the control window unusable for subsequent Starts.
+     for(auto& handle:c.textureHandles)if(handle)CloseHandle(handle);
+     if(c.captureFenceHandle)CloseHandle(c.captureFenceHandle);
+     if(c.releaseFenceHandle)CloseHandle(c.releaseFenceHandle);
+-    gDLSS.Shutdown();
+     PostMessageW(control_,WM_APP_STOPPED,0,0);
+ }
+ 
+ LRESULT App::OnControlMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+     switch (msg) {
++    case WM_ERASEBKGND: return 1;
++    case WM_PAINT: {
++        PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);
++        DrawPremiumUI(dc);EndPaint(hwnd,&ps);return 0;
++    }
++    case WM_SIZE: LayoutPremiumControls();InvalidateRect(hwnd,nullptr,FALSE);return 0;
++    case WM_MEASUREITEM: {
++        auto* measure=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
++        if(measure&&measure->CtlID==IDC_TARGET){measure->itemHeight=30;return TRUE;}
++        break;
++    }
++    case WM_DRAWITEM: {
++        auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(lp);
++        if(item&&item->CtlID==IDC_TARGET){premium::DrawCombo(item);return TRUE;}
++        break;
++    }
++    case WM_CTLCOLOREDIT:
++    case WM_CTLCOLORSTATIC:
++        SetTextColor(reinterpret_cast<HDC>(wp),RGB(242,231,253));
++        SetBkColor(reinterpret_cast<HDC>(wp),RGB(27,23,43));
++        return reinterpret_cast<LRESULT>(editBrush_ ? editBrush_ : GetStockObject(BLACK_BRUSH));
++    case WM_LBUTTONUP: {
++        RECT r{};GetClientRect(hwnd,&r);
++        const float scale=std::min(float(r.right)/premium::kDesignWidth,float(r.bottom)/premium::kDesignHeight);
++        if(scale>0.01f&&PremiumHit(float(GET_X_LPARAM(lp))/scale,float(GET_Y_LPARAM(lp))/scale))return 0;
++        break;
++    }
++    case WM_MOUSEMOVE: {
++        RECT r{};GetClientRect(hwnd,&r);
++        const float scale=std::min(float(r.right)/premium::kDesignWidth,float(r.bottom)/premium::kDesignHeight);
++        if(scale<=0.01f)break;
++        const float x=float(GET_X_LPARAM(lp))/scale,y=float(GET_Y_LPARAM(lp))/scale;
++        int newHover=premium::kCapture.Contains(x,y)?1:
++                     premium::kFactor.Contains(x,y)?2:
++                     premium::kResolution.Contains(x,y)?3:-1;
++        if(newHover!=hover_){hover_=newHover;InvalidateRect(hwnd,nullptr,FALSE);}
++        TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE,hwnd,0};TrackMouseEvent(&track);
++        return 0;
++    }
++    case WM_MOUSELEAVE: if(hover_!=-1){hover_=-1;InvalidateRect(hwnd,nullptr,FALSE);}return 0;
+     case WM_COMMAND:
+         switch (LOWORD(wp)) {
+-        case IDC_REFRESH: RefreshTargets(); return 0;
+-        case IDC_START: Start(); return 0;
+-        case IDC_STOP:
+-            Stop();UpdateIdleControls();
+-            SetWindowTextW(status_, L"Stopped - app remains open. Choose a game and press Start.");
+-            return 0;
++        case IDC_REFRESH: if(!running_)RefreshTargets();InvalidateRect(hwnd,nullptr,FALSE);return 0;
++        case IDC_START: if(!running_)Start();InvalidateRect(hwnd,nullptr,FALSE);return 0;
++        case IDC_STOP: if(running_)RequestStop();return 0;
+         case IDC_MULTIPLIER:
+             if(HIWORD(wp)==CBN_SELCHANGE && !running_)
+                 EnableWindow(GetDlgItem(control_,IDC_DYNAMIC_TARGET),
+                     SendDlgItemMessageW(control_,IDC_MULTIPLIER,CB_GETCURSEL,0,0)==6);
+-            return 0;
+-        }
+-        break;
++            InvalidateRect(hwnd,nullptr,FALSE);return 0;
++        }break;
+     case WM_TIMER:
+         if(wp==1 && running_ &&
+            (!IsWindow(target_) || (targetProcess_ && WaitForSingleObject(targetProcess_,0)==WAIT_OBJECT_0))) {
+-            Stop();UpdateIdleControls();RefreshTargets();
+-            SetWindowTextW(status_,L"Game closed - capture stopped; app remains open.");
++            // Set a cancellation flag, never destroy the app from the timer.
++            RequestStop();
+         }
+         return 0;
+     case WM_HOTKEY:
+         if (wp == 1 && running_) ToggleFullscreen();
+         if (wp == 2 && running_) { paused_ = !paused_; if(workerControlEvent_) SetEvent(workerControlEvent_); }
+-        if (wp == 3 && running_) { stop_ = true; if(workerControlEvent_) SetEvent(workerControlEvent_); }
++        if (wp == 3 && running_) RequestStop();
+         return 0;
+     case WM_APP_STATUS: {
+         auto* text = reinterpret_cast<std::wstring*>(lp);
+-        SetWindowTextW(status_, text->c_str()); delete text; return 0;
++        if(text){SetWindowTextW(status_, text->c_str());delete text;}
++        InvalidateRect(hwnd,nullptr,FALSE);return 0;
+     }
+     case WM_APP_STOPPED: {
+         const bool gameGone=target_ && (!IsWindow(target_) ||
+             (targetProcess_ && WaitForSingleObject(targetProcess_,0)==WAIT_OBJECT_0));
+         Stop();UpdateIdleControls();
+-        if(gameGone) RefreshTargets();
+-        SetWindowTextW(status_,gameGone ? L"Game closed - capture stopped; app remains open."
+-                                       : L"Capture stopped - app remains open.");
++        if(gameGone)RefreshTargets();
++        SetWindowTextW(status_,gameGone ? L"Game exited • capture stopped • app remains open"
++                                       : L"Capture stopped • ready to restart");
++        InvalidateRect(hwnd,nullptr,FALSE);
+         return 0;
+     }
+-    case WM_CLOSE: Stop(); DestroyWindow(hwnd); return 0;
++    case WM_SYSCOMMAND:
++        if((wp&0xFFF0)==SC_CLOSE)explicitExit_=true;
++        break;
++    case WM_CLOSE:
++        // The control panel's close must be explicit (X, Alt+F4, taskbar Close).
++        // Never let a game-owned presenter or capture shutdown close this window.
++        if(!explicitExit_){gLog.Write(L"Ignored unsolicited WM_CLOSE on control panel.");return 0;}
++        Stop();DestroyWindow(hwnd);return 0;
+     case WM_DESTROY:
++        gLog.Write(L"Control window WM_DESTROY: explicit application exit.");
+         KillTimer(hwnd,1);
+-        UnregisterHotKey(hwnd, 1); UnregisterHotKey(hwnd, 2); UnregisterHotKey(hwnd, 3);
+-        PostQuitMessage(0); return 0;
++        UnregisterHotKey(hwnd,1);UnregisterHotKey(hwnd,2);UnregisterHotKey(hwnd,3);
++        PostQuitMessage(0);return 0;
+     }
+-    return DefWindowProcW(hwnd, msg, wp, lp);
++    return DefWindowProcW(hwnd,msg,wp,lp);
+ }
+ 
+ LRESULT App::OnPresenterMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+diff --git a/source/premium_ui.h b/source/premium_ui.h
+new file mode 100644
+index 0000000..6dec865
+--- /dev/null
++++ b/source/premium_ui.h
+@@ -0,0 +1,161 @@
++#pragma once
++// V35 premium control-panel presentation only. The game capture/presenter are unchanged.
++#include <gdiplus.h>
++#include <windows.h>
++#include <string>
++#include <algorithm>
++#pragma comment(lib,"gdiplus.lib")
++
++namespace premium {
++using namespace Gdiplus;
++struct HitRect { float x, y, w, h; bool Contains(float xx, float yy) const {return xx>=x&&xx<x+w&&yy>=y&&yy<y+h;} };
++constexpr float kDesignWidth=1160.f, kDesignHeight=714.f;
++constexpr HitRect kRefresh{407,186,54,44};
++constexpr HitRect kCapture{823,154,287,44};
++constexpr HitRect kFactor{725,244,387,44};
++constexpr HitRect kResolution{816,356,294,44};
++constexpr HitRect kStart{28,575,536,75};
++constexpr HitRect kStop{582,575,550,75};
++constexpr HitRect kTarget{50,185,342,45};
++constexpr HitRect kTargetFps{1005,306,97,31};
++constexpr HitRect kRadius{858,459,94,32};
++constexpr HitRect kFeather{1010,459,94,32};
++inline Color C(BYTE r,BYTE g,BYTE b,BYTE a=255){return Color(a,r,g,b);}
++inline void Rounded(Graphics& g, RectF r, float rad, Color fill, Color outline=C(0,0,0,0), float line=1.0f) {
++  GraphicsPath path;
++  const float d=rad*2;
++  path.AddArc(r.X,r.Y,d,d,180,90);path.AddArc(r.GetRight()-d,r.Y,d,d,270,90);
++  path.AddArc(r.GetRight()-d,r.GetBottom()-d,d,d,0,90);path.AddArc(r.X,r.GetBottom()-d,d,d,90,90);path.CloseFigure();
++  SolidBrush b(fill);g.FillPath(&b,&path);
++  if(outline.GetA()) {Pen p(outline,line);g.DrawPath(&p,&path);}
++}
++inline void GradRounded(Graphics& g, RectF r, float rad, Color hi, Color lo, Color outline=C(0,0,0,0)){
++  GraphicsPath path;const float d=rad*2;
++  path.AddArc(r.X,r.Y,d,d,180,90);path.AddArc(r.GetRight()-d,r.Y,d,d,270,90);
++  path.AddArc(r.GetRight()-d,r.GetBottom()-d,d,d,0,90);path.AddArc(r.X,r.GetBottom()-d,d,d,90,90);path.CloseFigure();
++  LinearGradientBrush b(PointF(r.X,r.Y),PointF(r.X,r.GetBottom()),hi,lo);
++  g.FillPath(&b,&path);
++  if(outline.GetA()){Pen p(outline,1.5f);g.DrawPath(&p,&path);}
++}
++inline void Text(Graphics& g, const wchar_t* s,float x,float y,float w,float h,float size,Color color,bool bold=false,bool center=false,bool italic=false){
++  FontFamily family(L"Segoe UI");
++  Font f(&family,size,(bold?FontStyleBold:FontStyleRegular)|(italic?FontStyleItalic:0),UnitPixel);
++  SolidBrush b(color);
++  StringFormat sf;sf.SetAlignment(center?StringAlignmentCenter:StringAlignmentNear);
++  sf.SetLineAlignment(StringAlignmentCenter);sf.SetTrimming(StringTrimmingEllipsisCharacter);
++  sf.SetFormatFlags(StringFormatFlagsNoWrap);
++  g.DrawString(s,-1,&f,RectF(x,y,w,h),&sf,&b);
++}
++inline void Line(Graphics& g,float x,float y,float x2,float y2, Color c,float weight=1.f){Pen p(c,weight);g.DrawLine(&p,x,y,x2,y2);}
++inline void Segment(Graphics& g,HitRect area,const wchar_t* const* labels,int count,int selected,bool disabled=false,int hovered=-1){
++  Rounded(g,RectF(area.x,area.y,area.w,area.h),13,C(26,24,40),C(66,55,85));
++  const float cell=area.w/count;
++  for(int i=0;i<count;++i){
++    const float x=area.x+cell*i;
++    if(i==selected){
++      for(int j=5;j>=1;--j)Rounded(g,RectF(x-0.4f*j,area.y-0.4f*j,cell+0.8f*j,area.h+0.8f*j),12,C(150,53,255,(BYTE)(4+j*2)));
++      GradRounded(g,RectF(x+1,area.y+1,cell-2,area.h-2),11,C(172,68,255),C(85,26,183),C(208,111,255));
++    }else if(i==hovered&&!disabled){Rounded(g,RectF(x+1,area.y+1,cell-2,area.h-2),10,C(49,38,68));}
++    if(i>0&&i!=selected&&i-1!=selected)Line(g,x,area.y+7,x,area.y+area.h-7,C(69,61,85));
++    Text(g,labels[i],x+2,area.y+1,cell-4,area.h-2,count>=6?14.5f:17.f,disabled?C(103,96,121):C(244,240,255),i==selected,true);
++  }
++}
++inline void Glow(Graphics&g,float x,float y,float w,float h){
++  for(int i=12;i>=1;--i){SolidBrush b(C(139,54,231,(BYTE)(2+i/3)));g.FillEllipse(&b,x-w*0.5f-i*3,y-h*0.5f-i*3,w+6*i,h+6*i);}
++}
++inline void LogoTile(Graphics&g){
++  RectF box(50,257,411,279);
++  GradRounded(g,box,18,C(22,11,42),C(6,9,18),C(69,50,109));
++  // Ambient purple waves, geometrically drawn; no bitmap or extra GPU path.
++  Pen wave(C(139,60,255,50),14.f);wave.SetLineCap(LineCapRound,LineCapRound,DashCapRound);
++  Pen edge(C(187,94,255,105),3.f);
++  GraphicsPath ribbon;
++  ribbon.AddBezier(PointF(49,494),PointF(145,490),PointF(145,385),PointF(285,398));
++  ribbon.AddBezier(PointF(285,398),PointF(367,395),PointF(403,303),PointF(468,278));
++  g.DrawPath(&wave,&ribbon);g.DrawPath(&edge,&ribbon);
++  Pen ribbon2(C(136,50,255,50),2.f);
++  for(int j=0;j<5;++j)g.DrawBezier(&ribbon2,PointF(53,515+j*2),PointF(180,453-j*8),PointF(312,481-j*12),PointF(455,318+j*5));
++  Text(g,L"FG",135,347,240,100,85,C(185,93,255),true,true,true);
++  Text(g,L"E X T R A P O L A T I O N",90,453,330,39,13.2f,C(220,205,241),false,true);
++}
++inline void Paint(HDC hdc,int width,int height,int backend,int factor,int resolution,bool running,bool dynamic,
++                 const wchar_t* status,int hover){
++  Graphics g(hdc);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
++  const float scale=std::min(float(width)/kDesignWidth,float(height)/kDesignHeight);
++  g.ScaleTransform(scale,scale);
++  SolidBrush bg(C(10,9,20));g.FillRectangle(&bg,RectF(0,0,kDesignWidth,kDesignHeight));
++  // Ambient lighting, header and hairline dividers.
++  for(int i=13;i>=1;--i){SolidBrush haze(C(115,40,190,3));g.FillEllipse(&haze,840-i*13,-230-i*6,420+i*26,380+i*14);}
++  GradRounded(g,RectF(0,0,kDesignWidth,90),2,C(21,13,38),C(11,10,21));
++  Line(g,0,91,1160,91,C(75,44,105));
++  Text(g,L"FG",30,15,147,64,61,C(178,88,255),true,false,true);
++  Line(g,184,14,184,77,C(77,67,103));
++  Text(g,L"FG Extrapolation",214,8,715,54,32,C(249,246,255),true);
++  Text(g,L"DXGI / WGC    •    NvOFA    •    Reflex",215,54,630,30,17,C(158,151,180));
++  Rounded(g,RectF(980,29,145,34),17,C(34,25,50),C(87,62,112));
++  Text(g,L"V35  /  PRO",992,30,120,31,14,C(211,183,248),true,true);
++  // Left and right cards.
++  GradRounded(g,RectF(24,111,461,443),19,C(23,20,37),C(15,14,26),C(67,50,91));
++  GradRounded(g,RectF(502,111,633,443),19,C(23,20,37),C(16,14,28),C(67,50,91));
++  Text(g,L"▣   WINDOW (GAME)",50,132,386,41,20,C(245,243,253),true);
++  Rounded(g,RectF(50,184,342,48),12,C(26,23,40),C(154,64,226),1.8f);
++  Rounded(g,RectF(kRefresh.x,kRefresh.y,kRefresh.w,kRefresh.h),12,C(37,33,55),C(76,65,105));
++  Text(g,L"⟳",kRefresh.x,kRefresh.y-1,kRefresh.w,kRefresh.h,29,C(224,215,246),true,true);
++  LogoTile(g);
++  const Color line=C(67,53,90);
++  Line(g,521,222,1112,222,line);
++  Line(g,521,315,1112,315,line);
++  Line(g,521,423,1112,423,line);
++  Text(g,L"CAPTURE API",531,150,280,42,19,C(239,237,251),true);
++  static const wchar_t* cap[]={L"DXGI",L"WGC"};Segment(g,kCapture,cap,2,backend,running,hover==1?backend:-1);
++  Text(g,L"EXTRAPOLATION",531,240,225,45,19,C(239,237,251),true);
++  static const wchar_t* fac[]={L"Off",L"Dynamic",L"2×",L"3×",L"4×",L"5×",L"6×"};
++  const int active=(factor==6?1:factor==0?0:factor+1);
++  Segment(g,kFactor,fac,7,active,running,hover==2?active:-1);
++  Text(g,L"DYNAMIC TARGET",743,298,270,28,13,C(157,149,177),true);
++  Text(g,L"FPS",958,303,42,30,14,C(171,159,195));
++  Rounded(g,RectF(kTargetFps.x-1,kTargetFps.y-1,kTargetFps.w+2,kTargetFps.h+2),9,C(25,21,39),C(91,63,130));
++  Text(g,L"NvOFA RESOLUTION",531,349,265,44,19,C(239,237,251),true);
++  static const wchar_t* res[]={L"100%",L"50%",L"10%"};Segment(g,kResolution,res,3,resolution,running,hover==3?resolution:-1);
++  Text(g,L"CROSSHAIR PROTECTION",531,439,315,37,19,C(239,237,251),true);
++  Text(g,L"RADIUS",848,429,110,24,12.5f,C(163,150,187),true);
++  Text(g,L"FEATHER",994,429,114,24,12.5f,C(163,150,187),true);
++  Rounded(g,RectF(kRadius.x-1,kRadius.y-1,kRadius.w+2,kRadius.h+2),9,C(27,23,43),C(115,75,158));
++  Rounded(g,RectF(kFeather.x-1,kFeather.y-1,kFeather.w+2,kFeather.h+2),9,C(27,23,43),C(115,75,158));
++  Text(g,L"Radius and feather protect generated frames only",534,506,569,26,14,C(144,138,162));
++  // Large tactile CTA controls.
++  for(int i=10;i>=1;--i)Rounded(g,RectF(kStart.x-i*.35f,kStart.y-i*.3f,kStart.w+i*.7f,kStart.h+i*.6f),16,C(148,52,240,(BYTE)(1+i)));
++  GradRounded(g,RectF(kStart.x,kStart.y,kStart.w,kStart.h),18,C(173,67,252),C(92,26,185),C(199,111,255));
++  Text(g,L"▶   START",kStart.x,kStart.y,kStart.w,kStart.h,28,C(252,249,255),true,true);
++  GradRounded(g,RectF(kStop.x,kStop.y,kStop.w,kStop.h),18,C(43,38,62),C(26,25,43),C(89,78,111));
++  Text(g,L"■   STOP",kStop.x,kStop.y,kStop.w,kStop.h,28,C(227,220,243),true,true);
++  // Status ribbon with live summary.
++  Rounded(g,RectF(24,666,1112,39),14,C(24,22,39),C(65,58,91));
++  SolidBrush dot(running?C(109,245,184):C(119,111,148));g.FillEllipse(&dot,44,678,13,13);
++  Text(g,status,69,672,468,25,13.5f,C(215,211,231));
++  Line(g,539,674,539,697,C(76,63,100));
++  Text(g,backend?L"WGC":L"DXGI",549,672,67,25,13.5f,C(189,179,221),true);
++  Line(g,622,674,622,697,C(76,63,100));
++  const wchar_t* mode=(factor==0?L"Off":factor==6?L"Dynamic":factor==1?L"2×":factor==2?L"3×":factor==3?L"4×":factor==4?L"5×":L"6×");
++  Text(g,mode,634,672,115,25,13.5f,C(189,179,221),true);
++  Line(g,767,674,767,697,C(76,63,100));
++  Text(g,res[std::clamp(resolution,0,2)],779,672,92,25,13.5f,C(189,179,221),true);
++  Line(g,879,674,879,697,C(76,63,100));
++  Text(g,L"4×4 FAST   •   REFLEX + BOOST",897,672,230,25,12.6f,C(182,169,212));
++}
++inline void DrawCombo(const DRAWITEMSTRUCT* d){
++  if(!d||!d->hDC)return;
++  Graphics g(d->hDC);g.SetSmoothingMode(SmoothingModeAntiAlias);g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
++  auto r=d->rcItem;
++  RECT bounds=r;
++  HBRUSH background=CreateSolidBrush(RGB(25,22,41));FillRect(d->hDC,&bounds,background);DeleteObject(background);
++  if((d->itemState&ODS_SELECTED)&&d->itemID!=(UINT)-1){
++    HBRUSH selected=CreateSolidBrush(RGB(75,34,116));FillRect(d->hDC,&bounds,selected);DeleteObject(selected);
++  }
++  wchar_t text[500]{};
++  if(d->itemID!=(UINT)-1)SendMessageW(d->hwndItem,CB_GETLBTEXT,d->itemID,reinterpret_cast<LPARAM>(text));
++  else wcscpy_s(text,L"Choose a running game window");
++  Text(g,text,float(r.left+13),float(r.top+2),float(r.right-r.left-35),float(r.bottom-r.top-4),15.5f,C(239,231,248));
++  if(d->itemState&ODS_FOCUS){RECT focus=r;InflateRect(&focus,-3,-3);DrawFocusRect(d->hDC,&focus);}
++}
++} // namespace premium
