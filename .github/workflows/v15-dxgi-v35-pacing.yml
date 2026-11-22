@@ -1,8 +1,8 @@
-name: V15 DXGI V35 Pacing Windows x64
+name: V15 DXGI Exact V35 Pacing Windows x64
 on:
   push:
     branches:
-      - v15-dxgi-v35-pacing-20261122
+      - v15-dxgi-v35-exact-pacing-20261122
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,18 +12,20 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
-      - name: Checkout branch
+      - name: Checkout build branch
         uses: actions/checkout@v4
 
-      - name: Reconstruct exact patched source
+      - name: Reconstruct verified V15 DXGI and exact V35 schedule
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python --version
           python prepare_v15_pacing.py
-          if ($LASTEXITCODE -ne 0) { throw 'Source reconstruction failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'V15 source reconstruction failed' }
+          python apply_v35_exact.py
+          if ($LASTEXITCODE -ne 0) { throw 'Exact V35 pacing patch failed' }
 
-      - name: Compile V15 DXGI x64 with MSVC
+      - name: Compile Windows x64 using MSVC
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -35,21 +37,21 @@ jobs:
           $result = $LASTEXITCODE
           if (Test-Path build.log) { Get-Content build.log }
           if ($result -ne 0) { throw "MSVC build failed ($result)" }
-          if (!(Test-Path 'bin/FG.exe')) { throw 'Expected FG.exe was not produced' }
+          if (!(Test-Path 'bin/FG.exe')) { throw 'Compiled FG.exe not found' }
 
-      - name: Package ready-to-run application
+      - name: Package ready-to-run V15 + exact V35 pacing
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-V15-DXGI-V35-Pacing-Windows-x64.zip' -Force
-          if (!(Test-Path 'artifacts/FG-V15-DXGI-V35-Pacing-Windows-x64.zip')) { throw 'Artifact not produced' }
+          Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-V15-DXGI-V35-ExactPacing-Windows-x64.zip' -Force
+          if (!(Test-Path 'artifacts/FG-V15-DXGI-V35-ExactPacing-Windows-x64.zip')) { throw 'Artifact ZIP not produced' }
 
-      - name: Upload ready-to-run ZIP and diagnostics
+      - name: Upload Windows application
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: FG-V15-DXGI-V35-Pacing-Windows-x64
+          name: FG-V15-DXGI-V35-ExactPacing-Windows-x64
           path: |
             artifacts/*.zip
             build.log
