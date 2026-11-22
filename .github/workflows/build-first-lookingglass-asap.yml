@@ -1,0 +1,89 @@
+name: Build FIRST Looking Glass DXGI ASAP Q0 L1
+on:
+  push:
+    branches: [v15-first-lookingglass-asap-q0-l1]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Restore exact FIRST DXGI source and patch ASAP frame admission
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          python -m pip install --disable-pip-version-check brotli==1.1.0
+          if($LASTEXITCODE -ne 0){throw 'Brotli install failed'}
+          python prepare_source.py
+          if($LASTEXITCODE -ne 0){throw 'Original source restoration failed'}
+          $before=(Get-FileHash src/main.cpp -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($before -ne 'edf9012b454e2638660806495065a41309cd7a925eb4cd1f5ced465b24220f02'){throw "Wrong first DXGI source $before"}
+          python -c "import pathlib,base64,gzip; p=pathlib.Path('patches/first_lg_immediate.py.gz.b64'); pathlib.Path('patch_first_lg_immediate.py').write_bytes(gzip.decompress(base64.b64decode(p.read_text())))"
+          if($LASTEXITCODE -ne 0){throw 'Patch decode failed'}
+          python patch_first_lg_immediate.py
+          if($LASTEXITCODE -ne 0){throw 'ASAP patch failed'}
+          $after=(Get-FileHash src/main.cpp -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($after -ne '60e7d7e7bb0e7098deaf86a4816a93f5a4586e9cf7ce4fb2d18376ac28450226'){throw "Patched source hash mismatch $after"}
+          Write-Host 'Original LG source and ASAP patch validated; no V2 freeze patch, WGC, or synthetic burst patch.'
+          $ok=$false
+          for($attempt=1;$attempt -le 6;$attempt++){
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+            if($LASTEXITCODE -eq 0){$ok=$true;break}
+            Write-Host "SDK header download failed; attempt $attempt/6"
+            Start-Sleep -Seconds ([Math]::Min($attempt*2,10))
+          }
+          if(-not $ok){throw 'NVIDIA SDK headers unavailable after retries'}
+      - name: Compile original Looking Glass DXGI with MSVC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $p86=[Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhere=Join-Path $p86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs=& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if(-not $vs){throw 'MSVC x64 compiler not installed'}
+          $vcvars=Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c ('call "'+$vcvars+'" && call Build.cmd > build.log 2>&1')
+          $exit=$LASTEXITCODE
+          if(Test-Path build.log){Get-Content build.log}
+          if($exit -ne 0){throw "C++ compile failure $exit"}
+          if(-not (Test-Path 'bin/FG-LG-DXGI.exe')){throw 'Compiled first-LG EXE missing'}
+      - name: Package ready-to-run EXE and full patched source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force 'artifacts/ready' | Out-Null
+          Copy-Item bin/FG-LG-DXGI.exe artifacts/ready/FG-LG-DXGI-ASAP.exe
+          @'
+          FIRST Looking Glass DXGI V15 Clean V16 - ASAP real and generated frames
+          Capture: DXGI Desktop Duplication; no WGC, no NVFBC, no game injection.
+          Queue target 0 (latest real only, no software present queue).
+          Max DXGI frame latency 1, nonblocking GetFrameLatencyWaitableObject test.
+          No intentional synthetic frame deadline. Real frames and generated frames
+          try the next available DXGI presentation slot as soon as eligible.
+          Fixed modes x2-x6 and Dynamic retain the original UI.
+          IMPORTANT: A Windows refresh slot still exists. No app can make the 240Hz
+          panel scan out all simultaneous Presents instantaneously.
+          Experimental and not hardware-tested; close all other FG builds first.
+          If CS2 becomes unstable, stop testing and revert to a known working version.
+          '@ | Set-Content -Encoding UTF8 artifacts/ready/README-ASAP.txt
+          Compress-Archive -Path artifacts/ready/* -DestinationPath artifacts/FG-First-LookingGlass-DXGI-ASAP-Windows-x64.zip -Force
+          Compress-Archive -Path src,Build.cmd,Download-Headers.ps1,prepare_source.py,patch_first_lg_immediate.py,README.md,CAPTURE-NOTES.md -DestinationPath artifacts/FG-First-LookingGlass-DXGI-ASAP-Source.zip -Force
+          if(!(Test-Path artifacts/FG-First-LookingGlass-DXGI-ASAP-Windows-x64.zip)){throw 'Missing EXE ZIP'}
+          Get-ChildItem artifacts/*.zip | Select-Object Name,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FG-First-LookingGlass-DXGI-ASAP-ZIPs
+          path: artifacts/*.zip
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LG-ASAP-CompileLog
+          path: build.log
+          if-no-files-found: ignore
