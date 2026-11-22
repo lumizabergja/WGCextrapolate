@@ -52,6 +52,13 @@ Apply-Patch 'extrap-v35.patch' 'Custom extrapolation'
 Apply-Patch 'ui-v35.patch' 'Simplified UI with crosshair radius and feather'
 Apply-Patch 'premium-v35.patch' 'Premium GDI+ interface and persistent application window'
 
+# GDI+ imaging interfaces inherit IUnknown, which must be declared before
+# gdiplus.h is parsed. Include objidl.h explicitly on the Windows SDK runner.
+$premiumHeader = Get-Content 'source/premium_ui.h' -Raw
+$premiumHeader = $premiumHeader.Replace('#include <gdiplus.h>', '#include <objidl.h>' + $nl + '#include <gdiplus.h>')
+[IO.File]::WriteAllText('source/premium_ui.h', $premiumHeader, $utf8)
+
+
 $main = Get-Content 'source/main.cpp' -Raw
 $bridge = Get-Content 'source/dlss_bridge.cpp' -Raw
 if ($bridge -match 'kFeatureDLSS_G' -or $bridge -match 'slDLSSGSetOptions') {
