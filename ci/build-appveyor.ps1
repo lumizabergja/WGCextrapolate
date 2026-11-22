@@ -75,6 +75,14 @@ $premiumHeader = Get-Content 'source/premium_ui.h' -Raw
 $premiumHeader = $premiumHeader.Replace('#include <gdiplus.h>', '#include <objidl.h>' + $nl + '#include <gdiplus.h>')
 [IO.File]::WriteAllText('source/premium_ui.h', $premiumHeader, $utf8)
 
+# V15 Clean V16 complete predictor port, game-safe Stop and 100/50/10 OFA selector.
+$payload=(Get-Content 'ci/v15full-upgrade.py.xz.b64' -Raw).Trim()
+[IO.File]::WriteAllBytes('ci/v15full-upgrade.py.xz',[Convert]::FromBase64String($payload))
+& python -c "import lzma,pathlib;pathlib.Path('ci/v15full-upgrade.py').write_bytes(lzma.decompress(pathlib.Path('ci/v15full-upgrade.py.xz').read_bytes()))"
+if($LASTEXITCODE -ne 0){throw 'V15 predictor source upgrade unpack failed'}
+& python 'ci/v15full-upgrade.py'
+if($LASTEXITCODE -ne 0){throw 'V15 predictor source upgrade failed'}
+
 
 $main = Get-Content 'source/main.cpp' -Raw
 $bridge = Get-Content 'source/dlss_bridge.cpp' -Raw
@@ -97,8 +105,9 @@ if ($main -notmatch 'workerFinished_' -or $main -notmatch 'FinalizeFinishedSessi
     $main -notmatch 'float centerMask' -or $main -notmatch 'float\(d.width\),float\(d.height\)') {
   throw 'V15 center-mask/persistent Stop lifecycle validation failed'
 }
-if ($main -match 'ofaPercent_' -or $main -match 'CB_GETCURSEL,0,0\).*IDC_NVOF_RESOLUTION') {
-  throw 'OFA resolution scaling/UI selector was not fully removed'
+if ($main -notmatch 'ofaPercent_' -or $main -notmatch 'CBS_HASSTRINGS' -or
+    $main -notmatch 'Texture2D<float4> previousFrame' -or $main -notmatch 'cutSample') {
+  throw 'Full V15 predictor, OFA resolution controls or game selector text fix missing'
 }
 if ($main -notmatch 'SetMaximumFrameLatency\(1\)') {
   throw 'V35 low-latency swapchain setting is missing'
