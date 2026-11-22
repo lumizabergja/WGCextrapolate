@@ -1,0 +1,466 @@
+diff --git a/source/main.cpp b/source/main.cpp
+index 0995491..fad841c 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -32,7 +32,7 @@ using Microsoft::WRL::ComPtr;
+ 
+ namespace {
+ 
+-constexpr wchar_t kAppName[] = L"FG Extrap V35 - DXGI / WGC / NvOFA / Reflex";
++constexpr wchar_t kAppName[] = L"FG Extrap V35 - Low Latency";
+ constexpr wchar_t kControlClass[] = L"LoLDX12Presenter.Control";
+ constexpr wchar_t kPresenterClass[] = L"LoLDX12Presenter.Output";
+ constexpr UINT WM_APP_STATUS = WM_APP + 1;
+@@ -48,7 +48,7 @@ constexpr UINT kPreprocessQueriesPerFrame = 2;
+ enum ControlId : int {
+     IDC_TARGET = 100, IDC_REFRESH, IDC_START, IDC_STOP,
+     IDC_FULLSCREEN, IDC_LOW_LATENCY, IDC_STATUS, IDC_MULTIPLIER, IDC_CAPTURE_BACKEND, IDC_NVOF_GRID, IDC_REFLEX_TIMING, IDC_NVOF_COST,
+-    IDC_NVOF_RESOLUTION
++    IDC_NVOF_RESOLUTION, IDC_DYNAMIC_TARGET, IDC_CROSSHAIR_RADIUS, IDC_CROSSHAIR_FEATHER
+ };
+ 
+ std::wstring WinError(HRESULT hr) {
+@@ -252,6 +252,7 @@ private:
+     void RefreshTargets();
+     void Start();
+     void Stop();
++    void UpdateIdleControls();
+     void ToggleFullscreen();
+     void Worker(HWND target, HWND outputWindow);
+     void PostStatus(const std::wstring& text);
+@@ -276,6 +277,7 @@ private:
+     HWND targetCombo_{};
+     HWND status_{};
+     HWND target_{};
++    HANDLE targetProcess_{};
+     std::thread worker_;
+     HANDLE workerControlEvent_{};
+     std::atomic<bool> stop_{false};
+@@ -285,11 +287,16 @@ private:
+     UINT presenterClientWidth_{};
+     UINT presenterClientHeight_{};
+     bool fullscreen_{true};
+-    UINT multiplier_{2};
++    UINT multiplier_{4};
++    bool dynamicTarget_{false};
++    UINT targetFps_{240};
++    UINT crosshairRadius_{12};
++    UINT crosshairFeather_{8};
++    UINT ofaPercent_{100};
+     bool lowLatency_{true};
+     bool useWgc_{false};
+     UINT nvofGrid_{4};
+-    bool nvofCost_{true};
++    bool nvofCost_{false}; // Cost output disabled: no unused confidence surface.
+     UINT nvofWidth_{0};
+     UINT nvofHeight_{0};
+     UINT reflexTiming_{1};
+@@ -320,12 +327,13 @@ int App::Run(HINSTANCE instance) {
+     if (!RegisterClasses()) {gDLSS.Shutdown();return 1;}
+     control_ = CreateWindowExW(WS_EX_APPWINDOW, kControlClass, kAppName,
+         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+-        CW_USEDEFAULT, CW_USEDEFAULT, 590, 465, nullptr, nullptr, instance_, nullptr);
++        CW_USEDEFAULT, CW_USEDEFAULT, 640, 490, nullptr, nullptr, instance_, nullptr);
+     if (!control_) {gDLSS.Shutdown();return 1;}
+     CreateControls();
+     RefreshTargets();
+     ShowWindow(control_, SW_SHOW);
+     UpdateWindow(control_);
++    SetTimer(control_, 1, 250, nullptr); // Watch for game/window process exit.
+     RegisterHotKey(control_, 1, MOD_NOREPEAT, VK_F11);
+     RegisterHotKey(control_, 2, MOD_NOREPEAT, VK_F8);
+     RegisterHotKey(control_, 3, MOD_NOREPEAT, VK_F10);
+@@ -363,52 +371,54 @@ void App::CreateControls() {
+     auto label = [&](const wchar_t* text, int x, int y, int w, int h) {
+         return CreateWindowW(L"STATIC",text,WS_CHILD|WS_VISIBLE,x,y,w,h,control_,nullptr,instance_,nullptr);
+     };
+-    label(L"Source window",18,20,120,22);
++    label(L"Game window",18,17,120,24);
+     targetCombo_=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        18,45,430,240,control_,reinterpret_cast<HMENU>(IDC_TARGET),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Refresh",WS_CHILD|WS_VISIBLE,460,44,100,27,control_,reinterpret_cast<HMENU>(IDC_REFRESH),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Fullscreen output",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,18,91,170,24,control_,reinterpret_cast<HMENU>(IDC_FULLSCREEN),instance_,nullptr);
+-    SendDlgItemMessageW(control_,IDC_FULLSCREEN,BM_SETCHECK,BST_CHECKED,0);
+-    CreateWindowW(L"BUTTON",L"Low latency / tearing",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,205,91,190,24,control_,reinterpret_cast<HMENU>(IDC_LOW_LATENCY),instance_,nullptr);
+-    SendDlgItemMessageW(control_,IDC_LOW_LATENCY,BM_SETCHECK,BST_CHECKED,0);
+-    label(L"Extrap",397,94,60,22);
+-    HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        447,89,110,160,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
+-    for(const wchar_t* option:{L"Off (1x)",L"2x",L"3x",L"4x",L"5x",L"6x"}) SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+-    SendMessageW(multiplier,CB_SETCURSEL,3,0);
+-    label(L"Capture",18,132,60,22);
++        18,42,455,260,control_,reinterpret_cast<HMENU>(IDC_TARGET),instance_,nullptr);
++    CreateWindowW(L"BUTTON",L"Refresh",WS_CHILD|WS_VISIBLE,484,41,123,27,control_,reinterpret_cast<HMENU>(IDC_REFRESH),instance_,nullptr);
++
++    label(L"Capture API",18,88,150,24);
+     HWND backend=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        85,127,250,120,control_,reinterpret_cast<HMENU>(IDC_CAPTURE_BACKEND),instance_,nullptr);
+-    SendMessageW(backend,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"DXGI Desktop Duplication (recommended low latency)"));
+-    SendMessageW(backend,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Windows Graphics Capture"));
++        192,86,310,160,control_,reinterpret_cast<HMENU>(IDC_CAPTURE_BACKEND),instance_,nullptr);
++    for(const wchar_t* option:{L"DXGI Desktop Duplication",L"Windows Graphics Capture (WGC)"})
++        SendMessageW(backend,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(backend,CB_SETCURSEL,0,0);
+-    label(L"OF Grid",350,132,55,22);
+-    HWND ofGrid=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        410,127,150,100,control_,reinterpret_cast<HMENU>(IDC_NVOF_GRID),instance_,nullptr);
+-    SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"1x1 FAST"));
+-    SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"2x2 FAST"));
+-    SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"4x4 FAST"));
+-    SendMessageW(ofGrid,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"8x8 FAST"));
+-    SendMessageW(ofGrid,CB_SETCURSEL,2,0);
+-    label(L"OFA resolution",18,170,82,22);
++
++    label(L"Extrapolation",18,124,150,24);
++    HWND multiplier=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
++        192,122,185,240,control_,reinterpret_cast<HMENU>(IDC_MULTIPLIER),instance_,nullptr);
++    for(const wchar_t* option:{L"Off (1x)",L"2x",L"3x",L"4x",L"5x",L"6x",L"Dynamic target"})
++        SendMessageW(multiplier,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
++    SendMessageW(multiplier,CB_SETCURSEL,3,0);
++    label(L"Target FPS",402,125,90,23);
++    HWND dyn=CreateWindowW(L"EDIT",L"240",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER|WS_DISABLED,
++        509,121,98,27,control_,reinterpret_cast<HMENU>(IDC_DYNAMIC_TARGET),instance_,nullptr);
++    SendMessageW(dyn,EM_SETLIMITTEXT,4,0);
++
++    label(L"NvOFA resolution",18,162,160,24);
+     HWND ofRes=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        105,165,230,150,control_,reinterpret_cast<HMENU>(IDC_NVOF_RESOLUTION),instance_,nullptr);
+-    for(const wchar_t* option:{L"Native capture resolution",L"1600x900",L"1280x720",L"960x540",L"640x360"})
++        192,159,185,120,control_,reinterpret_cast<HMENU>(IDC_NVOF_RESOLUTION),instance_,nullptr);
++    for(const wchar_t* option:{L"100%",L"50%",L"10%"})
+         SendMessageW(ofRes,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(option));
+     SendMessageW(ofRes,CB_SETCURSEL,0,0);
+-    CreateWindowW(L"BUTTON",L"OFA confidence cost (quality)",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,365,166,195,24,control_,reinterpret_cast<HMENU>(IDC_NVOF_COST),instance_,nullptr);
+-    SendDlgItemMessageW(control_,IDC_NVOF_COST,BM_SETCHECK,BST_CHECKED,0);
+-    label(L"Reflex sleep",18,208,80,22);
+-    HWND reflex=CreateWindowW(WC_COMBOBOXW,nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+-        105,203,250,120,control_,reinterpret_cast<HMENU>(IDC_REFLEX_TIMING),instance_,nullptr);
+-    SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Off (Reflex mode)"));
+-    SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"Pre-capture (V14 behavior)"));
+-    SendMessageW(reflex,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"After frame arrival"));
+-    SendMessageW(reflex,CB_SETCURSEL,1,0);
+-    CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,18,248,180,36,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
+-    CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,210,248,110,36,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
+-    status_=label(L"Choose capture, extrapolation factor, optical-flow resolution and Reflex timing; Start.",18,300,540,65);
+-    label(L"F11 fullscreen | F8 pause | F10 stop",18,388,540,22);
++    label(L"NvOFA 4x4 FAST / confidence OFF",389,163,225,24);
++
++    label(L"Crosshair radius (px)",18,203,165,24);
++    HWND radius=CreateWindowW(L"EDIT",L"12",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER,
++        192,199,90,28,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_RADIUS),instance_,nullptr);
++    SendMessageW(radius,EM_SETLIMITTEXT,3,0);
++    label(L"Feather (px)",319,203,115,24);
++    HWND feather=CreateWindowW(L"EDIT",L"8",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER,
++        452,199,90,28,control_,reinterpret_cast<HMENU>(IDC_CROSSHAIR_FEATHER),instance_,nullptr);
++    SendMessageW(feather,EM_SETLIMITTEXT,3,0);
++    label(L"Only predicted frames are protected; real frames stay untouched.",18,239,580,22);
++
++    CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
++        18,275,282,39,control_,reinterpret_cast<HMENU>(IDC_START),instance_,nullptr);
++    CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED,
++        316,275,291,39,control_,reinterpret_cast<HMENU>(IDC_STOP),instance_,nullptr);
++    status_=label(L"Idle - choose a game window and press Start.",18,331,580,64);
++    label(L"Fullscreen ON | Low-latency ON | NvOFA grid 4x4 | Reflex + Boost ON",18,398,594,22);
++    label(L"F11 fullscreen  |  F8 pause  |  F10 stop",18,423,580,22);
+ }
+ 
+ BOOL CALLBACK App::EnumWindowsProc(HWND hwnd, LPARAM param) {
+@@ -424,18 +434,25 @@ BOOL CALLBACK App::EnumWindowsProc(HWND hwnd, LPARAM param) {
+     swprintf_s(entry, L"%s  [PID %lu]", text.c_str(), pid);
+     LRESULT index = SendMessageW(self->targetCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(entry));
+     SendMessageW(self->targetCombo_, CB_SETITEMDATA, index, reinterpret_cast<LPARAM>(hwnd));
+-    if (text.find(L"League of Legends") != std::wstring::npos ||
+-        text.find(L"League") != std::wstring::npos) {
++    if (text.find(L"Counter-Strike") != std::wstring::npos ||
++        text.find(L"League of Legends") != std::wstring::npos) {
+         SendMessageW(self->targetCombo_, CB_SETCURSEL, index, 0);
+     }
+     return TRUE;
+ }
+ 
+ void App::RefreshTargets() {
++    if(running_) return;
++    const LRESULT prior=SendMessageW(targetCombo_,CB_GETCURSEL,0,0);
++    HWND priorTarget=prior==CB_ERR?nullptr:reinterpret_cast<HWND>(SendMessageW(targetCombo_,CB_GETITEMDATA,prior,0));
+     SendMessageW(targetCombo_, CB_RESETCONTENT, 0, 0);
+     EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(this));
+-    if (SendMessageW(targetCombo_, CB_GETCURSEL, 0, 0) == CB_ERR &&
+-        SendMessageW(targetCombo_, CB_GETCOUNT, 0, 0) > 0)
++    const LRESULT count=SendMessageW(targetCombo_,CB_GETCOUNT,0,0);
++    for(LRESULT index=0;index<count && priorTarget;++index)
++        if(reinterpret_cast<HWND>(SendMessageW(targetCombo_,CB_GETITEMDATA,index,0))==priorTarget) {
++            SendMessageW(targetCombo_,CB_SETCURSEL,index,0);return;
++        }
++    if (SendMessageW(targetCombo_, CB_GETCURSEL, 0, 0) == CB_ERR && count>0)
+         SendMessageW(targetCombo_, CB_SETCURSEL, 0, 0);
+ }
+ 
+@@ -454,48 +471,48 @@ void App::Start() {
+         }
+     }
+     LRESULT selected = SendMessageW(targetCombo_, CB_GETCURSEL, 0, 0);
+-    if (selected == CB_ERR) { SetWindowTextW(status_, L"Select the League game window first."); return; }
++    if (selected == CB_ERR) { SetWindowTextW(status_, L"Select a game window first."); return; }
+     HWND target = reinterpret_cast<HWND>(SendMessageW(targetCombo_, CB_GETITEMDATA, selected, 0));
+     if (!IsWindow(target)) { RefreshTargets(); SetWindowTextW(status_, L"That window closed. Select it again."); return; }
+-    fullscreen_ = SendDlgItemMessageW(control_, IDC_FULLSCREEN, BM_GETCHECK, 0, 0) == BST_CHECKED;
++    fullscreen_ = true; // UI removed; fullscreen output remains enabled.
+     LRESULT selectedMultiplier = SendDlgItemMessageW(control_, IDC_MULTIPLIER, CB_GETCURSEL, 0, 0);
+-    if (selectedMultiplier < 0 || selectedMultiplier > 5) {
+-        SetWindowTextW(status_, L"Choose Off or 2x-6x before starting."); return;
++    if (selectedMultiplier < 0 || selectedMultiplier > 6) {
++        SetWindowTextW(status_, L"Choose Off, 2x-6x, or Dynamic target before starting."); return;
++    }
++    dynamicTarget_ = selectedMultiplier==6;
++    multiplier_ = dynamicTarget_ ? 6u : static_cast<UINT>(selectedMultiplier)+1u;
++    BOOL validTarget=FALSE;
++    targetFps_=GetDlgItemInt(control_,IDC_DYNAMIC_TARGET,&validTarget,FALSE);
++    if(dynamicTarget_ && (!validTarget || targetFps_<30 || targetFps_>1000)) {
++        SetWindowTextW(status_,L"Dynamic target must be 30-1000 FPS.");return;
+     }
+-    // Off = 1x (real frames only); 2x through 6x produce 1-5 prediction frames.
+-    multiplier_ = static_cast<UINT>(selectedMultiplier) + 1u;
+-    lowLatency_ = SendDlgItemMessageW(control_,IDC_LOW_LATENCY,BM_GETCHECK,0,0)==BST_CHECKED;
++    BOOL validRadius=FALSE,validFeather=FALSE;
++    crosshairRadius_=GetDlgItemInt(control_,IDC_CROSSHAIR_RADIUS,&validRadius,FALSE);
++    crosshairFeather_=GetDlgItemInt(control_,IDC_CROSSHAIR_FEATHER,&validFeather,FALSE);
++    if(!validRadius||!validFeather||crosshairRadius_>256||crosshairFeather_>128) {
++        SetWindowTextW(status_,L"Crosshair radius must be 0-256 px and feather 0-128 px.");return;
++    }
++    lowLatency_ = true; // Max-latency-one and tearing remain enabled.
+     LRESULT selectedBackend = SendDlgItemMessageW(control_, IDC_CAPTURE_BACKEND, CB_GETCURSEL, 0, 0);
+     if (selectedBackend < 0 || selectedBackend > 1) {
+         SetWindowTextW(status_, L"Choose DXGI or Windows Graphics Capture before starting."); return;
+     }
+     useWgc_ = selectedBackend == 1;
+-    LRESULT selectedGrid = SendDlgItemMessageW(control_, IDC_NVOF_GRID, CB_GETCURSEL, 0, 0);
+-    if (selectedGrid < 0 || selectedGrid > 3) {
+-        SetWindowTextW(status_, L"Choose NVOFA 1x1, 2x2, 4x4 or 8x8 FAST before starting."); return;
+-    }
+-    static constexpr UINT kGridChoices[] = {1u,2u,4u,8u};
+-    nvofGrid_ = kGridChoices[selectedGrid];
+-    nvofCost_ = SendDlgItemMessageW(control_,IDC_NVOF_COST,BM_GETCHECK,0,0)==BST_CHECKED;
++    nvofGrid_ = 4; // Fixed NvOFA FAST 4x4.
++    nvofCost_ = false; // Lowest-workload mode; measure full latency separately.
+     LRESULT selectedResolution = SendDlgItemMessageW(control_, IDC_NVOF_RESOLUTION, CB_GETCURSEL, 0, 0);
+-    if (selectedResolution < 0 || selectedResolution > 4) {
+-        SetWindowTextW(status_, L"Choose an OFA processing resolution before starting."); return;
++    if (selectedResolution < 0 || selectedResolution > 2) {
++        SetWindowTextW(status_, L"Choose 100%, 50% or 10% NvOFA resolution."); return;
+     }
+-    static constexpr UINT kOFAWidths[]  = {0u,1600u,1280u,960u,640u};
+-    static constexpr UINT kOFAHeights[] = {0u, 900u, 720u,540u,360u};
+-    nvofWidth_ = kOFAWidths[selectedResolution];
+-    nvofHeight_ = kOFAHeights[selectedResolution];
+-    LRESULT selectedReflex = SendDlgItemMessageW(control_, IDC_REFLEX_TIMING, CB_GETCURSEL, 0, 0);
+-    if (selectedReflex < 0 || selectedReflex > 2) {
+-        SetWindowTextW(status_, L"Choose Reflex sleep timing before starting."); return;
+-    }
+-    reflexTiming_ = static_cast<UINT>(selectedReflex);
++    static constexpr UINT kPercent[] = {100u,50u,10u};
++    ofaPercent_ = kPercent[selectedResolution];
++    reflexTiming_ = 1; // Streamline Reflex pre-capture with Boost enabled.
+ 
+     stop_ = false;
+     paused_ = false;
+     recreateSwapchain_ = false;
+     if (!CreatePresenter(target, fullscreen_)) {
+-        SetWindowTextW(status_, L"Could not create the DX12 output window. Restore League, press Refresh, and select it again.");
++        SetWindowTextW(status_, L"Could not create the DX12 output window. Restore the game, press Refresh, and select it again.");
+         return;
+     }
+     if (workerControlEvent_) { CloseHandle(workerControlEvent_); workerControlEvent_ = nullptr; }
+@@ -505,15 +522,14 @@ void App::Start() {
+         if (presenter_ && IsWindow(presenter_)) { DestroyWindow(presenter_); presenter_ = nullptr; }
+         return;
+     }
++    DWORD targetPid{};
++    GetWindowThreadProcessId(target,&targetPid);
++    targetProcess_=targetPid?OpenProcess(SYNCHRONIZE,FALSE,targetPid):nullptr;
+     running_ = true;
+-    EnableWindow(GetDlgItem(control_, IDC_START), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), FALSE);
+-    EnableWindow(GetDlgItem(control_, IDC_STOP), TRUE);
++    for(int id:{IDC_START,IDC_TARGET,IDC_REFRESH,IDC_MULTIPLIER,IDC_CAPTURE_BACKEND,
++                IDC_NVOF_RESOLUTION,IDC_DYNAMIC_TARGET,IDC_CROSSHAIR_RADIUS,IDC_CROSSHAIR_FEATHER})
++        EnableWindow(GetDlgItem(control_,id),FALSE);
++    EnableWindow(GetDlgItem(control_,IDC_STOP),TRUE);
+     worker_ = std::thread(&App::Worker, this, target, presenter_);
+ }
+ 
+@@ -527,9 +543,19 @@ void App::Stop() {
+     while(PeekMessageW(&pending,control_,WM_APP_STOPPED,WM_APP_STOPPED,PM_REMOVE)) {}
+     if (presenter_ && IsWindow(presenter_)) { DestroyWindow(presenter_); presenter_ = nullptr; }
+     target_ = nullptr;
++    if(targetProcess_) { CloseHandle(targetProcess_);targetProcess_=nullptr; }
+     running_ = false;
+ }
+ 
++void App::UpdateIdleControls() {
++    for(int id:{IDC_START,IDC_TARGET,IDC_REFRESH,IDC_MULTIPLIER,IDC_CAPTURE_BACKEND,
++                IDC_NVOF_RESOLUTION,IDC_CROSSHAIR_RADIUS,IDC_CROSSHAIR_FEATHER})
++        EnableWindow(GetDlgItem(control_,id),TRUE);
++    EnableWindow(GetDlgItem(control_,IDC_DYNAMIC_TARGET),
++        SendDlgItemMessageW(control_,IDC_MULTIPLIER,CB_GETCURSEL,0,0)==6);
++    EnableWindow(GetDlgItem(control_,IDC_STOP),FALSE);
++}
++
+ bool App::CreatePresenter(HWND target, bool fullscreen) {
+     target_ = target;
+     RECT source{};
+@@ -704,7 +730,7 @@ bool App::CreatePipeline(Dx12State& d) {
+     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     params[1].Constants.ShaderRegister = 0;
+     params[1].Constants.RegisterSpace = 0;
+-    params[1].Constants.Num32BitValues = 3;
++    params[1].Constants.Num32BitValues = 5;
+     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     D3D12_STATIC_SAMPLER_DESC sampler{};
+     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+@@ -726,7 +752,7 @@ bool App::CreatePipeline(Dx12State& d) {
+ 
+     static const char shader[] =
+         "Texture2D src : register(t0); Texture2D<float2> flow : register(t1); SamplerState samp : register(s0);"
+-        "cbuffer Predict : register(b0) { float fraction; float sourceW; float sourceH; };"
++        "cbuffer Predict : register(b0) { float fraction; float sourceW; float sourceH; float protectRadius; float protectFeather; };"
+         "struct V { float4 p:SV_Position; float2 uv:TEXCOORD0; };"
+         "V VS(uint id:SV_VertexID) { V o;"
+         "float2 p=float2((id==2)?3.0:-1.0,(id==1)?3.0:-1.0);"
+@@ -735,7 +761,10 @@ bool App::CreatePipeline(Dx12State& d) {
+         "[branch] if(fraction<=0.0) return src.Sample(samp,i.uv);"
+         "float2 v=flow.SampleLevel(samp,i.uv,0);"
+         "v=clamp(v,float2(-128,-128),float2(128,128));"
+-        "float2 uv=saturate(i.uv+v*(fraction/float2(sourceW,sourceH)));"
++        "float2 p=(i.uv-float2(0.5,0.5))*float2(sourceW,sourceH);"
++        "float d=length(p);"
++        "float protect=protectFeather<=0.01 ? step(protectRadius,d) : smoothstep(protectRadius,protectRadius+protectFeather,d);"
++        "float2 uv=saturate(i.uv+v*(fraction*protect/float2(sourceW,sourceH)));"
+         "return src.Sample(samp,uv); }";
+     ComPtr<ID3DBlob> vs, ps;
+     hr = D3DCompile(shader, sizeof(shader)-1, nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &errors);
+@@ -1205,8 +1234,8 @@ bool App::RenderFrame(CaptureState& c, Dx12State& d, UINT sourceSlot, UINT64 cop
+     auto colorTable = d.srvHeap->GetGPUDescriptorHandleForHeapStart();
+     colorTable.ptr += SIZE_T(allocatorIndex*2u) * d.srvStride;
+     d.list->SetGraphicsRootDescriptorTable(0, colorTable);
+-    float params[]={0.0f,float(d.sourceWidth),float(d.sourceHeight)};
+-    d.list->SetGraphicsRoot32BitConstants(1, 3, params, 0);
++    float params[]={0.0f,float(d.sourceWidth),float(d.sourceHeight),float(crosshairRadius_),float(crosshairFeather_)};
++    d.list->SetGraphicsRoot32BitConstants(1, 5, params, 0);
+     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     if(profileThisFrame) d.list->EndQuery(d.gpuQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
+ 
+@@ -1343,8 +1372,8 @@ bool App::PresentPrediction(Dx12State& d, UINT sourceSlot, float fraction) {
+     auto table=d.srvHeap->GetGPUDescriptorHandleForHeapStart();
+     table.ptr+=SIZE_T(allocatorIndex*2u)*d.srvStride;
+     d.list->SetGraphicsRootDescriptorTable(0,table);
+-    float params[]={fraction,float(d.sourceWidth),float(d.sourceHeight)};
+-    d.list->SetGraphicsRoot32BitConstants(1,3,params,0);
++    float params[]={fraction,float(d.sourceWidth),float(d.sourceHeight),float(crosshairRadius_),float(crosshairFeather_)};
++    d.list->SetGraphicsRoot32BitConstants(1,5,params,0);
+     d.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     d.list->DrawInstanced(3,1,0,0);
+     Transition(d.list.Get(),motion,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+@@ -1470,6 +1499,10 @@ void App::Worker(HWND target, HWND outputWindow) {
+         }
+         uint32_t width=0,height=0;
+         if(!InitCapture(target,c,width,height,useWgc_)) throw std::runtime_error("Capture initialization failed. See earlier log entry.");
++        // NvOFA resolution is a fraction of the actual captured source (including 4:3).
++        // Keep dimensions even to satisfy encoder/scaler and NvOF surface alignment.
++        nvofWidth_=ofaPercent_==100?0:std::max(16u,((width*ofaPercent_/100u)+1u)&~1u);
++        nvofHeight_=ofaPercent_==100?0:std::max(16u,((height*ofaPercent_/100u)+1u)&~1u);
+         if(!InitDx12(outputWindow,c,width,height,lowLatency_,d)) throw std::runtime_error("DX12 initialization failed. See log.");
+         RECT output{};GetClientRect(outputWindow,&output);
+         gDLSS.Init(d.device.Get(),c.adapter.Get(),d.sharedTextures[0].Get(),d.sharedTextures[1].Get(),d.sharedTextures[2].Get(),
+@@ -2016,9 +2049,13 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     if(c.mailboxes[i].state.load(std::memory_order_acquire)==CaptureState::kReady) return true;
+                 return false;
+             };
+-            for(UINT fake=1;fake<multiplier_ && !stop_&&!paused_;++fake) {
++            const UINT maxPredictions=dynamicTarget_?5u:(multiplier_>1u?multiplier_-1u:0u);
++            for(UINT fake=1;fake<=maxPredictions && !stop_&&!paused_;++fake) {
++                const double predictionMs=dynamicTarget_ ? 1000.0*double(fake)/double(targetFps_)
++                                                         : realIntervalMs*double(fake)/double(multiplier_);
++                if(dynamicTarget_ && predictionMs >= realIntervalMs) break;
+                 auto due=startPredictions+std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+-                    std::chrono::duration<double,std::milli>(realIntervalMs*double(fake)/double(multiplier_)));
++                    std::chrono::duration<double,std::milli>(predictionMs));
+                 if(hasNewCapture()) break;
+                 auto waitMs=std::chrono::duration_cast<std::chrono::milliseconds>(due-std::chrono::steady_clock::now()).count();
+                 if(waitMs>0) WaitForSingleObject(mailboxEvent,DWORD(std::min<int64_t>(waitMs,50)));
+@@ -2032,7 +2069,8 @@ void App::Worker(HWND target, HWND outputWindow) {
+                     WaitForSingleObject(d.frameLatencyWaitable,10);
+                 }
+                 if(hasNewCapture()) break;
+-                if(!PresentPrediction(d,UINT(sourceSlot),float(fake)/float(multiplier_)))
++                const float predictionFraction=float(predictionMs/realIntervalMs);
++                if(!PresentPrediction(d,UINT(sourceSlot),predictionFraction))
+                     throw std::runtime_error("Extrapolated present failed.");
+             }
+ 
+@@ -2198,16 +2236,24 @@ LRESULT App::OnControlMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+         switch (LOWORD(wp)) {
+         case IDC_REFRESH: RefreshTargets(); return 0;
+         case IDC_START: Start(); return 0;
+-        case IDC_STOP: Stop(); EnableWindow(GetDlgItem(control_, IDC_START), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), TRUE);
+-            EnableWindow(GetDlgItem(control_, IDC_STOP), FALSE); return 0;
++        case IDC_STOP:
++            Stop();UpdateIdleControls();
++            SetWindowTextW(status_, L"Stopped - app remains open. Choose a game and press Start.");
++            return 0;
++        case IDC_MULTIPLIER:
++            if(HIWORD(wp)==CBN_SELCHANGE && !running_)
++                EnableWindow(GetDlgItem(control_,IDC_DYNAMIC_TARGET),
++                    SendDlgItemMessageW(control_,IDC_MULTIPLIER,CB_GETCURSEL,0,0)==6);
++            return 0;
+         }
+         break;
++    case WM_TIMER:
++        if(wp==1 && running_ &&
++           (!IsWindow(target_) || (targetProcess_ && WaitForSingleObject(targetProcess_,0)==WAIT_OBJECT_0))) {
++            Stop();UpdateIdleControls();RefreshTargets();
++            SetWindowTextW(status_,L"Game closed - capture stopped; app remains open.");
++        }
++        return 0;
+     case WM_HOTKEY:
+         if (wp == 1 && running_) ToggleFullscreen();
+         if (wp == 2 && running_) { paused_ = !paused_; if(workerControlEvent_) SetEvent(workerControlEvent_); }
+@@ -2217,19 +2263,18 @@ LRESULT App::OnControlMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+         auto* text = reinterpret_cast<std::wstring*>(lp);
+         SetWindowTextW(status_, text->c_str()); delete text; return 0;
+     }
+-    case WM_APP_STOPPED:
+-        Stop();
+-        EnableWindow(GetDlgItem(control_, IDC_MULTIPLIER), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_CAPTURE_BACKEND), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_NVOF_GRID), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_NVOF_RESOLUTION), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_NVOF_COST), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_REFLEX_TIMING), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_START), TRUE);
+-        EnableWindow(GetDlgItem(control_, IDC_STOP), FALSE);
++    case WM_APP_STOPPED: {
++        const bool gameGone=target_ && (!IsWindow(target_) ||
++            (targetProcess_ && WaitForSingleObject(targetProcess_,0)==WAIT_OBJECT_0));
++        Stop();UpdateIdleControls();
++        if(gameGone) RefreshTargets();
++        SetWindowTextW(status_,gameGone ? L"Game closed - capture stopped; app remains open."
++                                       : L"Capture stopped - app remains open.");
+         return 0;
++    }
+     case WM_CLOSE: Stop(); DestroyWindow(hwnd); return 0;
+     case WM_DESTROY:
++        KillTimer(hwnd,1);
+         UnregisterHotKey(hwnd, 1); UnregisterHotKey(hwnd, 2); UnregisterHotKey(hwnd, 3);
+         PostQuitMessage(0); return 0;
+     }
