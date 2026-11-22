@@ -155,6 +155,22 @@ $bytecode = '#pragma once' + $nl + 'static const unsigned char resampleCode[]={'
   $nl + 'static const unsigned char motionCode[]={' + $m + '};' + $nl
 [IO.File]::WriteAllText('source/compute_bytecode.h',$bytecode,$utf8)
 
+
+# Static-check the runtime-compiled V15 prediction vertex and pixel shaders too.
+$predictCpp=Get-Content 'source/main.cpp' -Raw
+$predictBegin='static const char shader[] = R"HLSL('
+$predictEnd=')HLSL";'
+$a=$predictCpp.IndexOf($predictBegin)
+if($a -lt 0){throw 'V15 prediction HLSL source missing'}
+$a+=$predictBegin.Length
+$b=$predictCpp.IndexOf($predictEnd,$a)
+if($b -le $a){throw 'V15 prediction HLSL end marker missing'}
+[IO.File]::WriteAllText('source/v15_prediction.hlsl',$predictCpp.Substring($a,$b-$a),$utf8)
+& $dxc.FullName /nologo /T vs_6_0 /E VS /O3 /Fo source/v15-prediction-vs.cso source/v15_prediction.hlsl
+if($LASTEXITCODE -ne 0){throw 'V15 extrapolation vertex shader failed static validation'}
+& $dxc.FullName /nologo /T ps_6_0 /E PS /O3 /Fo source/v15-prediction-ps.cso source/v15_prediction.hlsl
+if($LASTEXITCODE -ne 0){throw 'V15 extrapolation pixel shader failed static validation'}
+
 Write-Host 'Compiling with MSVC x64...'
 $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found' }
