@@ -50,6 +50,7 @@ $v35 = (Get-ChildItem 'v35patch/part_*.patch' | Sort-Object Name | ForEach-Objec
 Apply-Patch 'v35-current.patch' 'V35'
 Apply-Patch 'extrap-v35.patch' 'Custom extrapolation'
 Apply-Patch 'ui-v35.patch' 'Simplified UI with crosshair radius and feather'
+Apply-Patch 'premium-v35.patch' 'Premium GDI+ interface and persistent application window'
 
 $main = Get-Content 'source/main.cpp' -Raw
 $bridge = Get-Content 'source/dlss_bridge.cpp' -Raw
@@ -63,6 +64,11 @@ if ($main -notmatch 'IDC_CROSSHAIR_RADIUS' -or $main -notmatch 'IDC_CROSSHAIR_FE
     $main -notmatch 'dynamicTarget_' -or $main -notmatch 'protectFeather') {
   throw 'Simplified UI or DX12 crosshair protection patch missing'
 }
+if ($main -notmatch 'DrawPremiumUI' -or $main -notmatch 'RequestStop' -or
+    $main -match 'gDLSS.EndRuntime\(\)' -or $main -notmatch 'PremiumHit') {
+  throw 'Premium UI or non-closing capture Stop lifecycle is missing'
+}
+if (-not (Test-Path 'source/premium_ui.h')) { throw 'Premium themed controls header missing' }
 if ($main -notmatch 'SetMaximumFrameLatency\(1\)') {
   throw 'V35 low-latency swapchain setting is missing'
 }
@@ -154,8 +160,8 @@ $validation = @(
   'Build verification: MSVC compiler returned success; no end-to-end GPU/game runtime test performed.'
 )
 [IO.File]::WriteAllLines('artifacts\payload\BUILD-VALIDATION.txt',$validation)
-Compress-Archive -Path 'artifacts\payload\*' -DestinationPath 'artifacts\FG-V35-Extrapolation-Reflex-Windows-x64.zip' -Force
-if (-not (Test-Path 'artifacts\FG-V35-Extrapolation-Reflex-Windows-x64.zip')) {
+Compress-Archive -Path 'artifacts\payload\*' -DestinationPath 'artifacts\FG-V35-Premium-UI-Fixed-Windows-x64.zip' -Force
+if (-not (Test-Path 'artifacts\FG-V35-Premium-UI-Fixed-Windows-x64.zip')) {
   throw 'AppVeyor ZIP artifact was not produced'
 }
 Write-Host 'Build and packaging succeeded.'
