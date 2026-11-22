@@ -25,7 +25,7 @@ build_script:
       if($ec -ne 0){throw "NVFBC diagnostic compilation failed (exit $ec)"}
       if(!(Test-Path bin/NvFBC-Enable-Test.exe)){throw 'EXE missing'}
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path bin/NvFBC-Enable-Test.exe,README-NVFBC-Diagnostic.md -DestinationPath artifacts/NvFBC-Enable-API-Test-Windows-x64.zip -Force
+      Compress-Archive -Path bin/NvFBC-Enable-Test.exe,README-NVFBC-Enable-Test.md -DestinationPath artifacts/NvFBC-Enable-API-Test-Windows-x64.zip -Force
 artifacts:
   - path: artifacts/NvFBC-Enable-API-Test-Windows-x64.zip
     name: NvFBC-Enable-API-Test-Windows-x64
