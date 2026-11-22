@@ -1,0 +1,35 @@
+name: Build V35 Premium + Full V15 Extrapolation + Stop Fix
+
+on:
+  push:
+    branches:
+      - v35-v15-full-extrap-stop-ui-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct V35 and compile V15 full predictor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath build-v15full.log
+          if($LASTEXITCODE -ne 0){throw "Windows x64 build failed ($LASTEXITCODE)"}
+          if(-not(Test-Path 'artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip')){throw 'No packaged EXE ZIP'}
+
+      - name: Publish EXE and diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V35-V15Full-StopSafe-Windows-x64
+          path: |
+            artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip
+            build-v15full.log
+          if-no-files-found: warn
