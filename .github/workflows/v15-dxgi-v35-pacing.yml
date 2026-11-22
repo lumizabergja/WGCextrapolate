@@ -1,0 +1,56 @@
+name: V15 DXGI V35 Pacing Windows x64
+on:
+  push:
+    branches:
+      - v15-dxgi-v35-pacing-20261122
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Reconstruct exact patched source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python --version
+          python prepare_v15_pacing.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source reconstruction failed' }
+
+      - name: Compile V15 DXGI x64 with MSVC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if (!$vs) { throw 'MSVC x64 build tools unavailable' }
+          $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd > build.log 2>&1')
+          $result = $LASTEXITCODE
+          if (Test-Path build.log) { Get-Content build.log }
+          if ($result -ne 0) { throw "MSVC build failed ($result)" }
+          if (!(Test-Path 'bin/FG.exe')) { throw 'Expected FG.exe was not produced' }
+
+      - name: Package ready-to-run application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-V15-DXGI-V35-Pacing-Windows-x64.zip' -Force
+          if (!(Test-Path 'artifacts/FG-V15-DXGI-V35-Pacing-Windows-x64.zip')) { throw 'Artifact not produced' }
+
+      - name: Upload ready-to-run ZIP and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V15-DXGI-V35-Pacing-Windows-x64
+          path: |
+            artifacts/*.zip
+            build.log
+          if-no-files-found: warn
