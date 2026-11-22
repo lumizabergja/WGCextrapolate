@@ -3,11 +3,11 @@ from pathlib import Path
 p = Path("ci/build-appveyor.ps1")
 s = p.read_text(encoding="utf-8-sig")
 
-marker = "Apply-Patch 'premium-v35.patch' 'Premium GDI+ interface and persistent application window'"
+marker = "Apply-Patch 'ui-v35.patch' 'Simplified UI with crosshair radius and feather'"
 assert s.count(marker) == 1, "Unexpected V35 CI script layout"
 insert = r"""
 # V36 adaptation: apply the exact user's V35 -> V36 source delta
-# after the existing V35 reconstruction/upgrade completes.
+# immediately after the exact V35 simplified-UI reconstruction completes.
 Write-Host 'Applying adaptive four-real-frame prediction and persistent Stop fix...'
 [IO.File]::WriteAllBytes('v36-upgrade.patch.xz',
   [Convert]::FromBase64String((Get-Content 'v36/upgrade.patch.xz.b64' -Raw).Trim()))
@@ -29,21 +29,12 @@ $shader = Get-Content 'source/adaptive_prediction_shader.h' -Raw
 if ($shader -notmatch 'validFlowCount >= 3.0') { throw 'Four-frame shader missing' }
 """
 s=s.replace(marker,marker+"\n"+insert,1)
-# The user-provided V35 source is the stage just after the premium UI. The
-# GitHub V15 crosshair + v15full upgrades are later, mutually incompatible
-# rewrites. DO NOT apply those over the user's V36 main.cpp.
-begin = s.index("# Apply the V15 Clean V16 center-mask")
+# The user-provided V35 source has SIMPLIFIED UI. Do not apply the later
+# premium UI, crosshair or V15full patches: those would replace user's code.
+begin = s.index("Apply-Patch 'premium-v35.patch'")
 end = s.index("Write-Host 'Retrieving pinned NVIDIA SDK dependencies...'")
 assert begin < end
 s = s[:begin] + s[end:]
-# The premium header needs the same Windows SDK compatibility include.
-anchor = "Write-Host 'Retrieving pinned NVIDIA SDK dependencies...'"
-fix = """$premiumHeader = Get-Content 'source/premium_ui.h' -Raw
-$premiumHeader = $premiumHeader.Replace('#include <gdiplus.h>', '#include <objidl.h>' + [string][char]10 + '#include <gdiplus.h>')
-[IO.File]::WriteAllText('source/premium_ui.h', $premiumHeader, [Text.UTF8Encoding]::new($false))
-"""
-s=s.replace(anchor,fix+"\n"+anchor,1)
-
 # V36 HLSL moved from main.cpp into the dedicated source header.
 old="$predictCpp=Get-Content 'source/main.cpp' -Raw"
 new="$predictCpp=Get-Content 'source/adaptive_prediction_shader.h' -Raw"
