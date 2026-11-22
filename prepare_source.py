@@ -537,20 +537,3 @@ if cleanup_hash != expected_cleanup_hash:
     raise RuntimeError(f'FG v16 clean source mismatch: {cleanup_hash}')
 print('Verified FG v16 cleanup:', cleanup_hash)
 
-# Additional isolated NvFBC community compatibility experiment.
-import zlib
-original = out.read_bytes()
-base_sha = "24b2fa5bec64694cf047451a17da84cee6e4ec0ee91c87942d0d6e39601b83ae"
-target_sha = "fb445337af61c569883a67b83fa27587387745425c02775bd1165476edbeecee"
-if hashlib.sha256(original).hexdigest() != base_sha:
-    raise RuntimeError("Refusing NvFBC community patch on non-V15-v16 source")
-ops = json.loads(zlib.decompress(base64.b64decode((root / "community_delta.b64").read_text(encoding="ascii"))))
-lines = original.decode("utf-8").splitlines(keepends=True)
-for i, j, replacement in sorted(ops, key=lambda v: v[0], reverse=True):
-    lines[i:j] = [replacement] if replacement else []
-patched = "".join(lines).encode("utf-8")
-h = hashlib.sha256(patched).hexdigest()
-if h != target_sha:
-    raise RuntimeError(f"NvFBC community source failed SHA256 validation: {h}")
-out.write_bytes(patched)
-print("V15 community NvFBC source verified:", h)
