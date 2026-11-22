@@ -1,0 +1,38 @@
+name: V35 Premium V15 Crosshair Native OFA Stop Fix x64
+
+on:
+  push:
+    branches:
+      - v35-v15-crosshair-native-stop-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Checkout WGCextrapolate
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and compile premium V35 with V15 center protection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath v35-v15-crosshair-build.log
+          if ($LASTEXITCODE -ne 0) { throw "MSVC build failed ($LASTEXITCODE)" }
+          if (-not (Test-Path 'artifacts/FG-V35-Premium-UI-Fixed-Windows-x64.zip')) {
+            throw 'Expected ready-to-run ZIP not found'
+          }
+
+      - name: Upload build and diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V35-Premium-V15-Crosshair-NativeOnly-StopFix
+          path: |
+            artifacts/FG-V35-Premium-UI-Fixed-Windows-x64.zip
+            v35-v15-crosshair-build.log
+          if-no-files-found: warn
