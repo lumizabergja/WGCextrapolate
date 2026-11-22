@@ -22,7 +22,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath build-v15full.log
           if($LASTEXITCODE -ne 0){throw "Windows x64 build failed ($LASTEXITCODE)"}
-          if(-not(Test-Path 'artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip')){throw 'No packaged EXE ZIP'}
+          if(-not(Test-Path 'artifacts/FG-V35-V15Full-StopSafe-Windows-x64.zip')){throw 'No packaged EXE ZIP'}
 
       - name: Publish EXE and diagnostic log
         if: always()
@@ -30,6 +30,6 @@ jobs:
         with:
           name: FG-V35-V15Full-StopSafe-Windows-x64
           path: |
-            artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip
+            artifacts/FG-V35-V15Full-StopSafe-Windows-x64.zip
             build-v15full.log
           if-no-files-found: warn
