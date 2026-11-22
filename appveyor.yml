@@ -5,7 +5,7 @@ configuration: Release
 clone_depth: 1
 branches:
   only:
-    - v15-nvfbc-driver-probe-20261122
+    - v15-nvfbc-enable-api-test-20261122
 install:
   - ps: |
       $ErrorActionPreference='Stop'
@@ -19,16 +19,16 @@ build_script:
       $vs=(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
       if(!$vs){throw 'MSVC x64 unavailable'}
       $vcvars=Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
-      & cmd.exe /d /s /c ('call "' + $vcvars + '" && if not exist bin mkdir bin && cl /nologo /std:c++20 /utf-8 /O2 /MT /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /I "vendor\headers" src\NvFBC-Diag.cpp /Fe:bin\NVFBC-Diagnostic.exe /link /SUBSYSTEM:CONSOLE advapi32.lib > build.log 2>&1')
+      & cmd.exe /d /s /c ('call "' + $vcvars + '" && if not exist bin mkdir bin && cl /nologo /std:c++20 /utf-8 /O2 /MT /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /I "vendor\headers" src\NvFBC-Enable.cpp /Fe:bin\NvFBC-Enable-Test.exe /link /SUBSYSTEM:CONSOLE advapi32.lib > build.log 2>&1')
       $ec=$LASTEXITCODE
       if(Test-Path build.log){Get-Content build.log}
       if($ec -ne 0){throw "NVFBC diagnostic compilation failed (exit $ec)"}
-      if(!(Test-Path bin/NVFBC-Diagnostic.exe)){throw 'EXE missing'}
+      if(!(Test-Path bin/NvFBC-Enable-Test.exe)){throw 'EXE missing'}
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path bin/NVFBC-Diagnostic.exe,README-NVFBC-Diagnostic.md -DestinationPath artifacts/NVFBC-Driver-Diagnostic-Windows-x64.zip -Force
+      Compress-Archive -Path bin/NvFBC-Enable-Test.exe,README-NVFBC-Diagnostic.md -DestinationPath artifacts/NvFBC-Enable-API-Test-Windows-x64.zip -Force
 artifacts:
-  - path: artifacts/NVFBC-Driver-Diagnostic-Windows-x64.zip
-    name: NVFBC-Driver-Diagnostic-Windows-x64
+  - path: artifacts/NvFBC-Enable-API-Test-Windows-x64.zip
+    name: NvFBC-Enable-API-Test-Windows-x64
   - path: build.log
     name: MSVC-build-log
 test: off
