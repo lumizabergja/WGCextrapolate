@@ -5,16 +5,18 @@ configuration: Release
 clone_depth: 1
 branches:
   only:
-    - v15-nvfbc-community
+    - v15clean-v16-wda-build-20261122
 install:
   - ps: |
       $ErrorActionPreference='Stop'
       python -m pip install --disable-pip-version-check brotli==1.1.0
-      if($LASTEXITCODE -ne 0){throw 'Brotli for original V15 source reconstruction failed'}
+      if($LASTEXITCODE -ne 0){throw 'Brotli install failed'}
       python prepare_source.py
-      if($LASTEXITCODE -ne 0){throw 'Verified V15 source reconstruction failed'}
-      powershell -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
-      if($LASTEXITCODE -ne 0){throw 'NvFBC community header download failed'}
+      if($LASTEXITCODE -ne 0){throw 'V15 source reconstruction failed'}
+      python patch_wda.py
+      if($LASTEXITCODE -ne 0){throw 'WDA fix verification failed'}
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
+      if($LASTEXITCODE -ne 0){throw 'Windows NVIDIA SDK header download failed'}
 build_script:
   - ps: |
       $ErrorActionPreference='Stop'
@@ -28,10 +30,10 @@ build_script:
       if($ec -ne 0){throw "C++ compilation failed (exit $ec)"}
       if(!(Test-Path 'bin/FG.exe')){throw 'Executable missing'}
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path bin/FG.exe,README.md -DestinationPath artifacts/FG-V15-Community-NvFBC-Windows-x64.zip -Force
+      Compress-Archive -Path bin/FG.exe,README.md -DestinationPath artifacts/FG-V15-Clean-v16-WDA-Fix-Windows-x64.zip -Force
 artifacts:
-  - path: artifacts/FG-V15-Community-NvFBC-Windows-x64.zip
-    name: FG-V15-Community-NvFBC-Windows-x64
+  - path: artifacts/FG-V15-Clean-v16-WDA-Fix-Windows-x64.zip
+    name: FG-V15-Clean-v16-WDA-Fix-Windows-x64
   - path: build.log
     name: MSVC-build-log
 test: off
