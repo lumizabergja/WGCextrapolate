@@ -49,6 +49,7 @@ $v35 = (Get-ChildItem 'v35patch/part_*.patch' | Sort-Object Name | ForEach-Objec
 [IO.File]::WriteAllText('v35-current.patch',(Normalize-Patch $v35),$utf8)
 Apply-Patch 'v35-current.patch' 'V35'
 Apply-Patch 'extrap-v35.patch' 'Custom extrapolation'
+Apply-Patch 'ui-v35.patch' 'Simplified UI with crosshair radius and feather'
 
 $main = Get-Content 'source/main.cpp' -Raw
 $bridge = Get-Content 'source/dlss_bridge.cpp' -Raw
@@ -57,6 +58,10 @@ if ($bridge -match 'kFeatureDLSS_G' -or $bridge -match 'slDLSSGSetOptions') {
 }
 if ($bridge -notmatch 'kFeatureReflex' -or $main -notmatch 'Extrap') {
   throw 'Reflex or extrapolation code was not found in the patched source'
+}
+if ($main -notmatch 'IDC_CROSSHAIR_RADIUS' -or $main -notmatch 'IDC_CROSSHAIR_FEATHER' -or
+    $main -notmatch 'dynamicTarget_' -or $main -notmatch 'protectFeather') {
+  throw 'Simplified UI or DX12 crosshair protection patch missing'
 }
 if ($main -notmatch 'SetMaximumFrameLatency\(1\)') {
   throw 'V35 low-latency swapchain setting is missing'
@@ -140,7 +145,9 @@ foreach ($name in @('sl.interposer.dll','sl.common.dll','sl.pcl.dll','sl.reflex.
 }
 $sha = (Get-FileHash 'FG-Extrap-V35.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
 $validation = @(
-  'V35 DXGI/WGC -> NvOFA -> custom extrapolation (Off-6x) -> DX12',
+  'V35 DXGI/WGC -> NvOFA -> custom extrapolation (Off-6x and Dynamic) -> DX12',
+  'UI: game selector + Refresh / capture / extrapolation / dynamic target / OFA percentage / radius / feather',
+  'Stop and game process exit: keep app open',
   'Streamline Reflex + PCL ONLY; no DLSS-G plugin shipped',
   "Git commit: $env:APPVEYOR_REPO_COMMIT",
   "Executable SHA256: $sha",
