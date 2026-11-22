@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) { throw 'V36 patch does not match reconstructed V35 sou
 if ($LASTEXITCODE -ne 0) { throw 'V36 patch application failed' }
 Copy-Item 'v36/adaptive_prediction_shader.h' 'source/adaptive_prediction_shader.h' -Force
 $four = Get-Content 'source/main.cpp' -Raw
-if ($four -notmatch 'kTemporalFlowSlots = 3' -or $four -notmatch 'RequestStop\\(bool gameClosed\\)' -or
+if ($four -notmatch 'kTemporalFlowSlots = 3' -or $four -notmatch 'RequestStop\(bool gameClosed\)' -or
     $four -notmatch 'kAdaptivePredictionHlsl') { throw 'V36 predictor / Stop change was not applied' }
 $shader = Get-Content 'source/adaptive_prediction_shader.h' -Raw
 if ($shader -notmatch 'validFlowCount >= 3.0') { throw 'Four-frame shader missing' }
