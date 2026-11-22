@@ -13,10 +13,14 @@ Write-Host 'Applying adaptive four-real-frame prediction and persistent Stop fix
   [Convert]::FromBase64String((Get-Content 'v36/upgrade.patch.xz.b64' -Raw).Trim()))
 & python -c "import pathlib,lzma; pathlib.Path('v36-upgrade.patch').write_bytes(lzma.decompress(pathlib.Path('v36-upgrade.patch.xz').read_bytes()))"
 if ($LASTEXITCODE -ne 0) { throw 'V36 source patch decompression failed' }
-& git apply --check 'v36-upgrade.patch'
-if ($LASTEXITCODE -ne 0) { throw 'V36 patch does not match reconstructed V35 source: stop rather than compile wrong app' }
-& git apply 'v36-upgrade.patch'
-if ($LASTEXITCODE -ne 0) { throw 'V36 patch application failed' }
+& git apply --reject --whitespace=nowarn 'v36-upgrade.patch'
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Showing rejected V36 hunks for precise baseline reconciliation:'
+    if (Test-Path 'source/main.cpp.rej') {
+        Get-Content 'source/main.cpp.rej' | Select-Object -First 480 | ForEach-Object { Write-Host $_ }
+    }
+    throw 'V36 source integration has unmatched hunks; NOT producing an invalid build'
+}
 Copy-Item 'v36/adaptive_prediction_shader.h' 'source/adaptive_prediction_shader.h' -Force
 $four = Get-Content 'source/main.cpp' -Raw
 if ($four -notmatch 'kTemporalFlowSlots = 3' -or $four -notmatch 'RequestStop\(bool gameClosed\)' -or
