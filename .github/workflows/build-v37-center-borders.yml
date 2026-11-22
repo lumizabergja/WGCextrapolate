@@ -1,0 +1,52 @@
+name: Build V37 from V35 with Hard Center and Protected Borders
+
+on:
+  push:
+    branches:
+      - v37-v35-stable-center-border-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare V37 Windows build
+        shell: pwsh
+        run: |
+          python ci/prepare-v37.py
+          if($LASTEXITCODE -ne 0){throw 'V37 CI preparation failed'}
+
+      - name: Reconstruct original V35, add guards, compile V37 for x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath v37-build.log
+          if($LASTEXITCODE -ne 0){throw "V37 compilation failed ($LASTEXITCODE)"}
+          if(-not(Test-Path 'artifacts/FG-V37-V35-StableCenterBorders-Windows-x64.zip')){
+            throw 'V37 executable ZIP was not created'
+          }
+
+      - name: Check packaged compiled EXE
+        if: success()
+        shell: pwsh
+        run: |
+          Get-Item 'FG-Extrap-V37.exe' | Format-List Name,Length
+          Get-FileHash 'FG-Extrap-V37.exe' -Algorithm SHA256 | Format-List
+          python -c "import zipfile; p='artifacts/FG-V37-V35-StableCenterBorders-Windows-x64.zip'; z=zipfile.ZipFile(p); assert 'FG-Extrap-V37.exe' in z.namelist(); print('V37 executable verified')"
+          if($LASTEXITCODE -ne 0){throw 'V37 ZIP check failed'}
+
+      - name: Publish ready-to-run ZIP and diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V37-V35-StableCenterBorders-Windows-x64
+          path: |
+            artifacts/FG-V37-V35-StableCenterBorders-Windows-x64.zip
+            v37-build.log
+          if-no-files-found: warn
