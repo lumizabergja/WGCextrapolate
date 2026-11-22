@@ -1,0 +1,42 @@
+name: Build V35 Premium UI and Stop Fix (Windows x64)
+
+on:
+  push:
+    branches: [v35-premium-ui-stop-fix]
+    paths:
+      - '.github/workflows/build-v35-premium.yml'
+      - 'ci/**'
+      - 'premium-v35.patch'
+      - 'ui-v35.patch'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout working V35 extrapolation branch
+        uses: actions/checkout@v4
+
+      - name: Build DXGI WGC premium control panel with MSVC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath premium-build.log
+          if ($LASTEXITCODE -ne 0) { throw "Premium build failed ($LASTEXITCODE)" }
+          if (-not (Test-Path 'artifacts/FG-V35-Premium-UI-Fixed-Windows-x64.zip')) {
+            throw 'No Windows executable ZIP produced'
+          }
+
+      - name: Upload ready-to-run ZIP and full diagnostic log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FG-V35-Premium-UI-Fixed-Windows-x64
+          path: |
+            artifacts/FG-V35-Premium-UI-Fixed-Windows-x64.zip
+            premium-build.log
+          if-no-files-found: warn
