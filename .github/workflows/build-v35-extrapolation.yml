@@ -1,0 +1,52 @@
+name: Build V35 DXGI-WGC Extrapolation + Reflex (Windows x64)
+
+on:
+  push:
+    branches:
+      - v35-dxgi-wgc-extrapolation-reflex
+    paths:
+      - '.github/workflows/build-v35-extrapolation.yml'
+      - 'ci/**'
+      - 'v26build/**'
+      - 'v27patch/**'
+      - 'v28patch/**'
+      - 'v29patch/**'
+      - 'v30patch/**'
+      - 'v31patch/**'
+      - 'v32patch/**'
+      - 'v33patch/**'
+      - 'v34patch/**'
+      - 'v35patch/**'
+      - 'extrap-v35.patch'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout WGCextrapolate V35 branch
+        uses: actions/checkout@v4
+
+      - name: Compile V35 extrapolation with MSVC 2022
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci/build-appveyor.ps1 *>&1 | Tee-Object -FilePath v35-build.log
+          if ($LASTEXITCODE -ne 0) { throw "MSVC build script failed ($LASTEXITCODE)" }
+          if (-not (Test-Path 'artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip')) {
+            throw 'No Windows ZIP was produced'
+          }
+
+      - name: Upload executable and diagnostic build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V35-Extrapolation-Reflex-Windows-x64
+          path: |
+            artifacts/FG-V35-Extrapolation-Reflex-Windows-x64.zip
+            v35-build.log
+          if-no-files-found: warn
