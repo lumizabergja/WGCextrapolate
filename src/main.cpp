@@ -55,7 +55,7 @@ std::atomic<bool> g_engineFinished{true};
 std::atomic<bool> g_lastGameExited{false};
 constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
-std::atomic<int> g_fgMode{2};
+std::atomic<int> g_fgMode{0};
 std::atomic<int> g_targetHz{320};
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
@@ -158,6 +158,7 @@ struct DxDevices {
     ComPtr<IDXGISwapChain2> lowLatencySwap;
     HANDLE frameReady{}; // Closed before releasing the swapchain.
     bool allowTearing{};
+    LARGE_INTEGER captureFrequency{},lastCaptureStamp{};
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
@@ -200,6 +201,7 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
+        QueryPerformanceFrequency(&captureFrequency);
         capture.Open(dev11.Get(),item,w,h);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
@@ -313,12 +315,18 @@ float4 PS(V i):SV_Target {
         Check(texture->GetInterface(IID_PPV_ARGS(&source)),"WGC texture");
         D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);
         if(desc.Width<srcW||desc.Height<srcH)throw DisplayChanged{};
-        D3D11_BOX box{0,0,0,srcW,srcH,1};
-        ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,source.Get(),0,&box);
-        LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);
         const auto ticks=frame.SystemRelativeTime().count();
-        timestamp.QuadPart=static_cast<LONGLONG>(static_cast<long double>(ticks)*frequency.QuadPart/10000000.0L);
+        timestamp.QuadPart=static_cast<LONGLONG>(static_cast<long double>(ticks)*captureFrequency.QuadPart/10000000.0L);
         if(timestamp.QuadPart<=0)QueryPerformanceCounter(&timestamp);
+        if(timestamp.QuadPart<=lastCaptureStamp.QuadPart){frame.Close();return false;}
+        // Full-resource GPU copy for equal extents; no CPU mapping or staging.
+        if(desc.Width==srcW&&desc.Height==srcH&&desc.MipLevels==1&&desc.ArraySize==1)
+            ctx11->CopyResource(history[slot].Get(),source.Get());
+        else{
+            D3D11_BOX box{0,0,0,srcW,srcH,1};
+            ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,source.Get(),0,&box);
+        }
+        lastCaptureStamp=timestamp;
         frame.Close();
         return true;
     }
@@ -421,9 +429,10 @@ struct Flow11 {
         NvCheck(funcs.nvOFRegisterResourceD3D11(handle,motionTexture.Get(),&motion),"NVOFA register motion output");
         Check(d.dev11->CreateShaderResourceView(motionTexture.Get(),nullptr,&motionSRV),"NvOFA motion SRV");
     }
-    void Calculate(int current,int previous){
+    void Calculate(int current,int previous,bool continuous){
         NV_OF_EXECUTE_INPUT_PARAMS in{};
         in.inputFrame=frames[current];in.referenceFrame=frames[previous];
+        in.disableTemporalHints=continuous?NV_OF_FALSE:NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
         NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
     }
@@ -486,164 +495,138 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
-        // Anchor predictions to the WGC SystemRelativeTime timestamp. During
-        // that train, only make zero-timeout WGC polls.
-
-        LARGE_INTEGER freq{};
-        QueryPerformanceFrequency(&freq);
-        LARGE_INTEGER previousCaptureAt{};
-        double realIntervalMs=16.667;
-        double pairIntervalMs=0;
-        int current=-1,previous=-1;
-        bool flowReady=false;
-        bool realFramePending=false;
-        bool flowPending=false;
-        DWORD captureWaitMs=4;
-        bool wasFocused=false;
-        int resumeWarmup=0;
-
-        unsigned nextPrediction=1;
-        unsigned maxPredictions=0;
-        int predictionMode=2;
-        int predictionTargetHz=320;
-        double predictionRealIntervalMs=16.667;
-        // Only the V15 render thread touches the D3D11 immediate context,
-        // WGC pool, NvOFA surfaces and swapchain. No second thread
-        // can overwrite a texture while it is being sampled or copied.
+        // One graphics owner; WGC notification thread only signals a handle.
+        // Keep source timestamps for motion and arrival/presentation clocks for pacing.
+        LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
+        if(freq.QuadPart<=0)throw Error("QPC frequency unavailable");
+        auto now=[]()->LONGLONG{LARGE_INTEGER q{};QueryPerformanceCounter(&q);return q.QuadPart;};
+        auto ticks=[&](double ms)->LONGLONG{return static_cast<LONGLONG>(ms*double(freq.QuadPart)/1000.0);};
+        auto ms=[&](LONGLONG t)->double{return 1000.0*double(t)/double(freq.QuadPart);};
+        struct Timer {
+            HANDLE handle{CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS)};
+            Timer(){if(!handle)handle=CreateWaitableTimerExW(nullptr,nullptr,0,TIMER_ALL_ACCESS);}
+            ~Timer(){if(handle)CloseHandle(handle);}
+        } timer;
+        if(!timer.handle)throw Error("Prediction timer creation failed",GetLastError());
+        const int originalPriority=GetThreadPriority(GetCurrentThread());
+        struct PriorityRestore {int prior;~PriorityRestore(){if(prior!=THREAD_PRIORITY_ERROR_RETURN)SetThreadPriority(GetCurrentThread(),prior);}} priority{originalPriority};
+        SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        bool slotHeld=false;
+        auto waitActivity=[&](LONGLONG deadline,bool needSlot){
+            const LONGLONG remaining=deadline-now();
+            if(remaining<=0)return;
+            LARGE_INTEGER due{};
+            due.QuadPart=-std::max<LONGLONG>(1,static_cast<LONGLONG>(double(remaining)*10000000.0/double(freq.QuadPart)));
+            if(!SetWaitableTimer(timer.handle,&due,0,nullptr,nullptr,FALSE))throw Error("Set prediction timer",GetLastError());
+            HANDLE handles[3]{dx.capture.event.get(),timer.handle,dx.frameReady};
+            const DWORD count=needSlot&&!slotHeld?3u:2u;
+            const DWORD r=MsgWaitForMultipleObjectsEx(count,handles,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+            if(count==3&&r==WAIT_OBJECT_0+2)slotHeld=true;
+            if(r==WAIT_FAILED)throw Error("WGC scheduler wait",GetLastError());
+            CancelWaitableTimer(timer.handle);
+        };
+        auto acquireSlot=[&]()->bool{
+            if(slotHeld)return true;
+            const DWORD r=WaitForSingleObject(dx.frameReady,0);
+            if(r==WAIT_OBJECT_0){slotHeld=true;return true;}
+            if(r==WAIT_TIMEOUT)return false;
+            throw Error("DXGI frame latency wait failed",GetLastError());
+        };
+        LONGLONG priorSource=0,arrival=0,realPresented=0,lastPresented=0;
+        double interval=16.667,pair=0.0,slotMs=3.125;
+        int current=-1,previous=-1,lastFlowCurrent=-1;
+        bool flowReady=false,realPending=false,wasFocused=false;
+        unsigned nextPrediction=1,maxPredictions=0;
+        int measurements=0,warmup=0;
         while(g_running.load(std::memory_order_acquire)){
             if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
             MSG message{};
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 TranslateMessage(&message);DispatchMessageW(&message);
             }
-            if(tracked.Exited()){
-                g_running.store(false,std::memory_order_release);
-                break;
-            }
+            if(tracked.Exited()){g_running.store(false,std::memory_order_release);break;}
             DWORD foregroundPid=0;
             HWND foreground=GetForegroundWindow();
             if(foreground)GetWindowThreadProcessId(foreground,&foregroundPid);
             const bool focused=!IsIconic(game.window)&&foregroundPid==game.pid;
             if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             if(!focused){
-                overlay.SetVisible(false);
-                wasFocused=false;
-                flowReady=false;
-                realFramePending=false;
-                flowPending=false;
-                nextPrediction=maxPredictions+1;
-                Sleep(8);
+                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;
+                // Release queued WGC frames while unfocused so resume starts fresh.
+                if(auto dropped=dx.capture.Latest(0))dropped.Close();
+                waitActivity(now()+ticks(8),false);
                 continue;
             }
             if(!wasFocused){
-                wasFocused=true;
-                resumeWarmup=2;
-                current=-1;previous=-1;previousCaptureAt={};
-                realIntervalMs=16.667;
-                flowReady=false;
-                realFramePending=false;
-                flowPending=false;
-                nextPrediction=maxPredictions+1;
-                captureWaitMs=4;
+                wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
+                lastFlowCurrent=-1;priorSource=0;interval=16.667;pair=0;
+                flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
+                realPresented=lastPresented=0;
             }
-
-            // Always poll WGC capture before a queued prediction. New real
-            // frames supersede the old prediction train, as in V35's mailbox.
-            LARGE_INTEGER captureTime{};
-            int next=(current+1)%kNumCapture;
-            const bool scheduling=realFramePending || (flowReady && nextPrediction<=maxPredictions);
-            if(!dx.Grab(game.window,next,scheduling?0u:captureWaitMs,captureTime))next=-1;
-            captureWaitMs=4;
-            if(next>=0){
+            LARGE_INTEGER stamp{};
+            const int next=(current+1)%kNumCapture;
+            // New real frames always win the mailbox, including when a present slot
+            // becomes available while we were waiting on the timer.
+            if(dx.Grab(game.window,next,0,stamp)){
+                arrival=now();
                 if(dx.warp.initialized)dx.warp.sourcePose();
-                previous=current;
-                current=next;
-                pairIntervalMs=0;
-                if(previousCaptureAt.QuadPart>0 && captureTime.QuadPart>previousCaptureAt.QuadPart && freq.QuadPart>0){
-                    const double measured=1000.0*double(captureTime.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
-                    if(measured>=1.0 && measured<=80.0){
-                        pairIntervalMs=measured;
-                        realIntervalMs=std::clamp(realIntervalMs*0.75+measured*0.25,1.0,50.0);
+                previous=current;current=next;pair=0.0;
+                if(priorSource>0&&stamp.QuadPart>priorSource){
+                    const double measured=ms(stamp.QuadPart-priorSource);
+                    if(measured>=1.0&&measured<=80.0){
+                        pair=measured;
+                        interval=measurements++==0?measured:std::clamp(interval*.60+measured*.40,1.0,80.0);
                     }
                 }
-                previousCaptureAt=captureTime;
-                flowReady=false;
-                realFramePending=true;
-                flowPending=(previous>=0 && resumeWarmup==0 && pairIntervalMs>0);
-                if(resumeWarmup>0)--resumeWarmup;
-                nextPrediction=maxPredictions+1;
+                priorSource=stamp.QuadPart;
+                realPending=true;flowReady=false;maxPredictions=0;nextPrediction=1;
+                if(warmup>0)--warmup;
             }
-            if(current<0)continue;
-
-            if(realFramePending){
-                // Non-blocking wait: the separate producer in V35 can keep
-                // capturing during its 250ms wait. In single-thread V15 a
-                // blocking wait prevents new captures, making the image freeze.
-                const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-                if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
-                if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
-
-                dx.PresentReal(UINT(current),ofGrid);
-                overlay.SetVisible(true);
-                realFramePending=false;
+            if(realPending){
+                if(!acquireSlot()){waitActivity(now()+ticks(8),true);continue;}
+                dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
+                realPresented=lastPresented=now();
+                overlay.SetVisible(true);realPending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
-                const int configuredTarget=g_targetHz.load(std::memory_order_relaxed);
-                const int target=std::clamp(configuredTarget==0?int(monitorHz):configuredTarget,30,1000);
-                predictionMode=mode;
-                predictionTargetHz=target;
-                predictionRealIntervalMs=realIntervalMs;
-                maxPredictions=mode==0?5u:(mode>1?unsigned(mode-1):0u);
-                // Allow 5% timing jitter when native updates already meet the target.
-                if(mode==0 && predictionRealIntervalMs<=1.05*1000.0/target)
-                    maxPredictions=0;
+                const int configured=g_targetHz.load(std::memory_order_relaxed);
+                const int target=std::clamp(configured==0?int(monitorHz):configured,30,1000);
+                // Dynamic target can exceed x6 when the real FPS is very low.
+                // Bound the maximum prediction horizon to one measured source interval.
+                slotMs=mode==0?1000.0/target:interval/double(std::max(1,mode));
+                maxPredictions=mode==0?std::min(12u,unsigned(std::max(0.0,std::ceil(interval/slotMs)-1.0))):
+                    (mode>1?unsigned(mode-1):0u);
+                if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
-                // Avoid optical flow work when the entire prediction window has expired.
-                LARGE_INTEGER afterPresent{};
-                QueryPerformanceCounter(&afterPresent);
-                const double ageMs=1000.0 * double(afterPresent.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
-                if(flowPending){
-                    if(maxPredictions>0 && ageMs<predictionRealIntervalMs){
-                        flow.Calculate(current,previous);
-                        flowReady=true;
-                    }
-                    flowPending=false;
+                const LONGLONG expiry=arrival+ticks(interval*1.10);
+                if(maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
+                    realPresented+ticks(slotMs*.70)<expiry){
+                    const bool continuous=lastFlowCurrent==previous;
+                    flow.Calculate(current,previous,continuous);
+                    lastFlowCurrent=current;flowReady=true;
                 }
                 continue;
             }
-            if(!flowReady || nextPrediction>maxPredictions){
-                captureWaitMs=4;
-                continue;
+            if(!flowReady||nextPrediction>maxPredictions){
+                waitActivity(now()+ticks(8),false);continue;
             }
-            const double slotMs=predictionMode==0 ? 1000.0/predictionTargetHz
-                                                   : predictionRealIntervalMs/predictionMode;
-            LARGE_INTEGER now{};
-            QueryPerformanceCounter(&now);
-            const double elapsedMs=1000.0 * double(now.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
-            if(elapsedMs>=predictionRealIntervalMs ||
-               slotMs*nextPrediction>=predictionRealIntervalMs){
-                nextPrediction=maxPredictions+1;
-                continue;
-            }
-            if(elapsedMs<slotMs*nextPrediction){
-                SwitchToThread();
-                continue;
-            }
-            // Submit only the most recent due slot after a delayed GPU or CPU
-            // wakeup. Back-to-back catch-up presents can replace each other.
-            unsigned dueSlot=std::min(maxPredictions,unsigned(elapsedMs/slotMs));
-            nextPrediction=std::max(nextPrediction,dueSlot);
-            const double predictionMs=nextPrediction*slotMs;
-            // A successful wait consumes a presentation slot. Once acquired,
-            // always submit this frame before polling the handle again.
-            const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-            if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
-            if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
-
-            const float fraction=float(std::min(1.0,predictionMs/pairIntervalMs));
-            dx.Draw(UINT(current),UINT(previous>=0?previous:current),
-                    flow.motionSRV.Get(),fraction,ofGrid);
-            ++nextPrediction;
-            captureWaitMs=(nextPrediction<=maxPredictions)?0:4;
+            const LONGLONG t=now();
+            // Pacing begins at actual real submission, not WGC's earlier source
+            // timestamp. Do not consume fake slots before the real was submitted.
+            const LONGLONG expiry=arrival+ticks(interval*1.10);
+            if(t>=expiry){flowReady=false;continue;}
+            const LONGLONG due=std::max(realPresented+ticks(slotMs*nextPrediction),
+                                        lastPresented+ticks(slotMs*.85));
+            if(due>=expiry){flowReady=false;continue;}
+            if(t<due){waitActivity(due,false);continue;}
+            if(!acquireSlot()){waitActivity(expiry,true);continue;}
+            // No burst catch-up; use the newest due prediction, at most one per
+            // present opportunity. Never extrapolate more than one source pair.
+            const double elapsed=ms(t-realPresented);
+            const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
+            nextPrediction=std::max(nextPrediction,dueIndex);
+            const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
+            dx.Draw(UINT(current),UINT(previous),flow.motionSRV.Get(),fraction,ofGrid);
+            slotHeld=false;lastPresented=now();++nextPrediction;
         }
         overlay.SetVisible(false);
         Status(L"Stopped");
