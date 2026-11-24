@@ -1,6 +1,6 @@
 #pragma once
 #include <dxgi1_2.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <vector>
@@ -94,6 +94,35 @@ struct Capture {
         Step(L"Shared texture pre-registration ReleaseSync(0)");
         hr=mutex->ReleaseSync(0);
         if(hr!=S_OK)return Fail("Pre-registration ReleaseSync key 0",hr);
+        // Test actual NT-handle import and key handoff using only our own
+        // resource and a second device on the same adapter. No screen pixels.
+        {
+            Step(L"Pre-registration second-device shared texture import");
+            ComPtr<ID3D11Device> peer;
+            hr=D3D11CreateDevice(dxgi,D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                nullptr,0,D3D11_SDK_VERSION,&peer,nullptr,nullptr);
+            if(FAILED(hr))return Fail("Peer D3D11 device",hr);
+            ComPtr<ID3D11Device1> peer1;hr=peer.As(&peer1);
+            if(FAILED(hr))return Fail("Peer ID3D11Device1",hr);
+            ComPtr<ID3D11Texture2D> imported;
+            hr=peer1->OpenSharedResource1(shared,IID_PPV_ARGS(&imported));
+            if(FAILED(hr))return Fail("Peer OpenSharedResource1",hr);
+            ComPtr<IDXGIKeyedMutex> peerMutex;hr=imported.As(&peerMutex);
+            if(FAILED(hr))return Fail("Peer keyed mutex query",hr);
+            Step(L"Pre-registration cross-device key roundtrip");
+            hr=mutex->AcquireSync(0,100);
+            if(hr!=S_OK)return Fail("Owner roundtrip AcquireSync(0)",hr);
+            hr=mutex->ReleaseSync(1);
+            if(hr!=S_OK)return Fail("Owner roundtrip ReleaseSync(1)",hr);
+            hr=peerMutex->AcquireSync(1,100);
+            if(hr!=S_OK)return Fail("Peer roundtrip AcquireSync(1)",hr);
+            hr=peerMutex->ReleaseSync(0);
+            if(hr!=S_OK)return Fail("Peer roundtrip ReleaseSync(0)",hr);
+            hr=mutex->AcquireSync(0,100);
+            if(hr!=S_OK)return Fail("Owner roundtrip reacquire key 0",hr);
+            hr=mutex->ReleaseSync(0);
+            if(hr!=S_OK)return Fail("Owner roundtrip final ReleaseSync(0)",hr);
+        }
         td.Width=td.Height=sampleSize;td.BindFlags=td.MiscFlags=0;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         hr=device->CreateTexture2D(&td,nullptr,&stage);if(FAILED(hr))return Fail("Create startup validation texture",hr);
         Create c{};c.adapter=adapter.adapter;c.source=adapter.source;c.count=1;c.surfaces[0]=shared;
@@ -113,8 +142,15 @@ struct Capture {
         HRESULT sync=mutex->AcquireSync(1,0);
         if(sync==WAIT_TIMEOUT||sync==DXGI_ERROR_WAIT_TIMEOUT){Fail("AcquireSync key 1 timeout",sync);return NoFrame();}
         if(sync==WAIT_ABANDONED){
-            Fail("Post-registration AcquireSync key 1 WAIT_ABANDONED (pre-registration key 0 passed)",sync);
-            return Result::Abandoned;
+            // Do not read, copy or release an abandoned shared resource.
+            // Query only the native frame metadata for diagnostic evidence.
+            Info probe{};probe.adapter=adapter.adapter;probe.source=adapter.source;
+            Step(L"Abandoned mutex: native metadata diagnostic");
+            const LONG st=get(&probe);
+            char msg[256];std::snprintf(msg,sizeof(msg),
+                "WAIT_ABANDONED 0x%08lX; cross-device NT handle/key roundtrip PASS; GetFrameInfo=0x%08lX present=%lld accumulated=%u masked=%d",
+                (unsigned long)sync,(unsigned long)st,(long long)probe.present.QuadPart,probe.accumulated,int(probe.masked));
+            detail=msg;return Result::Abandoned;
         }
         if(sync!=S_OK)return Reject("AcquireSync key 1",sync);
         Info f{};f.adapter=adapter.adapter;f.source=adapter.source;
