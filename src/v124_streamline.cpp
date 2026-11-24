@@ -49,8 +49,8 @@ uint32_t frameId=1;bool active=false,initialized=false,first=true;
 std::array<float,16> previousSource{};
 ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
 ComPtr<ID3D12Fence> fence;HANDLE eventHandle{};UINT64 serial=0;
-struct Slot {ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color,mask;UINT64 fenceValue{};};
-std::vector<Slot> slots;ComPtr<ID3D12Resource> depth,zeroMotion,fixedMask,zeroUI;
+struct Slot {ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color,mask;std::vector<ComPtr<ID3D12Resource>> maskUploads;UINT maskRadius{UINT_MAX},maskFeather{UINT_MAX};UINT64 fenceValue{};};
+std::vector<Slot> slots;ComPtr<ID3D12Resource> depth,zeroMotion,zeroUI;
 UINT width{},height{},motionW{},motionH{};
 constexpr D3D12_RESOURCE_STATES readState=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 void Check(sl27::Result r,const char* name){if(r!=sl27::Result::eOk)throw std::runtime_error(std::string("V124 ")+name+" Streamline result "+std::to_string(int(r)));}
@@ -115,12 +115,46 @@ void CheckAdapter(IDXGIAdapter1* a){Stage(L"Streamline feature support and API r
 }
 void Enable(){Stage(L"slLatewarpSetOptions ON");if(!setOptions)throw std::runtime_error("V125 Latewarp options missing");Options27 o{};o.latewarpActive=1;Check(setOptions(viewport,o),"slLatewarpSetOptions ON");active=true;first=true;frameId=1;}
 void Disable() noexcept{Stage(L"slLatewarpSetOptions OFF");if(active&&setOptions){Options27 o{};setOptions(viewport,o);}active=false;}
-void InitializePlanes(ID3D12Device* d,ID3D12CommandQueue* q,UINT w,UINT h,UINT mw,UINT mh,UINT count,UINT sourceAspectMilli){Stage(L"allocate native Latewarp resource planes");if(!count||!w||!h||!d||!q)throw std::runtime_error("V125 invalid Latewarp dimensions or device");device=d;queue=q;width=w;height=h;motionW=std::max(1u,mw);motionH=std::max(1u,mh);slots.resize(count);HR(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"Latewarp plane fence");eventHandle=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!eventHandle)throw std::runtime_error("V124 plane event");
+void InitializePlanes(ID3D12Device* d,ID3D12CommandQueue* q,UINT w,UINT h,UINT mw,UINT mh,UINT count,UINT /*sourceAspectMilli*/){Stage(L"allocate native Latewarp resource planes");if(!count||!w||!h||!d||!q)throw std::runtime_error("V125 invalid Latewarp dimensions or device");device=d;queue=q;width=w;height=h;motionW=std::max(1u,mw);motionH=std::max(1u,mh);slots.resize(count);HR(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"Latewarp plane fence");eventHandle=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!eventHandle)throw std::runtime_error("V124 plane event");
     for(auto& slot:slots){HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot.allocator)),"Latewarp allocator");HR(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,slot.allocator.Get(),nullptr,IID_PPV_ARGS(&slot.list)),"Latewarp list");HR(slot.list->Close(),"Latewarp initial close");Plane(slot.color,w,h,DXGI_FORMAT_B8G8R8A8_UNORM,readState);Plane(slot.mask,w,h,DXGI_FORMAT_R8_UNORM,readState);}
-    Plane(depth,motionW,motionH,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST);Plane(zeroMotion,motionW,motionH,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST);Plane(fixedMask,w,h,DXGI_FORMAT_R8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST);Plane(zeroUI,w,h,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST);
-    auto& s=slots[0];HR(s.allocator->Reset(),"plane allocator");HR(s.list->Reset(s.allocator.Get(),nullptr),"plane list");std::vector<ComPtr<ID3D12Resource>> u;std::vector<uint8_t> values(size_t(motionW)*motionH*4);const float dep=.999f;for(size_t i=0;i<values.size();i+=4)memcpy(values.data()+i,&dep,4);Upload(s.list.Get(),depth.Get(),values,4,u);std::fill(values.begin(),values.end(),0);Upload(s.list.Get(),zeroMotion.Get(),values,4,u);values.assign(size_t(w)*h,0);const float aspect=float(sourceAspectMilli)/1000.f;for(UINT y=0;y<h;++y)for(UINT x=0;x<w;++x){float u0=(x+.5f)/w,v=(y+.5f)/h;float cx=(u0-.5f)*aspect,cy=v-.5f;if(v<=.055f||v>=.88f||cx*cx+cy*cy<=.005f*.005f)values[size_t(y)*w+x]=255;}Upload(s.list.Get(),fixedMask.Get(),values,1,u);values.assign(size_t(w)*h*4,0);Upload(s.list.Get(),zeroUI.Get(),values,4,u);HR(s.list->Close(),"plane close");ID3D12CommandList* lists[]={s.list.Get()};queue->ExecuteCommandLists(1,lists);HR(queue->Signal(fence.Get(),++serial),"plane signal");Wait(serial);
+    Plane(depth,motionW,motionH,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST);Plane(zeroMotion,motionW,motionH,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_STATE_COPY_DEST);Plane(zeroUI,w,h,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto& s=slots[0];HR(s.allocator->Reset(),"plane allocator");HR(s.list->Reset(s.allocator.Get(),nullptr),"plane list");std::vector<ComPtr<ID3D12Resource>> u;std::vector<uint8_t> values(size_t(motionW)*motionH*4);const float dep=.999f;for(size_t i=0;i<values.size();i+=4)memcpy(values.data()+i,&dep,4);Upload(s.list.Get(),depth.Get(),values,4,u);std::fill(values.begin(),values.end(),0);Upload(s.list.Get(),zeroMotion.Get(),values,4,u);values.assign(size_t(w)*h*4,0);Upload(s.list.Get(),zeroUI.Get(),values,4,u);HR(s.list->Close(),"plane close");ID3D12CommandList* lists[]={s.list.Get()};queue->ExecuteCommandLists(1,lists);HR(queue->Signal(fence.Get(),++serial),"plane signal");Wait(serial);
+}
+// Same output-pixel distance and smoothstep as the common D3D11 centerMask.
+// The no-warp mask stores the inverse of the extrapolation permission.
+// Upload only on settings changes, separately for each in-flight swapchain slot.
+void UpdateCenterMask(Slot& s,UINT radius,UINT feather){
+    if(s.maskRadius==radius&&s.maskFeather==feather)return;
+    std::vector<uint8_t> pixels(size_t(width)*height,0);
+    if(radius||feather){
+        const float r=float(radius),f=float(feather),outer=r+f;
+        const float cx=float(width)*.5f,cy=float(height)*.5f;
+        // Bound work to the protected square; outside it the mask stays zero.
+        const UINT x0=UINT(std::max(0.f,std::floor(cx-outer)));
+        const UINT y0=UINT(std::max(0.f,std::floor(cy-outer)));
+        const UINT x1=UINT(std::min(float(width),std::ceil(cx+outer)));
+        const UINT y1=UINT(std::min(float(height),std::ceil(cy+outer)));
+        for(UINT y=y0;y<y1;++y)for(UINT x=x0;x<x1;++x){
+            const float dx=float(x)+.5f-cx,dy=float(y)+.5f-cy;
+            const float d=std::sqrt(dx*dx+dy*dy);
+            float protection=0.f;
+            if(d<=r)protection=1.f;
+            else if(f>0.f&&d<outer){
+                const float t=std::clamp((d-r)/f,0.f,1.f);
+                protection=1.f-t*t*(3.f-2.f*t);
+            }
+            pixels[size_t(y)*width+x]=uint8_t(std::lround(protection*255.f));
+        }
+    }
+    // The outer presenter waits for this slot's post-Present fence before
+    // calling Prepare; its previous plugin reads and upload are complete.
+    s.maskUploads.clear();
+    Transition(s.list.Get(),s.mask.Get(),readState,D3D12_RESOURCE_STATE_COPY_DEST);
+    Upload(s.list.Get(),s.mask.Get(),pixels,1,s.maskUploads);
+    s.maskRadius=radius;s.maskFeather=feather;
 }
 void Prepare(const Frame& f){Stage(L"Latewarp native resource copy");if(!active||!f.back||f.index>=slots.size())throw std::runtime_error("V124 Latewarp missing active resources");auto& s=slots[f.index];Wait(s.fenceValue);HR(s.allocator->Reset(),"Latewarp allocator reuse");HR(s.list->Reset(s.allocator.Get(),nullptr),"Latewarp list reuse");auto* l=s.list.Get();
+    UpdateCenterMask(s,f.centerRadiusPx,f.centerFeatherPx);
     // Separate color copy avoids aliasing the native swapchain resource while
     // the NVIDIA plugin owns the final Present. Mask and compact flow remain GPU-resident.
     Transition(l,f.back,D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);Transition(l,s.color.Get(),readState,D3D12_RESOURCE_STATE_COPY_DEST);l->CopyResource(s.color.Get(),f.back);Transition(l,s.color.Get(),D3D12_RESOURCE_STATE_COPY_DEST,readState);Transition(l,f.back,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
@@ -128,7 +162,7 @@ void Prepare(const Frame& f){Stage(L"Latewarp native resource copy");if(!active|
     const auto src=CameraMatrix(f.camera.yaw,f.camera.pitch),projection=Projection(f.camera),inv=InverseProjection(projection);if(first){previousSource=src;if(frameId==1)CameraData(*currentToken,src,src,projection);}
     Check(marker(sl27::PCLMarker::eSimulationStart,*currentToken),"Reflex simulation start");Check(marker(sl27::PCLMarker::eSimulationEnd,*currentToken),"Reflex simulation end");
     Stage(L"Latewarp frame constants");sl27::Constants c{};c.cameraViewToClip=Mat(projection);c.clipToCameraView=Mat(inv);c.clipToLensClip=Mat(Identity());c.clipToPrevClip=Mat(Multiply(Multiply(Multiply(inv,Transpose(src)),previousSource),projection));c.prevClipToClip=Mat(Multiply(Multiply(Multiply(inv,Transpose(previousSource)),src),projection));c.jitterOffset={0,0};c.mvecScale={1.f/std::max(1u,f.sourceWidth),1.f/std::max(1u,f.sourceHeight)};c.cameraPinholeOffset={0,0};c.cameraPos={0,0,0};c.cameraUp={src[1],src[5],src[9]};c.cameraRight={src[0],src[4],src[8]};c.cameraFwd={src[2],src[6],src[10]};c.cameraNear=.1f;c.cameraFar=1000.f;c.cameraFOV=2*std::atan(1.f/projection[5]);c.cameraAspectRatio=f.camera.aspect;c.motionVectorsInvalidValue=65504.f;c.depthInverted=sl27::Boolean::eFalse;c.cameraMotionIncluded=sl27::Boolean::eTrue;c.motionVectors3D=sl27::Boolean::eFalse;c.reset=first?sl27::Boolean::eTrue:sl27::Boolean::eFalse;c.orthographicProjection=sl27::Boolean::eFalse;c.motionVectorsDilated=sl27::Boolean::eFalse;c.motionVectorsJittered=sl27::Boolean::eFalse;Check(constants(c,*currentToken,viewport),"slSetConstants");
-    auto* mask=fixedMask.Get();auto* mv=f.motion?f.motion:zeroMotion.Get();auto back=Resource(f.back,D3D12_RESOURCE_STATE_PRESENT),color=Resource(s.color.Get(),readState),dep=Resource(depth.Get(),readState),motion=Resource(mv,f.motion?D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE):readState),ui=Resource(zeroUI.Get(),readState),protection=Resource(mask,readState);auto ce=Extent(s.color.Get()),de=Extent(depth.Get()),me=Extent(mv),pe=Extent(mask);
+    auto* mask=s.mask.Get();auto* mv=f.motion?f.motion:zeroMotion.Get();auto back=Resource(f.back,D3D12_RESOURCE_STATE_PRESENT),color=Resource(s.color.Get(),readState),dep=Resource(depth.Get(),readState),motion=Resource(mv,f.motion?D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE):readState),ui=Resource(zeroUI.Get(),readState),protection=Resource(mask,readState);auto ce=Extent(s.color.Get()),de=Extent(depth.Get()),me=Extent(mv),pe=Extent(mask);
     sl27::ResourceTag tags[]={{&back,sl27::kBufferTypeBackbuffer,sl27::eValidUntilPresent,&ce},{&color,sl27::kBufferTypeHUDLessColor,sl27::eValidUntilPresent,&ce},{&dep,sl27::kBufferTypeDepth,sl27::eValidUntilPresent,&de},{&motion,sl27::kBufferTypeMotionVectors,sl27::eValidUntilPresent,&me},{&ui,sl27::kBufferTypeUIColorAndAlpha,sl27::eValidUntilPresent,&ce},{&protection,sl27::kBufferTypeNoWarpMask,sl27::eValidUntilPresent,&pe}};
     Stage(L"Latewarp resource tags");Check(setTag(viewport,tags,UINT(std::size(tags)),l),"slSetTag Latewarp resources");
     Check(marker(sl27::PCLMarker::eRenderSubmitStart,*currentToken),"Reflex render submit start");HR(l->Close(),"Latewarp resource list close");ID3D12CommandList* lists[]={l};queue->ExecuteCommandLists(1,lists);Check(marker(sl27::PCLMarker::eRenderSubmitEnd,*currentToken),"Reflex render submit end");HR(queue->Signal(fence.Get(),++serial),"Latewarp copy fence");s.fenceValue=serial;
@@ -140,7 +174,7 @@ void Prepare(const Frame& f){Stage(L"Latewarp native resource copy");if(!active|
 void LatchCamera(const Camera& c){Stage(L"Latewarp next camera token");if(!active||!currentToken)throw std::runtime_error("V124 missing current token");uint32_t next=frameId+1;sl27::FrameToken* t{};Check(newToken(t,&next),"next Reflex camera token");if(!t)throw std::runtime_error("V124 next frame token null");CameraData(*t,CameraMatrix(c.lateYaw,c.latePitch),CameraMatrix(c.yaw,c.pitch),Projection(c));Check(marker(sl27::PCLMarker::ePresentStart,*currentToken),"Reflex Present start");}
 void PresentEnd(){Stage(L"Latewarp Present end");if(currentToken){Check(marker(sl27::PCLMarker::ePresentEnd,*currentToken),"Reflex Present end");currentToken=nullptr;++frameId;}}
 void ResetCameraHistory() noexcept{first=true;}
-void ReleasePlanes() noexcept{try{if(fence&&queue){HR(queue->Signal(fence.Get(),++serial),"Latewarp drain");Wait(serial);}}catch(...){}slots.clear();depth.Reset();zeroMotion.Reset();fixedMask.Reset();zeroUI.Reset();fence.Reset();queue.Reset();device.Reset();if(eventHandle){CloseHandle(eventHandle);eventHandle=nullptr;}serial=0;}
+void ReleasePlanes() noexcept{try{if(fence&&queue){HR(queue->Signal(fence.Get(),++serial),"Latewarp drain");Wait(serial);}}catch(...){}slots.clear();depth.Reset();zeroMotion.Reset();zeroUI.Reset();fence.Reset();queue.Reset();device.Reset();if(eventHandle){CloseHandle(eventHandle);eventHandle=nullptr;}serial=0;}
 void Shutdown() noexcept{Disable();ReleasePlanes();if(initialized&&shutdown)shutdown();initialized=false;// The engine process exits after Stop. Keep the interposer resident until
     // all local COM proxies have been released by their owning scopes.
     // FreeLibrary here in V124 could leave live proxy vtables pointing into unmapped memory.
