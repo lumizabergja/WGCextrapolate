@@ -42,7 +42,7 @@ struct WgcCapture {
         event=std::shared_ptr<void>(CreateEventW(nullptr,FALSE,FALSE,nullptr),[](void* h){if(h)CloseHandle(h);});
         if(!event)throw std::runtime_error("WGC frame event failed");
         pool=wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(wrapped,
-            wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized,2,{int(width),int(height)});
+            wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized,5,{int(width),int(height)});
         token=pool.FrameArrived([signal=event](auto const&,auto const&){SetEvent(signal.get());});
         subscribed=true;
         session=pool.CreateCaptureSession(item);
@@ -67,16 +67,19 @@ struct WgcCapture {
         if(!frame)return nullptr;
         // Free the older lease before draining another frame. No CPU readback,
         // no graphics work in the callback, and bounded mailbox drain.
-        for(unsigned i=0;i<2;++i){
+        for(unsigned i=0;i<4;++i){
             auto newer=pool.TryGetNextFrame();
             if(!newer)break;
             frame.Close();frame=std::move(newer);
         }
         return frame;
     }
+    void StopSession() noexcept{
+        if(pool&&subscribed){try{pool.FrameArrived(token);}catch(...){}subscribed=false;}
+        if(session){try{session.Close();}catch(...){}session=nullptr;}
+    }
     ~WgcCapture(){
-        if(pool&&subscribed){try{pool.FrameArrived(token);}catch(...){}}
-        if(session){try{session.Close();}catch(...){}}
+        StopSession();
         if(pool){try{pool.Close();}catch(...){}}
     }
 };
