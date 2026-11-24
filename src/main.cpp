@@ -162,7 +162,8 @@ struct DxDevices {
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps,realPS;
+    ComPtr<ID3D11VertexShader> realVS;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> constants;
     // A WGC frame lease owns the original surface until GPU retirement.
@@ -171,6 +172,7 @@ struct DxDevices {
     ComPtr<ID3D11DeviceContext4> fenceContext;
     ComPtr<ID3D11Fence> retirementFence;
     UINT64 nextFence{};
+    bool retirementNeedsSubmit{};
     UINT64 retiring[kNumCapture]{};
     HANDLE retireEvent{};
     ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
@@ -204,7 +206,12 @@ struct DxDevices {
             if(leases[i]&&!retiring[i]&&i!=current&&i!=previous)retiring[i]=value;
         // OFA may have queued work after the previous Present; submit once per
         // retired batch, without waiting on the render thread.
-        ctx11->Flush();
+        // The next Present normally submits this fence with the draw.
+        // Only flush explicitly when idle or capture surfaces are exhausted.
+        retirementNeedsSubmit=true;
+    }
+    void SubmitRetirementIfIdle(){
+        if(retirementNeedsSubmit){ctx11->Flush();retirementNeedsSubmit=false;}
     }
     UINT64 Completed() const {
         const UINT64 v=retirementFence->GetCompletedValue();
@@ -312,6 +319,11 @@ V VS(uint id:SV_VertexID){
     [branch] if(horizon>0.00001){float e=cutSample(float2(.2,.3))+cutSample(float2(.8,.3))+cutSample(float2(.5,.5))+cutSample(float2(.2,.7))+cutSample(float2(.8,.7));o.scene=smoothstep(.19,.32,e*.2);}
     return o;
 }
+V RealVS(uint id:SV_VertexID){
+    V o;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);
+    o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);o.scene=0;return o;
+}
+float4 RealPS(V i):SV_Target{return currentFrame.SampleLevel(samp,i.uv,0);}
 float centerMask(float2 uv){
     // The center mask affects only predicted pixels, never real captured frames.
     // 0px radius + 0px feather is a full bypass (no center protection).
@@ -343,6 +355,14 @@ float4 PS(V i):SV_Target {
         errs.Reset();hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs);
         if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"PS compile",hr);
         Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
+        vsBlob.Reset();psBlob.Reset();errs.Reset();
+        hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"RealVS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs);
+        if(FAILED(hr))throw Error("RealVS compile",hr);
+        Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&realVS),"RealVS");
+        errs.Reset();
+        hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"RealPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs);
+        if(FAILED(hr))throw Error("RealPS compile",hr);
+        Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&realPS),"RealPS");
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
         Check(dev11->CreateSamplerState(&sd,&sampler),"Sampler");
@@ -416,15 +436,27 @@ float4 PS(V i):SV_Target {
         ctx11->VSSetShaderResources(0,3,nullViews);
         Present(horizon==0.f);
     }
-    void PresentReal(UINT current,int grid){
-        // Real frames also sample the leased WGC texture directly into the flip buffer.
-        Draw(current,current,nullptr,0.f,grid);
+    void PresentReal(UINT current,int /*grid*/){
+        // Dedicated one-sample real pass: no flow/scene-cut/constant update.
+        D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
+        ctx11->RSSetViewports(1,&vp);
+        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+        ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx11->VSSetShader(realVS.Get(),nullptr,0);
+        ctx11->PSSetShader(realPS.Get(),nullptr,0);
+        ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
+        ctx11->PSSetShaderResources(0,1,frameSRV[current].GetAddressOf());
+        ctx11->Draw(3,0);
+        ID3D11ShaderResourceView* empty=nullptr;
+        ctx11->PSSetShaderResources(0,1,&empty);
+        Present(true);
     }
     void Present(bool /*real*/){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
         Check(swap->Present(0,flags),"DX11 low-latency Present");
+        retirementNeedsSubmit=false;
     }
 };
 
@@ -596,7 +628,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
         uint64_t captureSerial=0,lastFlowSerial=0;
-        bool flowReady=false,realPending=false,wasFocused=false;
+        bool flowReady=false,realPending=false,flowPending=false,wasFocused=false;
         unsigned nextPrediction=1,maxPredictions=0;
         int measurements=0,warmup=0;
         while(g_running.load(std::memory_order_acquire)){
@@ -613,8 +645,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             flow.Reap();
             if(!focused){
-                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;
+                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;flowPending=false;
                 dx.RetireExcept(-1,-1);
+                dx.SubmitRetirementIfIdle();
                 // Release queued WGC frames while unfocused so resume starts fresh.
                 if(auto dropped=dx.capture.Latest(0))dropped.Close();
                 waitActivity(now()+ticks(8),false);
@@ -623,15 +656,15 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
-                flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
+                flowReady=false;realPending=false;flowPending=false;maxPredictions=0;nextPrediction=1;
                 realPresented=lastPresented=0;
             }
             LARGE_INTEGER stamp{};
             const int next=dx.FreeSlot();
-            if(next<0){waitActivity(now()+ticks(0.5),false);continue;}
+            if(next<0)dx.SubmitRetirementIfIdle();
             // New real frames always win the mailbox, including when a present slot
             // becomes available while we were waiting on the timer.
-            if(dx.Grab(game.window,next,0,stamp)){
+            if(next>=0&&dx.Grab(game.window,next,0,stamp)){
                 arrival=now();++captureSerial;
                 previous=current;current=next;pair=0.0;
                 dx.RetireExcept(current,previous);
@@ -643,11 +676,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     }
                 }
                 priorSource=stamp.QuadPart;
-                realPending=true;flowReady=false;maxPredictions=0;nextPrediction=1;
+                realPending=true;flowReady=false;flowPending=false;maxPredictions=0;nextPrediction=1;
                 if(warmup>0)--warmup;
             }
             if(realPending){
-                if(!acquireSlot()){waitActivity(now()+ticks(8),true);continue;}
+                if(!acquireSlot()){dx.SubmitRetirementIfIdle();waitActivity(now()+ticks(next<0?.25:8),true);continue;}
                 dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
                 realPresented=lastPresented=now();
                 overlay.SetVisible(true);realPending=false;
@@ -662,16 +695,25 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
                 const LONGLONG expiry=arrival+ticks(interval*1.10);
-                if(maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
-                    realPresented+ticks(slotMs*.70)<expiry){
+                flowPending=maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
+                    realPresented+ticks(slotMs*.70)<expiry;
+                // Return to capture mailbox before doing any OFA work.
+                continue;
+            }
+            if(flowPending){
+                flowPending=false;
+                const LONGLONG expiry=arrival+ticks(interval*1.10);
+                if(now()+ticks(slotMs*.35)<expiry){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
                     flow.Calculate(current,previous,continuous);
                     lastFlowSerial=captureSerial;flowReady=true;
                 }
+                // Another real frame may have arrived during optical flow.
                 continue;
             }
             if(!flowReady||nextPrediction>maxPredictions){
-                waitActivity(now()+ticks(8),false);continue;
+                dx.SubmitRetirementIfIdle();
+                waitActivity(now()+ticks(next<0?.25:8),false);continue;
             }
             const LONGLONG t=now();
             // Pacing begins at actual real submission, not WGC's earlier source
@@ -682,10 +724,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                                         lastPresented+ticks(slotMs*.85));
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
-            if(!acquireSlot()){waitActivity(expiry,true);continue;}
+            if(!acquireSlot()){dx.SubmitRetirementIfIdle();waitActivity(std::min(expiry,now()+ticks(next<0?.25:8)),true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
-            const double elapsed=ms(t-realPresented);
+            const double elapsed=ms(now()-realPresented);
             const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
