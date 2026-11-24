@@ -1,8 +1,8 @@
-name: FG D3DKMT 320 LateInput Windows x64
+name: FG D3DKMT Native Only 320 Windows x64
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-d3dkmt-320-lateinput-build']
+    branches: ['fg-d3dkmt-320-native-only']
 permissions:
   contents: read
 jobs:
@@ -22,7 +22,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-D3DKMT-320-LateInput-Windows-x64
+          name: FG-D3DKMT-320-NativeOnly-Windows-x64
           path: |
             bin/FG.exe
             README.md
