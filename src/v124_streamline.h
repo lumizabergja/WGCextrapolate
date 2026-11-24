@@ -37,7 +37,8 @@ struct Frame {
 // actual next-camera token. The signed 2.7 plugin performs the warp in its
 // own swapchain Present hook, not in a host NGX/custom-shader fallback.
 void Prepare(const Frame&);
-void LatchCamera(const Camera&);
+using LatePoseSampler=void(*)(Camera&);
+void LatchCamera(const Camera&,LatePoseSampler);
 void PresentEnd();
 void ResetCameraHistory() noexcept;
 }
