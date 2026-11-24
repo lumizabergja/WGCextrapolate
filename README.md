@@ -1,3 +1,7 @@
-# FG Mask 320 — D3DKMT Experimental
+# FG 320 IddCx frame-delivery probe
 
-Select a game, enable D3DKMT probe, press Start, and keep the game focused and moving for 8 seconds. Report the result dialog. This is a diagnostic only; it does not generate frames when enabled. With the probe unchecked the original DXGI presenter is used. No custom driver or game injection.
+An experimental separate UMDF indirect display driver based on Microsoft's pinned MIT-licensed sample. Mask 320 is unchanged. One EDID-less 1080p virtual display advertises 320 Hz and 240 Hz. The driver counts acquired buffers and successful D3D11 texture queries once per second; it does not read or save pixels, send frames to FG, or measure end-to-end latency.
+
+The CI artifact is UNSIGNED and cannot be installed as a trusted production driver as-is. Use a properly signed development/test package on an isolated Windows test system or obtain appropriate driver signing; do not disable platform security on your gaming PC. Driver installation requires administrator permission. After a correctly signed package has been staged with pnputil, run Enable-Report.ps1 as administrator, then IddSampleApp.exe to instantiate the virtual display. Use Extend, keep the physical monitor primary, choose the virtual display's 320 Hz mode if available, and move a continuously animated test window onto it. Press x in the launcher to remove the virtual device. Report C:\ProgramData\FGIddProbe\stats.txt. A count of frames is not proof that they contain unique images. Windows 10 22H2 and Windows 11 compatibility is untested.
+
+Build with Windows SDK/WDK and MSVC: run Prepare-IddProbe.ps1, then msbuild upstream/video/IndirectDisplay/IddSampleDriver.sln /p:Configuration=Release /p:Platform=x64. Upstream sample license applies.
