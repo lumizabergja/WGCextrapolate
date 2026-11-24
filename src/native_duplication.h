@@ -45,7 +45,7 @@ struct Capture {
     static constexpr uint32_t marker=0xFFAC19D3u;
     ~Capture(){Reset();}
     void Reset(){
-        if(created){Destroy d{adapter.adapter,adapter.source,FALSE};destroy(&d);created=false;}
+        if(created){Step(L"D3DKMTDestroyOutputDupl");Destroy d{adapter.adapter,adapter.source,FALSE};destroy(&d);created=false;}
         if(shared){CloseHandle(shared);shared=nullptr;}
         mutex.Reset();tex.Reset();stage.Reset();
         if(opened){Close c{adapter.adapter};close(&c);opened=false;}
@@ -86,6 +86,14 @@ struct Capture {
         hr=tex.As(&mutex);if(FAILED(hr))return Fail("Query keyed mutex",hr);
         ComPtr<IDXGIResource1> res;hr=tex.As(&res);if(FAILED(hr))return Fail("Query IDXGIResource1",hr);
         hr=res->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&shared);if(FAILED(hr))return Fail("CreateSharedHandle",hr);
+        // Validate our own shared surface before handing it to the system.
+        // Key zero is the documented initial key. Do not retain ownership.
+        Step(L"Shared texture pre-registration AcquireSync(0)");
+        hr=mutex->AcquireSync(0,0);
+        if(hr!=S_OK)return Fail("Pre-registration AcquireSync key 0",hr);
+        Step(L"Shared texture pre-registration ReleaseSync(0)");
+        hr=mutex->ReleaseSync(0);
+        if(hr!=S_OK)return Fail("Pre-registration ReleaseSync key 0",hr);
         td.Width=td.Height=sampleSize;td.BindFlags=td.MiscFlags=0;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         hr=device->CreateTexture2D(&td,nullptr,&stage);if(FAILED(hr))return Fail("Create startup validation texture",hr);
         Create c{};c.adapter=adapter.adapter;c.source=adapter.source;c.count=1;c.surfaces[0]=shared;
@@ -93,7 +101,7 @@ struct Capture {
         LONG st=create(&c);if(st!=0)return Fail("D3DKMTCreateOutputDupl session",st);
         created=true;began=lastGood=0;detail="D3DKMT waiting for first valid frame";return true;
     }
-    enum class Result { None, Frame, Reject };
+    enum class Result { None, Frame, Reject, Abandoned };
     Result Reject(const char* op,LONG status=0){Fail(op,status);return Result::Reject;}
     Result NoFrame(){if(GetTickCount64()-lastGood>(verified?3000u:4000u)){detail="Native frame timeout: "+detail;return Result::Reject;}return Result::None;}
     Result Grab(ID3D11DeviceContext* ctx,ID3D11Texture2D* dest,const D3D11_BOX& region,LARGE_INTEGER& stamp){
@@ -104,6 +112,10 @@ struct Capture {
         Step(L"Native keyed mutex AcquireSync(1,0)");
         HRESULT sync=mutex->AcquireSync(1,0);
         if(sync==WAIT_TIMEOUT||sync==DXGI_ERROR_WAIT_TIMEOUT){Fail("AcquireSync key 1 timeout",sync);return NoFrame();}
+        if(sync==WAIT_ABANDONED){
+            Fail("Post-registration AcquireSync key 1 WAIT_ABANDONED (pre-registration key 0 passed)",sync);
+            return Result::Abandoned;
+        }
         if(sync!=S_OK)return Reject("AcquireSync key 1",sync);
         Info f{};f.adapter=adapter.adapter;f.source=adapter.source;
         Step(L"D3DKMTOutputDuplGetFrameInfo");
