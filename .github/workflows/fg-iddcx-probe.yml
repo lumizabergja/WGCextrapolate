@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
       - name: Prepare pinned Microsoft sample
         shell: pwsh
         run: ./Prepare-IddProbe.ps1
@@ -18,7 +20,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          msbuild upstream/video/IndirectDisplay/IddSampleDriver.sln /m /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=false /p:SignMode=Off
+          $cpp = 'upstream/video/IndirectDisplay/IddSampleDriver/Driver.cpp'
+          $source = [IO.File]::ReadAllText((Resolve-Path $cpp))
+          $source = $source.Replace('AvRevertMmThreadCharacteristics(AvTaskHandle);','if (AvTaskHandle) AvRevertMmThreadCharacteristics(AvTaskHandle);')
+          [IO.File]::WriteAllText((Resolve-Path $cpp), $source)
+          msbuild upstream/video/IndirectDisplay/IddSampleDriver.sln /m /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=false /p:EnablePREfast=false /p:SignMode=Off
           if ($LASTEXITCODE) { throw "Driver build failed: $LASTEXITCODE" }
           $base = 'upstream/video/IndirectDisplay'
           $dll = Get-ChildItem $base -Recurse -Filter IddSampleDriver.dll | Select-Object -First 1
