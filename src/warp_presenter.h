@@ -123,6 +123,8 @@ struct Presenter {
     void barrier(ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
         D3D12_RESOURCE_BARRIER t{};t.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;t.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};list->ResourceBarrier(1,&t);
     }
+    static void sampleRealPose(v124::Camera& c){MSG input{};for(unsigned k=0;k<32&&PeekMessageW(&input,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++k)DispatchMessageW(&input);c.lateYaw=angle(mouseX.load());c.latePitch=angle(mouseY.load());}
+    static void samplePredictedPose(v124::Camera& c){c.lateYaw=c.yaw;c.latePitch=c.pitch;}
     void render(ID3D12Resource* current,ID3D12Resource* previous,ID3D12Resource* motion,const void* params,
                 bool real,UINT flags,UINT w,UINT h){
         UINT i=chain->GetCurrentBackBufferIndex();wait(retired[i]);
@@ -152,9 +154,9 @@ struct Presenter {
         // The original Streamline 2.7 path still needs its separate HUD-less color copy.
         v124::Frame frame{};frame.back=back;frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.camera=camera;
         v124::Prepare(frame);
-        if(real){MSG input{};for(unsigned k=0;k<32&&PeekMessageW(&input,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++k)DispatchMessageW(&input);}
-        camera.lateYaw=real?angle(mouseX.load()):camera.yaw;camera.latePitch=real?angle(mouseY.load()):camera.pitch;
-        v124::LatchCamera(camera);check(chain->Present(0,flags),"Native12 Frame Warp Present");v124::PresentEnd();
+        // Obtain the next Streamline token before reading the latest mouse pose.
+        // Preserve real-only correction to avoid double-predicting camera motion.
+        v124::LatchCamera(camera,real?&sampleRealPose:&samplePredictedPose);check(chain->Present(0,flags),"Native12 Frame Warp Present");v124::PresentEnd();
         retired[i]=signal();
     }
     ~Presenter(){if(initialized){try{drain();}catch(...){}v124::Disable();v124::ReleasePlanes();for(auto& b:buffers)b.Reset();chain.Reset();list.Reset();for(auto& a:allocator)a.Reset();on12.Reset();queue.Reset();device.Reset();v124::Shutdown();}}
