@@ -1,8 +1,8 @@
-name: FG WGC 320 Strict Zero Copy Windows 11 26H2
+name: FG WGC 320 Zero Queue Windows 11 26H2
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-26h2-zero-copy']
+    branches: ['fg-wgc-320-26h2-zero-queue']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-26H2-ZeroCopy-Windows-x64
+          name: FG-WGC-320-26H2-ZeroQueue-Windows-x64
           path: |
             bin/FG.exe
             README.md
