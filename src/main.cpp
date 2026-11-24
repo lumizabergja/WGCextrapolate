@@ -134,7 +134,7 @@ struct OverlayWindow {
         if(!GetMonitorInfoW(monitor,&mi))throw Error("GetMonitorInfo failed",GetLastError());
         RECT r=mi.rcMonitor;width=r.right-r.left;height=r.bottom-r.top;
         originX=r.left;originY=r.top;
-        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW;
+        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOREDIRECTIONBITMAP;
         hwnd=CreateWindowExW(normalEx,
             L"FGDXGIOverlay",L"FG",WS_POPUP,r.left,r.top,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!hwnd)throw Error("Create presenter window failed",GetLastError());
@@ -142,7 +142,8 @@ struct OverlayWindow {
         if(!SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA))
             throw Error("SetLayeredWindowAttributes failed",GetLastError());
         // Fail closed: without capture exclusion the presenter can recursively capture itself.
-        if(!SetWindowDisplayAffinity(hwnd,0x00000011))throw Error("WDA_EXCLUDEFROMCAPTURE unsupported",GetLastError());
+        // HWND-specific WGC source; match BothModes presenter (no display-affinity flag).
+        // OS capture indicators remain enabled.
         // Do not show over the control window; engine reveals it only when game has focus.
         ShowWindow(hwnd,SW_HIDE);
         visible=false;
@@ -173,6 +174,7 @@ struct DxDevices {
     ComPtr<ID3D11DeviceContext4> fenceContext;
     ComPtr<ID3D11Fence> retirementFence;
     UINT64 nextFence{};
+    bool retirementNeedsSubmit{};
     UINT64 retiring[kNumCapture]{};
     HANDLE retireEvent{};
     ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
@@ -204,10 +206,10 @@ struct DxDevices {
         Check(fenceContext->Signal(retirementFence.Get(),value),"Signal WGC retirement fence");
         for(int i=0;i<kNumCapture;++i)
             if(leases[i]&&!retiring[i]&&i!=current&&i!=previous)retiring[i]=value;
-        // OFA may have queued work after the previous Present; submit once per
-        // retired batch, without waiting on the render thread.
-        ctx11->Flush();
+        // Let the next real Present or OFA submission flush this batch.
+        retirementNeedsSubmit=true;
     }
+    void SubmitRetirement(){if(retirementNeedsSubmit){ctx11->Flush();retirementNeedsSubmit=false;}}
     UINT64 Completed() const {
         const UINT64 v=retirementFence->GetCompletedValue();
         if(v==UINT64_MAX)throw Error("WGC retirement device removed",dev11->GetDeviceRemovedReason());
@@ -450,8 +452,9 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH,real);return;}
+        if(warp.initialized){warp.present(flags,srcW,srcH,real);retirementNeedsSubmit=false;return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
+        retirementNeedsSubmit=false;
     }
 };
 
@@ -464,8 +467,13 @@ struct Flow11 {
     NvOFGPUBufferHandle motion{};
     ComPtr<ID3D11Texture2D> motionTexture;
     ComPtr<ID3D11ShaderResourceView> motionSRV;
+    ComPtr<ID3D11Fence> flowFence;
+    UINT64 flowSubmitted{};
     void Init(DxDevices& d,int grid){
         owner=&d;
+        ComPtr<ID3D11Device5> fenceDevice;
+        Check(d.dev11.As(&fenceDevice),"Query NvOFA completion fence device");
+        Check(fenceDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&flowFence)),"Create NvOFA completion fence");
         library=LoadLibraryW(L"nvofapi64.dll");if(!library)throw Error("nvofapi64.dll missing");
         auto entry=(decltype(&NvOFAPICreateInstanceD3D11))GetProcAddress(library,"NvOFAPICreateInstanceD3D11");
         if(!entry)throw Error("NvOFAPICreateInstanceD3D11 missing");
@@ -516,13 +524,23 @@ struct Flow11 {
         NvCheck(funcs.nvOFRegisterResourceD3D11(handle,owner->history[slot].Get(),&frames[slot]),
             "Zero-copy rejected: NvOFA direct WGC registration");
     }
-    void Calculate(int current,int previous,bool continuous){
+    bool Ready() const {
+        const UINT64 complete=flowFence->GetCompletedValue();
+        if(complete==UINT64_MAX)throw Error("NvOFA device removed",owner->dev11->GetDeviceRemovedReason());
+        return complete>=flowSubmitted;
+    }
+    bool Calculate(int current,int previous,bool continuous){
+        if(!Ready())return false; // no additional flow job while previous is outstanding
         Register(current);Register(previous);
         NV_OF_EXECUTE_INPUT_PARAMS in{};
         in.inputFrame=frames[current];in.referenceFrame=frames[previous];
         in.disableTemporalHints=continuous?NV_OF_FALSE:NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
         NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
+        Check(owner->fenceContext->Signal(flowFence.Get(),++flowSubmitted),"Signal flow completion");
+        // Explicit submit, never CPU-wait for motion. D3D11 retains implicit resource ordering.
+        owner->ctx11->Flush();owner->retirementNeedsSubmit=false;
+        return true;
     }
     ~Flow11(){
         if(owner)owner->DrainForShutdown();
@@ -604,6 +622,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
         bool slotHeld=false;
         auto waitActivity=[&](LONGLONG deadline,bool needSlot){
+            dx.SubmitRetirement();
             const LONGLONG remaining=deadline-now();
             if(remaining<=0)return;
             LARGE_INTEGER due{};
@@ -658,7 +677,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 realPresented=lastPresented=0;
             }
             LARGE_INTEGER stamp{};
-            const int next=dx.FreeSlot();
+            int next=dx.FreeSlot();
+            if(next<0){dx.SubmitRetirement();flow.Reap();next=dx.FreeSlot();}
 
             // New real frames always win the mailbox, including when a present slot
             // becomes available while we were waiting on the timer.
@@ -702,8 +722,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 flowPending=false;
                 if(now()+ticks(slotMs*.35)<arrival+ticks(interval*1.10)){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
-                    flow.Calculate(current,previous,continuous);
-                    lastFlowSerial=captureSerial;flowReady=true;
+                    flowReady=flow.Calculate(current,previous,continuous);
+                    if(flowReady)lastFlowSerial=captureSerial;
                 }
                 continue;
             }
@@ -719,10 +739,14 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                                         lastPresented+ticks(slotMs*.85));
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
+            // At a prediction deadline, never block the CPU on optical flow.
+            if(!flow.Ready()){waitActivity(std::min(expiry,now()+ticks(.20)),false);continue;}
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
-            const double elapsed=ms(t-realPresented);
+            const LONGLONG submitTime=now();
+            if(submitTime>=expiry){flowReady=false;continue;}
+            const double elapsed=ms(submitTime-realPresented);
             const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
