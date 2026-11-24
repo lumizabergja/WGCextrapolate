@@ -654,7 +654,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
-        // Show the actual capture route in the title, without logging.\n        if(s.rfind(L"Capture path:",0)==0)SetWindowTextW(hwnd,(L"FG UltraDirect V2 - "+s).c_str());
+        // Show the actual capture route in the title, without logging.
+        if(s.rfind(L"Capture path:",0)==0)SetWindowTextW(hwnd,(L"FG UltraDirect V2 - "+s).c_str());
         else if(s==L"Stopped")SetWindowTextW(hwnd,L"FG UltraDirect V2");
         // Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
