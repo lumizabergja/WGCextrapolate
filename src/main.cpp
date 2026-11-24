@@ -432,7 +432,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
-        Present(horizon==0.f);
+        Present(horizon==0.f,UINT(p.centerRadiusPx),UINT(p.centerFeatherPx));
     }
     void PresentReal(UINT current,int /*grid*/){
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
@@ -446,13 +446,13 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->Draw(3,0);
         ID3D11ShaderResourceView* empty=nullptr;
         ctx11->PSSetShaderResources(0,1,&empty);
-        Present(true);
+        Present(true,g_centerRadiusPx.load(std::memory_order_relaxed),g_centerFeatherPx.load(std::memory_order_relaxed));
     }
-    void Present(bool real){
+    void Present(bool real,UINT radius,UINT feather){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH,real);retirementNeedsSubmit=false;return;}
+        if(warp.initialized){warp.present(flags,srcW,srcH,real,radius,feather);retirementNeedsSubmit=false;return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
         retirementNeedsSubmit=false;
     }
