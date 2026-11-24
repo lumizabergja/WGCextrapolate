@@ -210,6 +210,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         bool flowPending=false;
         DWORD captureWaitMs=4;
         bool wasFocused=false;
+        int lastPath=-1;
         int resumeWarmup=0;
 
         unsigned nextPrediction=1;
@@ -264,6 +265,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             int next=mailbox.Take(captureTime);
             captureWaitMs=4;
             if(next>=0){
+                const int path=dx.fallbackFrames.load()?1:0;
+                if(lastPath!=path){lastPath=path;Status(path?L"Capture path: D3D11 fallback":L"Capture path: direct D3D12");}
                 previous=current;
                 current=next;
                 if(previousCaptureAt.QuadPart>0 && captureTime.QuadPart>previousCaptureAt.QuadPart && freq.QuadPart>0){
@@ -651,7 +654,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
-        // No Ready/Running/Stopped display. Keep actionable errors visible.
+        // Show the actual capture route in the title, without logging.\n        if(s.rfind(L"Capture path:",0)==0)SetWindowTextW(hwnd,(L"FG UltraDirect V2 - "+s).c_str());
+        else if(s==L"Stopped")SetWindowTextW(hwnd,L"FG UltraDirect V2");
+        // Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
             MessageBoxW(hwnd,s.c_str(),L"FG error",MB_OK|MB_ICONERROR);
         
