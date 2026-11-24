@@ -27,7 +27,6 @@
 #include <uxtheme.h>
 #include <commctrl.h>
 #include <nvOpticalFlowD3D11.h>
-#include "warp_presenter.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -36,11 +35,11 @@ constexpr int kOpticalFlowGrid = 4; // This app has a fixed NvOFA FAST 4x4 path.
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
-    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109;
+    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109, kPrimaryProbe = 110;
 constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
-HWND g_refresh{};
+HWND g_refresh{},g_primaryProbe{};
 HFONT g_font{},g_fontBold{},g_fontSmall{},g_fontHero{};
 HBRUSH g_bgBrush{},g_fieldBrush{},g_panelBrush{};
 const COLORREF kBackground=RGB(10,14,22),kPanel=RGB(20,27,38),kField=RGB(26,36,49),kText=RGB(233,244,250),kMuted=RGB(145,160,173),kAccent=RGB(61,226,220);
@@ -64,13 +63,7 @@ std::wstring g_statusText;
 struct Game {HWND window;DWORD pid;std::wstring name;};
 std::vector<Game> g_games;
 
-struct SessionState{
-    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather;
-    wchar_t error[512],stage[96];
-};
-SessionState* session{};
 void Status(const std::wstring& s) {
-    if(session && (s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0))lstrcpynW(session->error,s.c_str(),512);
     {std::lock_guard<std::mutex> l(g_statusLock);g_statusText=s;}
     if(g_control) PostMessageW(g_control,WM_FG_STATUS,0,0);
 }
@@ -155,7 +148,6 @@ struct OverlayWindow {
 };
 
 struct DxDevices {
-    fgwarp::Presenter warp;
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
@@ -222,13 +214,12 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
-        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
+        Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+        Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
         D3D11_TEXTURE2D_DESC input{};
         input.Width=w;input.Height=h;input.ArraySize=1;input.MipLevels=1;
@@ -389,7 +380,6 @@ float4 PS(V i):SV_Target {
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
 };
@@ -470,6 +460,7 @@ struct TrackedGame {
             GetWindowThreadProcessId(game.window,&owner)==0||owner!=game.pid;
     }
 };
+#include "primary_probe.h"
 enum class SessionOutcome { Stop, Recreate };
 
 // One session owns ALL DXGI capture, D3D11, and NvOFA resources. Returning from
@@ -492,11 +483,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         const UINT sourceW=gameW,sourceH=gameH;
         if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
             throw Error("Invalid game native capture resolution");
-        if(session){lstrcpynW(session->stage,L"Capture and presenter initialization",96);
-            if(fgwarp::requested.load()){RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
-            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());}}
         DxDevices dx;dx.Init(overlay.hwnd,sourceW,sourceH,overlay.width,overlay.height);
-        if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
         Status(L"Running");
 
         constexpr int ofGrid=kOpticalFlowGrid;
@@ -508,7 +495,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         QueryPerformanceFrequency(&freq);
         LARGE_INTEGER previousCaptureAt{};
         double realIntervalMs=16.667;
-        double pairIntervalMs=0;
         int current=-1,previous=-1;
         bool flowReady=false;
         bool realFramePending=false;
@@ -526,7 +512,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         // DXGI duplication, NvOFA surfaces and swapchain. No second thread
         // can overwrite a texture while it is being sampled or copied.
         while(g_running.load(std::memory_order_acquire)){
-            if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
             MSG message{};
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 TranslateMessage(&message);DispatchMessageW(&message);
@@ -570,21 +555,17 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!dx.Grab(game.window,next,scheduling?0u:captureWaitMs,captureTime))next=-1;
             captureWaitMs=4;
             if(next>=0){
-                if(dx.warp.initialized)dx.warp.sourcePose();
                 previous=current;
                 current=next;
-                pairIntervalMs=0;
                 if(previousCaptureAt.QuadPart>0 && captureTime.QuadPart>previousCaptureAt.QuadPart && freq.QuadPart>0){
                     const double measured=1000.0*double(captureTime.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
-                    if(measured>=1.0 && measured<=80.0){
-                        pairIntervalMs=measured;
+                    if(measured>=1.0 && measured<=80.0)
                         realIntervalMs=std::clamp(realIntervalMs*0.75+measured*0.25,1.0,50.0);
-                    }
                 }
                 previousCaptureAt=captureTime;
                 flowReady=false;
                 realFramePending=true;
-                flowPending=(previous>=0 && resumeWarmup==0 && pairIntervalMs>0);
+                flowPending=(previous>=0 && resumeWarmup==0);
                 if(resumeWarmup>0)--resumeWarmup;
                 nextPrediction=maxPredictions+1;
             }
@@ -654,7 +635,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
             if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
 
-            const float fraction=float(std::min(1.0,predictionMs/pairIntervalMs));
+            const float fraction=float(predictionMs/predictionRealIntervalMs);
             dx.Draw(UINT(current),UINT(previous>=0?previous:current),
                     flow.motionSRV.Get(),fraction,ofGrid);
             ++nextPrediction;
@@ -704,8 +685,6 @@ void Engine(Game game){
     g_engineFinished.store(true,std::memory_order_release);
     if(g_control)PostMessageW(g_control,WM_FG_STOPPED,tracked.Exited()?1u:0u,0);
 }
-#include "session_process.inc"
-
 
 
 void InitUiStyle(HWND hwnd){
@@ -795,14 +774,6 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
-    if(msg==WM_INPUT){
-        RAWINPUT input{};UINT bytes=sizeof(input);
-        if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))==sizeof(input) &&
-           input.header.dwType==RIM_TYPEMOUSE && !(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
-            fgwarp::mouseX.fetch_add(input.data.mouse.lLastX);fgwarp::mouseY.fetch_add(input.data.mouse.lLastY);
-        }
-        return DefWindowProcW(hwnd,msg,wp,lp);
-    }
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -819,6 +790,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             386,135,140,31,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefresh)),nullptr,nullptr);
         StyleControl(g_refresh);
         UiLabel(hwnd,L"FRAME GENERATION",36,176,180,18,true);
+        g_primaryProbe=CreateWindowW(L"BUTTON",L"D3DKMT probe",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+            285,173,240,25,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPrimaryProbe)),nullptr,nullptr);
+        SendMessageW(g_primaryProbe,WM_SETFONT,(WPARAM)g_fontSmall,TRUE);
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
             36,229,160,210,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMultiplier)),nullptr,nullptr);
         StyleControl(g_multi);
@@ -830,9 +804,6 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             218,247,100,27,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDynamicTarget)),nullptr,nullptr);
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
-        HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
-            36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
-        StyleControl(warpCheck);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -887,7 +858,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
            !IsWindowEnabled(g_start)){
             // Engine owns GPU teardown; only the GUI joins after completion.
             if(g_worker.joinable())g_worker.join();
-            EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);
+            EnableWindow(g_start,TRUE);
             EnableWindow(g_stop,FALSE);
             if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         }
@@ -900,9 +871,6 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
-        case 120:
-            fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
-            break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
@@ -956,8 +924,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_userStopRequested.store(false,std::memory_order_release);
             g_lastGameExited.store(false,std::memory_order_release);
             g_engineFinished.store(false,std::memory_order_release);
-            g_running.store(true);EnableWindow(GetDlgItem(hwnd,120),FALSE);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
-            g_worker=std::thread([game]{RunIsolated(game);});
+            g_running.store(true);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
+            const bool probe=SendMessageW(g_primaryProbe,BM_GETCHECK,0,0)==BST_CHECKED;
+            g_worker=std::thread([game,probe]{if(probe)PrimaryProbeEngine(game);else Engine(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
             break;
@@ -973,6 +942,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // No Ready/Running/Stopped display. Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
             MessageBoxW(hwnd,s.c_str(),L"FG error",MB_OK|MB_ICONERROR);
+        else if(s.rfind(L"Probe result:",0)==0)
+            MessageBoxW(hwnd,s.c_str(),L"D3DKMT probe",MB_OK|MB_ICONINFORMATION);
         return 0;
     }
     case WM_FG_STOPPED:
@@ -980,7 +951,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // outer Engine() completion is allowed to unlock another Start.
         if(!g_engineFinished.load(std::memory_order_acquire))return 0;
         if(g_worker.joinable())g_worker.join();
-        EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
+        EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
         if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         return 0;
     case WM_DESTROY:
@@ -998,7 +969,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 } // namespace
-int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR args,int){
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     // Obtain physical monitor/window dimensions rather than DPI-virtualized pixels.
     if(!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
@@ -1006,7 +977,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR args,int){
     o.lpszClassName=L"FGDXGIOverlay";o.hCursor=nullptr;
     o.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));
     if(!RegisterClassW(&o))return 1;
-    if(wcsncmp(args,L"--fg-session ",13)==0)return RunChild(wcstoul(args+13,nullptr,10));
     WNDCLASSW c{};c.hInstance=instance;c.lpfnWndProc=ControlProc;
     c.lpszClassName=L"FGDXGIControl";c.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     c.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));
