@@ -1,0 +1,14 @@
+name: Windows runner diagnostic
+on:
+  workflow_dispatch:
+  push:
+    branches: ['fg-wgc-320-26h2-lowlatency-independent-flip']
+    paths: ['.github/workflows/runner-probe.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - shell: pwsh
+        run: Write-Output "Runner started"
