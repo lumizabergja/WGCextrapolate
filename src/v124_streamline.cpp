@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstddef>
+#include <climits>
 #include <bcrypt.h>
 #include <wintrust.h>
 #include <softpub.h>
