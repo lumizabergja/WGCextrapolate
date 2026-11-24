@@ -76,7 +76,7 @@ struct Presenter {
     // Both captured and extrapolated frames use the same final pose callback.
     // The source pose stays anchored to the captured image; never feed a late
     // target back into the source pose for the following synthetic frame.
-    void present(UINT flags,UINT w,UINT h,bool real){
+    void present(UINT flags,UINT w,UINT h,bool real,UINT radius,UINT feather){
         UINT i=chain->GetCurrentBackBufferIndex();wait(retired[i]);
         check(context->Signal(fence11.Get(),++serial),"Publish DXGI frame");context->Flush();
         check(queue->Wait(fence.Get(),serial),"Wait for DXGI color");
@@ -87,7 +87,7 @@ struct Presenter {
         list->ResourceBarrier(1,&b);list->CopyResource(back.Get(),image.Get());
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);list->ResourceBarrier(1,&b);check(list->Close(),"Warp copy close");
         ID3D12CommandList* lists[]={list.Get()};queue->ExecuteCommandLists(1,lists);
-        v124::Frame frame{};frame.back=back.Get();frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.camera=camera;
+        v124::Frame frame{};frame.back=back.Get();frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.centerRadiusPx=radius;frame.centerFeatherPx=feather;frame.camera=camera;
         v124::Prepare(frame);
         // Match the uploaded real-only late-input behavior.
         if(real){
