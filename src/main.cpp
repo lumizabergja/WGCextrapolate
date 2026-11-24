@@ -1,4 +1,4 @@
-// V15 Clean v16 with DXGI Desktop Duplication capture.
+// FG native D3DKMT output duplication ONLY; DXGI used for presentation.
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -58,7 +58,7 @@ constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 std::atomic<int> g_fgMode{2};
 std::atomic<int> g_targetHz{320};
 std::atomic<bool> g_nativeRequested{true};
-// 0=DXGI, 1=trying native, 2=native frames validated, 3=DXGI fallback.
+// 1=native initialization, 2=native frames validated; no other capture backend.
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -176,10 +176,8 @@ struct DxDevices {
     ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
     UINT srcW{},srcH{},screenW{},screenH{};
     ComPtr<IDXGIAdapter> matchingAdapter;
-    ComPtr<IDXGIOutputDuplication> duplication;
     ComPtr<IDXGIOutput1> captureOutput;
     fgnative::Capture native;
-    bool nativeActive{};
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
     void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
@@ -210,11 +208,10 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        if(g_nativeRequested.load()){
-            if(session)InterlockedExchange(&session->backend,1);
-            nativeActive=native.Init(dev11.Get(),matchingAdapter.Get(),desktop);
-            if(!nativeActive)Fallback();
-        }else OpenDXGI();
+        if(session)InterlockedExchange(&session->backend,1);
+        native.stageCallback=[](const wchar_t* stage){if(session)lstrcpynW(session->stage,stage,96);};
+        if(!native.Init(dev11.Get(),matchingAdapter.Get(),desktop))
+            throw Error(native.detail);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -315,65 +312,18 @@ float4 PS(V i):SV_Target {
         D3D11_BUFFER_DESC bd{};bd.ByteWidth=48;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
     }
-    void OpenDXGI(){
-        // Original DXGI fallback: preserve existing behavior and driver support.
-        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
-    }
-    void Fallback(){
-        const bool wasVerified=native.verified;
-        native.Reset();nativeActive=false;g_nativeRequested.store(false);
-        if(session)InterlockedExchange(&session->backend,3);
-        // If a native frame was already presented, restart the whole GPU session
-        // to discard any cross-backend motion history and hide the old overlay.
-        if(wasVerified)throw DisplayChanged{};
-        OpenDXGI();
-    }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
-        if(nativeActive){
-            RECT client{};POINT origin{};
-            if(!GetClientRect(game,&client)||!ClientToScreen(game,&origin))return false;
-            if(UINT(client.right)!=srcW||UINT(client.bottom)!=srcH||MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
-            const LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
-            if(x<0||y<0||UINT(x)+srcW>native.w||UINT(y)+srcH>native.h||srcW<64||srcH<64){Fallback();return false;}
-            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
-            const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
-            if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
-            if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
-            Fallback();
-        }
-
-        DXGI_OUTDUPL_FRAME_INFO info{};
-        ComPtr<IDXGIResource> resource;
-        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
-        if(hr==DXGI_ERROR_WAIT_TIMEOUT)return false;
-        CheckDuplication(hr,"Acquire desktop frame");
-        struct Lease {
-            IDXGIOutputDuplication* owner;
-            ~Lease(){if(owner)owner->ReleaseFrame();}
-        } lease{duplication.Get()};
-        // DXGI has already masked protected pixels in the acquired texture.
-        bool updated=info.LastPresentTime.QuadPart!=0;
-        if(updated){
-            RECT client{};
-            POINT origin{};
-            if(!GetClientRect(game,&client) || !ClientToScreen(game,&origin))return false;
-            if(UINT(client.right)!=srcW || UINT(client.bottom)!=srcH ||
-               MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
-            LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
-            if(x<0 || y<0 || x+LONG(srcW)>desktop.DesktopCoordinates.right-desktop.DesktopCoordinates.left ||
-               y+LONG(srcH)>desktop.DesktopCoordinates.bottom-desktop.DesktopCoordinates.top)
-                throw Error("Keep the entire game client on the selected monitor");
-            ComPtr<ID3D11Texture2D> texture;
-            Check(resource.As(&texture),"Read desktop texture");
-            D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
-            if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
-            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
-            ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,texture.Get(),0,&region);
-            timestamp=info.LastPresentTime;
-        }
-        lease.owner=nullptr;
-        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
-        return updated;
+        RECT client{};POINT origin{};
+        if(!GetClientRect(game,&client)||!ClientToScreen(game,&origin))return false;
+        if(UINT(client.right)!=srcW||UINT(client.bottom)!=srcH||MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
+        const LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
+        if(x<0||y<0||UINT(x)+srcW>native.w||UINT(y)+srcH>native.h||srcW<64||srcH<64)
+            throw Error("D3DKMT source rectangle outside native output");
+        D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
+        const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
+        if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
+        if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
+        throw Error(native.detail);
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
     struct Params{
@@ -598,7 +548,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 captureWaitMs=4;
             }
 
-            // Always poll DXGI capture before a queued prediction. New real
+            // Always poll native D3DKMT capture before a queued prediction. New real
             // frames supersede the old prediction train, as in V35's mailbox.
             LARGE_INTEGER captureTime{};
             int next=(current+1)%kNumCapture;
@@ -699,7 +649,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         overlay.SetVisible(false);
         Status(L"Stopped");
     }catch(const DisplayChanged&){
-        return SessionOutcome::Recreate;
+        if(!tracked.Exited()&&!g_userStopRequested.load())Status(L"Source error: D3DKMT output or game geometry changed. Capture stopped; press Start to retry.");
+        return SessionOutcome::Stop;
     }catch(const std::exception& e){
         if(!tracked.Exited() && !g_userStopRequested.load())
             Status(L"FG error: "+Wide(e.what()));
@@ -724,7 +675,7 @@ void Engine(Game game){
         const ULONGLONG now=GetTickCount64();
         if(now-windowStart>10000){windowStart=now;restartCount=0;}
         if(++restartCount>3){
-            Status(L"Source error: DXGI capture repeatedly invalidated. "
+            Status(L"Source error: D3DKMT capture repeatedly invalidated. "
                    L"Full capture restart failed; check the display mode and driver.");
             break;
         }
@@ -869,10 +820,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
             36,285,220,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
         StyleControl(warpCheck);
-        HWND nativeCheck=CreateWindowW(L"BUTTON",L"D3DKMT (experimental)",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+        HWND nativeCheck=CreateWindowW(L"STATIC",L"D3DKMT Native Only",WS_CHILD|WS_VISIBLE,
             278,285,248,30,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
         StyleControl(nativeCheck,false,true);
-        SendMessageW(nativeCheck,BM_SETCHECK,BST_CHECKED,0);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -941,7 +891,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:{
         switch(LOWORD(wp)){
         case 121:
-            g_nativeRequested.store(IsDlgButtonChecked(hwnd,121)==BST_CHECKED);
+            g_nativeRequested.store(true);
             break;
         case 120:
             fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
@@ -1013,7 +963,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_FG_BACKEND:
-        SetWindowTextW(hwnd,wp==1?L"FG - testing D3DKMT":wp==2?L"FG - D3DKMT experimental":wp==3?L"FG - DXGI fallback":L"FG - DXGI");
+        SetWindowTextW(hwnd,wp==2?L"FG - D3DKMT Native: validated frames":L"FG - D3DKMT Native Only: waiting");
         return 0;
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
