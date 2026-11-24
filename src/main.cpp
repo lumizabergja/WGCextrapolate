@@ -26,7 +26,9 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <commctrl.h>
-#include <nvOpticalFlowD3D11.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <nvOpticalFlowD3D12.h>
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -147,302 +149,7 @@ struct OverlayWindow {
     ~OverlayWindow(){if(hwnd)DestroyWindow(hwnd);g_overlay=nullptr;}
 };
 
-struct DxDevices {
-    ComPtr<ID3D11Device> dev11;
-    ComPtr<ID3D11DeviceContext> ctx11;
-    ComPtr<IDXGISwapChain1> swap;
-    ComPtr<IDXGISwapChain2> lowLatencySwap;
-    HANDLE frameReady{}; // Closed before releasing the swapchain.
-    bool allowTearing{};
-    ComPtr<ID3D11Texture2D> backBuffer;
-    ComPtr<ID3D11RenderTargetView> rtv;
-    ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
-    ComPtr<ID3D11SamplerState> sampler;
-    ComPtr<ID3D11Buffer> constants;
-    ComPtr<ID3D11Texture2D> history[kNumCapture];
-    ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
-    UINT srcW{},srcH{},screenW{},screenH{};
-    ComPtr<IDXGIAdapter> matchingAdapter;
-    ComPtr<IDXGIOutputDuplication> duplication;
-    DXGI_OUTPUT_DESC desktop{};
-    ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
-    void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
-        srcW=w;srcH=h;screenW=outputW;screenH=outputH;
-        HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
-        ComPtr<IDXGIFactory1> factory;
-        Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"Create DXGI factory");
-        ComPtr<IDXGIOutput1> captureOutput;
-        for(UINT i=0;!captureOutput;++i){
-            ComPtr<IDXGIAdapter1> adapter;
-            HRESULT hr=factory->EnumAdapters1(i,&adapter);
-            if(hr==DXGI_ERROR_NOT_FOUND)break;
-            Check(hr,"Enumerate adapters");
-            for(UINT j=0;;++j){
-                ComPtr<IDXGIOutput> candidate;
-                hr=adapter->EnumOutputs(j,&candidate);
-                if(hr==DXGI_ERROR_NOT_FOUND)break;
-                Check(hr,"Enumerate outputs");
-                Check(candidate->GetDesc(&desktop),"Read output description");
-                if(desktop.Monitor!=monitor)continue;
-                Check(candidate.As(&captureOutput),"Query duplication output");
-                matchingAdapter=adapter;
-                break;
-            }
-        }
-        if(!captureOutput)throw Error("Selected monitor unavailable");
-        if(desktop.Rotation!=DXGI_MODE_ROTATION_IDENTITY)
-            throw Error("Select an unrotated monitor");
-        D3D_FEATURE_LEVEL obtained{};
-        Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
-        ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
-        DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
-        sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sc.BufferCount=2;sc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;sc.Scaling=DXGI_SCALING_STRETCH;
-        sc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
-        // DXGI cannot have a literal maximum frame latency of 0: its minimum is 1.
-        // Retain the newest source while the display slot is busy and
-        // do not submit a new present until DXGI frees a frame slot.
-        ComPtr<IDXGIFactory5> factory5;
-        if(SUCCEEDED(f2.As(&factory5))){
-            BOOL supported=FALSE;
-            if(SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                    &supported,sizeof(supported))) && supported)
-                allowTearing=true;
-        }
-        sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-            (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
-        Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
-        Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
-        frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
-        if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
-        Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
-        D3D11_TEXTURE2D_DESC input{};
-        input.Width=w;input.Height=h;input.ArraySize=1;input.MipLevels=1;
-        input.SampleDesc.Count=1;input.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
-        input.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        for(int i=0;i<kNumCapture;++i){
-            Check(dev11->CreateTexture2D(&input,nullptr,&history[i]),"Allocate capture history");
-            Check(dev11->CreateShaderResourceView(history[i].Get(),nullptr,&frameSRV[i]),"Capture history SRV");
-        }
-        // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
-        // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
-        static const char* shader=R"HLSL(
-Texture2D<float4> currentFrame:register(t0);
-Texture2D<int2> rawFlow:register(t1);
-Texture2D<float4> previousFrame:register(t2);
-SamplerState samp:register(s0);
-cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float _padding1;float centerRadiusPx;float centerFeatherPx;float2 outputSize;};
-struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;};
-// Use native block centers, including partial cells on odd-sized captures.
-float2 flow(float2 uv){
-    uint fw,fh;rawFlow.GetDimensions(fw,fh);
-    float2 pos=uv/(motionInv*gridSize*gridExtent)*float2(fw,fh)-0.5;
-    int2 base=int2(floor(pos));float2 f=frac(pos);
-    int2 edge=int2(int(fw)-1,int(fh)-1);
-    int2 a=clamp(base,int2(0,0),edge),b=clamp(base+int2(1,0),int2(0,0),edge);
-    int2 c=clamp(base+int2(0,1),int2(0,0),edge),d=clamp(base+int2(1,1),int2(0,0),edge);
-    float2 v00=float2(rawFlow.Load(int3(a,0)))*(1.0/32.0);
-    float2 v10=float2(rawFlow.Load(int3(b,0)))*(1.0/32.0);
-    float2 v01=float2(rawFlow.Load(int3(c,0)))*(1.0/32.0);
-    float2 v11=float2(rawFlow.Load(int3(d,0)))*(1.0/32.0);
-    return lerp(lerp(v00,v10,f.x),lerp(v01,v11,f.x),f.y)*motionInv;
-}
-float cutSample(float2 uv){float2 q=uv+flow(uv);if(any(q<0)||any(q>1))return 0;return dot(abs(currentFrame.SampleLevel(samp,uv,0).rgb-previousFrame.SampleLevel(samp,q,0).rgb),float3(.333333,.333333,.333333));}
-V VS(uint id:SV_VertexID){
-    V o;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);
-    o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);o.scene=0;
-    [branch] if(horizon>0.00001){float e=cutSample(float2(.2,.3))+cutSample(float2(.8,.3))+cutSample(float2(.5,.5))+cutSample(float2(.2,.7))+cutSample(float2(.8,.7));o.scene=smoothstep(.19,.32,e*.2);}
-    return o;
-}
-float centerMask(float2 uv){
-    // The center mask affects only predicted pixels, never real captured frames.
-    // 0px radius + 0px feather is a full bypass (no center protection).
-    if(centerRadiusPx<=0.0 && centerFeatherPx<=0.0)return 1.0;
-    float distancePx=length((uv-float2(.5,.5))*outputSize);
-    if(centerFeatherPx<=0.0)return distancePx>centerRadiusPx?1.0:0.0;
-    return smoothstep(centerRadiusPx,centerRadiusPx+centerFeatherPx,distancePx);
-}
-float4 PS(V i):SV_Target {
-    // NVIDIA's stretched scanout is already scaled into native game-size textures.
-    float2 uv=i.uv;
-    float4 base=currentFrame.SampleLevel(samp,uv,0);
-    [branch] if(horizon<=0.00001 || i.scene>0.9)return base;
-    float2 v=flow(uv),q=uv+horizon*v;
-    if(any(q<0)||any(q>1))return base;
-    float2 mv=flow(q),old=q+mv;
-    if(any(old<0)||any(old>1)||length(mv)>maxMotion)return base;
-    float4 next=currentFrame.SampleLevel(samp,q,0);
-    float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
-    float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
-    float confidence=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
-    return lerp(base,next,saturate(confidence*centerMask(uv)));
-}
-)HLSL";
-        ComPtr<ID3DBlob> vsBlob,psBlob,errs;
-        HRESULT hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs);
-        if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"VS compile",hr);
-        Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&vs),"VertexShader");
-        errs.Reset();hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs);
-        if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"PS compile",hr);
-        Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
-        D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
-        Check(dev11->CreateSamplerState(&sd,&sampler),"Sampler");
-        D3D11_BUFFER_DESC bd{};bd.ByteWidth=48;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
-        Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
-    }
-    bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
-        DXGI_OUTDUPL_FRAME_INFO info{};
-        ComPtr<IDXGIResource> resource;
-        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
-        if(hr==DXGI_ERROR_WAIT_TIMEOUT)return false;
-        CheckDuplication(hr,"Acquire desktop frame");
-        struct Lease {
-            IDXGIOutputDuplication* owner;
-            ~Lease(){if(owner)owner->ReleaseFrame();}
-        } lease{duplication.Get()};
-        // DXGI has already masked protected pixels in the acquired texture.
-        bool updated=info.LastPresentTime.QuadPart!=0;
-        if(updated){
-            RECT client{};
-            POINT origin{};
-            if(!GetClientRect(game,&client) || !ClientToScreen(game,&origin))return false;
-            if(UINT(client.right)!=srcW || UINT(client.bottom)!=srcH ||
-               MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
-            LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
-            if(x<0 || y<0 || x+LONG(srcW)>desktop.DesktopCoordinates.right-desktop.DesktopCoordinates.left ||
-               y+LONG(srcH)>desktop.DesktopCoordinates.bottom-desktop.DesktopCoordinates.top)
-                throw Error("Keep the entire game client on the selected monitor");
-            ComPtr<ID3D11Texture2D> texture;
-            Check(resource.As(&texture),"Read desktop texture");
-            D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
-            if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
-            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
-            ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,texture.Get(),0,&region);
-            timestamp=info.LastPresentTime;
-        }
-        lease.owner=nullptr;
-        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
-        return updated;
-    }
-    // 48-byte constant buffer: motion settings plus center-only protection.
-    struct Params{
-        float horizon, invW, invH, maxMotion;
-        float flowW, flowH, grid, padding1;
-        float centerRadiusPx,centerFeatherPx,outputW,outputH;
-    };
-    static_assert(sizeof(Params)==48);
-    void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
-              float horizon,int grid){
-        ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
-        // Optical flow and extrapolation use the captured client resolution;
-        // presentation covers the full monitor, with no selectable letterboxing.
-        const Params p{horizon,1.0f/float(srcW),1.0f/float(srcH),0.12f,
-              float((srcW+UINT(grid)-1)/UINT(grid)),
-              float((srcH+UINT(grid)-1)/UINT(grid)),
-              float(grid),0.0f,
-              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
-              float(g_centerFeatherPx.load(std::memory_order_relaxed)),
-              float(screenW),float(screenH)};
-        ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
-        D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
-        ctx11->RSSetViewports(1,&vp);
-        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
-        ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(ps.Get(),nullptr,0);
-        ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-        ctx11->VSSetConstantBuffers(0,1,constants.GetAddressOf());
-        ctx11->PSSetShaderResources(0,3,views);
-        ctx11->VSSetShaderResources(0,3,views); // source's scene-cut detector runs in VS
-        ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
-        ctx11->VSSetSamplers(0,1,sampler.GetAddressOf());
-        ctx11->Draw(3,0);
-        ID3D11ShaderResourceView* nullViews[3]{};
-        ctx11->PSSetShaderResources(0,3,nullViews);
-        ctx11->VSSetShaderResources(0,3,nullViews);
-        Present();
-    }
-    void PresentReal(UINT current,int grid){
-        if(srcW!=screenW || srcH!=screenH){
-            Draw(current,current,nullptr,0.f,grid);
-            return;
-        }
-        // Capture history and flip buffer share BGRA8, sample count and extent.
-        ctx11->CopyResource(backBuffer.Get(),history[current].Get());
-        Present();
-    }
-    void Present(){
-        // Present with sync=0; request tearing only when supported and enabled
-        // on the swapchain.  This leaves actual Independent Flip up to Windows.
-        const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        Check(swap->Present(0,flags),"DX11 low-latency Present");
-    }
-};
-
-struct Flow11 {
-    HMODULE library{};
-    NV_OF_D3D11_API_FUNCTION_LIST funcs{};
-    NvOFHandle handle{};
-    NvOFGPUBufferHandle frames[kNumCapture]{};
-    NvOFGPUBufferHandle motion{};
-    ComPtr<ID3D11Texture2D> motionTexture;
-    ComPtr<ID3D11ShaderResourceView> motionSRV;
-    void Init(DxDevices& d,int grid){
-        library=LoadLibraryW(L"nvofapi64.dll");if(!library)throw Error("nvofapi64.dll missing");
-        auto entry=(decltype(&NvOFAPICreateInstanceD3D11))GetProcAddress(library,"NvOFAPICreateInstanceD3D11");
-        if(!entry)throw Error("NvOFAPICreateInstanceD3D11 missing");
-        NvCheck(entry(NV_OF_API_VERSION,&funcs),"NVOFA D3D11 API initialization");
-        if(!funcs.nvCreateOpticalFlowD3D11||!funcs.nvOFInit||!funcs.nvOFExecute||
-            !funcs.nvOFRegisterResourceD3D11||!funcs.nvOFUnregisterResourceD3D11)
-            throw Error("NVOFA DX11 function list incomplete");
-        NvCheck(funcs.nvCreateOpticalFlowD3D11(d.dev11.Get(),d.ctx11.Get(),&handle),"NVOFA Create D3D11");
-        NV_OF_INIT_PARAMS init{};init.width=d.srcW;init.height=d.srcH;
-        init.outGridSize=grid==1?NV_OF_OUTPUT_VECTOR_GRID_SIZE_1:
-            grid==2?NV_OF_OUTPUT_VECTOR_GRID_SIZE_2:NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
-        init.mode=NV_OF_MODE_OPTICALFLOW;init.perfLevel=NV_OF_PERF_LEVEL_FAST;
-        init.enableOutputCost=NV_OF_FALSE;
-        init.enableExternalHints=NV_OF_FALSE;init.inputBufferFormat=NV_OF_BUFFER_FORMAT_ABGR8;
-        NvCheck(funcs.nvOFInit(handle,&init),"NVOFA init (selected grid FAST, ABGR8)");
-        // Sharing is only valid if OFA accepts this exact D3D11 texture format.
-        // The history texture is registered once and sampled directly.
-        UINT count=0;
-        NvCheck(funcs.nvOFGetSurfaceFormatCountD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,&count),"NVOFA query input format count");
-        if(!count||count>32)throw Error("NVOFA input formats unavailable");
-        std::vector<DXGI_FORMAT> formats(count);
-        NvCheck(funcs.nvOFGetSurfaceFormatD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,formats.data()),"NVOFA query input formats");
-        if(std::find(formats.begin(),formats.end(),DXGI_FORMAT_B8G8R8A8_UNORM)==formats.end())
-            throw Error("NVOFA cannot accept BGRA capture history");
-        for(int i=0;i<kNumCapture;++i){
-            NvCheck(funcs.nvOFRegisterResourceD3D11(handle,d.history[i].Get(),&frames[i]),"NVOFA register D3D11 capture history");
-        }
-        const UINT fw=(d.srcW+UINT(grid)-1)/UINT(grid),fh=(d.srcH+UINT(grid)-1)/UINT(grid);
-        D3D11_TEXTURE2D_DESC desc{};desc.Width=fw;desc.Height=fh;desc.MipLevels=1;desc.ArraySize=1;
-        desc.Format=DXGI_FORMAT_R16G16_SINT;desc.SampleDesc.Count=1;
-        desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        Check(d.dev11->CreateTexture2D(&desc,nullptr,&motionTexture),"Create NvOFA output texture");
-        NvCheck(funcs.nvOFRegisterResourceD3D11(handle,motionTexture.Get(),&motion),"NVOFA register motion output");
-        Check(d.dev11->CreateShaderResourceView(motionTexture.Get(),nullptr,&motionSRV),"NvOFA motion SRV");
-    }
-    void Calculate(int current,int previous){
-        NV_OF_EXECUTE_INPUT_PARAMS in{};
-        in.inputFrame=frames[current];in.referenceFrame=frames[previous];
-        NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
-        NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
-    }
-    ~Flow11(){
-        if(handle){
-            for(auto &f:frames)if(f&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(f);
-            if(motion&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(motion);
-            if(funcs.nvOFDestroy)funcs.nvOFDestroy(handle);
-        }
-        if(library)FreeLibrary(library);
-    }
-};
+#include "ultradirect.h"
 
 // A user may Alt+Tab or minimize; neither is an exit. Check the original
 // HWND/PID identity and, when permitted, the process termination signal.
@@ -460,7 +167,7 @@ struct TrackedGame {
             GetWindowThreadProcessId(game.window,&owner)==0||owner!=game.pid;
     }
 };
-#include "primary_probe.h"
+
 enum class SessionOutcome { Stop, Recreate };
 
 // One session owns ALL DXGI capture, D3D11, and NvOFA resources. Returning from
@@ -631,13 +338,14 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const double predictionMs=nextPrediction*slotMs;
             // A successful wait consumes a presentation slot. Once acquired,
             // always submit this frame before polling the handle again.
+            if(!DxDevices::Done(dx.ofFence.Get(),dx.ofValue)){SwitchToThread();continue;}
             const DWORD ready=WaitForSingleObject(dx.frameReady,0);
             if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
             if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
 
             const float fraction=float(predictionMs/predictionRealIntervalMs);
             dx.Draw(UINT(current),UINT(previous>=0?previous:current),
-                    flow.motionSRV.Get(),fraction,ofGrid);
+                    flow.motionSRV,fraction,ofGrid);
             ++nextPrediction;
             captureWaitMs=(nextPrediction<=maxPredictions)?0:4;
         }
@@ -790,9 +498,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             386,135,140,31,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefresh)),nullptr,nullptr);
         StyleControl(g_refresh);
         UiLabel(hwnd,L"FRAME GENERATION",36,176,180,18,true);
-        g_primaryProbe=CreateWindowW(L"BUTTON",L"D3DKMT probe",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-            285,173,240,25,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPrimaryProbe)),nullptr,nullptr);
-        SendMessageW(g_primaryProbe,WM_SETFONT,(WPARAM)g_fontSmall,TRUE);
+        UiLabel(hwnd,L"UltraDirect D3D12",285,176,240,18,true);
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
             36,229,160,210,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMultiplier)),nullptr,nullptr);
         StyleControl(g_multi);
@@ -925,8 +631,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_lastGameExited.store(false,std::memory_order_release);
             g_engineFinished.store(false,std::memory_order_release);
             g_running.store(true);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
-            const bool probe=SendMessageW(g_primaryProbe,BM_GETCHECK,0,0)==BST_CHECKED;
-            g_worker=std::thread([game,probe]{if(probe)PrimaryProbeEngine(game);else Engine(game);});
+            g_worker=std::thread([game]{Engine(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
             break;
@@ -942,8 +647,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // No Ready/Running/Stopped display. Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
             MessageBoxW(hwnd,s.c_str(),L"FG error",MB_OK|MB_ICONERROR);
-        else if(s.rfind(L"Probe result:",0)==0)
-            MessageBoxW(hwnd,s.c_str(),L"D3DKMT probe",MB_OK|MB_ICONINFORMATION);
+        
         return 0;
     }
     case WM_FG_STOPPED:
