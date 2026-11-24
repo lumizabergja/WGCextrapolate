@@ -1,13 +1,13 @@
-name: FG WGC 320 Reflex Low Latency Windows 11 26H2
+name: FG WGC 320 Native D3D12 Frame Warp
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-26h2-reflex-lowlatency']
+    branches: ['fg-wgc-320-26h2-native12-warp']
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Compile with MSVC x64
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-26H2-Reflex-LowLatency-Windows-x64
+          name: FG-WGC-320-26H2-Native12-Warp-Windows-x64
           path: |
             bin/FG.exe
             README.md
