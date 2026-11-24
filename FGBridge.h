@@ -34,7 +34,9 @@ public:
             a.Format!=b.Format||a.MipLevels!=b.MipLevels||a.ArraySize!=b.ArraySize||
             a.SampleDesc.Count!=1||b.SampleDesc.Count!=1)return;
         const HRESULT hr=mutex->AcquireSync(0,0);
-        if(hr==WAIT_TIMEOUT)return; // drop this update instead of blocking IddCx
+        // AcquireSync documents the raw WAIT_TIMEOUT status (not HRESULT_FROM_WIN32).
+#pragma warning(suppress:6221)
+        if(hr==static_cast<HRESULT>(WAIT_TIMEOUT))return; // drop update rather than block
         if(hr!=S_OK){Reset();return;}
         ctx->CopyResource(texture.Get(),input.Get());
         ctx->Flush();
