@@ -1,4 +1,4 @@
-// V15 Clean v16 with DXGI Desktop Duplication capture.
+// FG 320: native Windows Graphics Capture (Windows 11 24H2/26H2).
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -28,6 +28,7 @@
 #include <commctrl.h>
 #include <nvOpticalFlowD3D11.h>
 #include "warp_presenter.h"
+#include "wgc_capture.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -48,7 +49,7 @@ std::atomic<bool> g_running{false};
 // Separate user-requested Stop from a transient invalidated capture session.
 // The latter ends one GPU session before the supervisor restarts it.
 std::atomic<bool> g_userStopRequested{false};
-// The presenter may temporarily stop during DXGI capture recovery. Only the outer
+// The presenter may temporarily stop during WGC capture recovery. Only the outer
 // Engine() completion marks the launcher as ready for a fresh Start.
 std::atomic<bool> g_engineFinished{true};
 std::atomic<bool> g_lastGameExited{false};
@@ -81,11 +82,6 @@ std::runtime_error Error(const std::string& what,HRESULT hr=0) {
 void Check(HRESULT hr,const char* what) {if(FAILED(hr)) throw Error(what,hr);}
 void NvCheck(NV_OF_STATUS s,const char* what) {if(s!=NV_OF_SUCCESS)throw Error(what,static_cast<HRESULT>(s));}
 struct DisplayChanged {};
-void CheckDuplication(HRESULT hr,const char* operation){
-    if(hr==DXGI_ERROR_ACCESS_LOST || hr==DXGI_ERROR_SESSION_DISCONNECTED ||
-       hr==DXGI_ERROR_MODE_CHANGE_IN_PROGRESS)throw DisplayChanged{};
-    Check(hr,operation);
-}
 std::wstring Wide(const std::string& s) {int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,nullptr,0);if(n<1)return L"Error";std::wstring w(size_t(n),L'\0');MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,w.data(),n);w.pop_back();return w;}
 BOOL CALLBACK FindWindows(HWND h,LPARAM) {
     if(!IsWindowVisible(h)||h==g_control||h==g_overlay||GetWindow(h,GW_OWNER))return TRUE;
@@ -172,10 +168,10 @@ struct DxDevices {
     ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
     UINT srcW{},srcH{},screenW{},screenH{};
     ComPtr<IDXGIAdapter> matchingAdapter;
-    ComPtr<IDXGIOutputDuplication> duplication;
+    WgcCapture capture;
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
-    void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
+    void Init(HWND output,const wgc::GraphicsCaptureItem& item,UINT w,UINT h,UINT outputW,UINT outputH){
         srcW=w;srcH=h;screenW=outputW;screenH=outputH;
         HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
         ComPtr<IDXGIFactory1> factory;
@@ -193,7 +189,7 @@ struct DxDevices {
                 Check(hr,"Enumerate outputs");
                 Check(candidate->GetDesc(&desktop),"Read output description");
                 if(desktop.Monitor!=monitor)continue;
-                Check(candidate.As(&captureOutput),"Query duplication output");
+                Check(candidate.As(&captureOutput),"Query monitor output");
                 matchingAdapter=adapter;
                 break;
             }
@@ -204,7 +200,7 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
+        capture.Open(dev11.Get(),item,w,h);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -306,38 +302,25 @@ float4 PS(V i):SV_Target {
         Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
     }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
-        DXGI_OUTDUPL_FRAME_INFO info{};
-        ComPtr<IDXGIResource> resource;
-        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
-        if(hr==DXGI_ERROR_WAIT_TIMEOUT)return false;
-        CheckDuplication(hr,"Acquire desktop frame");
-        struct Lease {
-            IDXGIOutputDuplication* owner;
-            ~Lease(){if(owner)owner->ReleaseFrame();}
-        } lease{duplication.Get()};
-        // DXGI has already masked protected pixels in the acquired texture.
-        bool updated=info.LastPresentTime.QuadPart!=0;
-        if(updated){
-            RECT client{};
-            POINT origin{};
-            if(!GetClientRect(game,&client) || !ClientToScreen(game,&origin))return false;
-            if(UINT(client.right)!=srcW || UINT(client.bottom)!=srcH ||
-               MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
-            LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
-            if(x<0 || y<0 || x+LONG(srcW)>desktop.DesktopCoordinates.right-desktop.DesktopCoordinates.left ||
-               y+LONG(srcH)>desktop.DesktopCoordinates.bottom-desktop.DesktopCoordinates.top)
-                throw Error("Keep the entire game client on the selected monitor");
-            ComPtr<ID3D11Texture2D> texture;
-            Check(resource.As(&texture),"Read desktop texture");
-            D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
-            if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
-            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
-            ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,texture.Get(),0,&region);
-            timestamp=info.LastPresentTime;
-        }
-        lease.owner=nullptr;
-        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
-        return updated;
+        if(!IsWindow(game))return false;
+        if(MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
+        const auto frame=capture.Latest(timeout);
+        if(!frame)return false;
+        const auto size=frame.ContentSize();
+        if(size.Width!=int(srcW)||size.Height!=int(srcH))throw DisplayChanged{};
+        const auto texture=frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        ComPtr<ID3D11Texture2D> source;
+        Check(texture->GetInterface(IID_PPV_ARGS(&source)),"WGC texture");
+        D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);
+        if(desc.Width<srcW||desc.Height<srcH)throw DisplayChanged{};
+        D3D11_BOX box{0,0,0,srcW,srcH,1};
+        ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,source.Get(),0,&box);
+        LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);
+        const auto ticks=frame.SystemRelativeTime().count();
+        timestamp.QuadPart=static_cast<LONGLONG>(static_cast<long double>(ticks)*frequency.QuadPart/10000000.0L);
+        if(timestamp.QuadPart<=0)QueryPerformanceCounter(&timestamp);
+        frame.Close();
+        return true;
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
     struct Params{
@@ -374,7 +357,7 @@ float4 PS(V i):SV_Target {
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
-        Present();
+        Present(horizon==0.f);
     }
     void PresentReal(UINT current,int grid){
         if(srcW!=screenW || srcH!=screenH){
@@ -383,13 +366,13 @@ float4 PS(V i):SV_Target {
         }
         // Capture history and flip buffer share BGRA8, sample count and extent.
         ctx11->CopyResource(backBuffer.Get(),history[current].Get());
-        Present();
+        Present(true);
     }
-    void Present(){
+    void Present(bool real){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH);return;}
+        if(warp.initialized){warp.present(flags,srcW,srcH,real);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
 };
@@ -472,15 +455,17 @@ struct TrackedGame {
 };
 enum class SessionOutcome { Stop, Recreate };
 
-// One session owns ALL DXGI capture, D3D11, and NvOFA resources. Returning from
+// One session owns ALL WGC capture, D3D11, and NvOFA resources. Returning from
 // this function destroys them in reverse lifetime order before another attempt.
 SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
     try {
         if(tracked.Exited())return SessionOutcome::Stop;
         // D3D11 resources are created on this single render thread.
         OverlayWindow overlay;overlay.Init(game.window);
-        RECT rc{};GetClientRect(game.window,&rc);
-        const UINT gameW=UINT(rc.right-rc.left),gameH=UINT(rc.bottom-rc.top);
+        WgcApartment apartment;
+        const auto item=WgcCapture::ItemForWindow(game.window);
+        const auto size=item.Size();
+        const UINT gameW=UINT(size.Width),gameH=UINT(size.Height);
         MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);
         UINT monitorHz=320;
         if(GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)){
@@ -488,21 +473,21 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>=30)
                 monitorHz=dm.dmDisplayFrequency;
         }
-        // Duplicate output pixels inside the selected client rectangle.
+        // Capture the selected window directly (full WGC content extent).
         const UINT sourceW=gameW,sourceH=gameH;
         if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
             throw Error("Invalid game native capture resolution");
         if(session){lstrcpynW(session->stage,L"Capture and presenter initialization",96);
             if(fgwarp::requested.load()){RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
             if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());}}
-        DxDevices dx;dx.Init(overlay.hwnd,sourceW,sourceH,overlay.width,overlay.height);
+        DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(L"Running");
+        Status(L"Running - WGC");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
-        // Anchor predictions to the DXGI desktop update timestamp. During
-        // that train, only make zero-timeout duplication calls.
+        // Anchor predictions to the WGC SystemRelativeTime timestamp. During
+        // that train, only make zero-timeout WGC polls.
 
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
@@ -523,7 +508,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         int predictionTargetHz=320;
         double predictionRealIntervalMs=16.667;
         // Only the V15 render thread touches the D3D11 immediate context,
-        // DXGI duplication, NvOFA surfaces and swapchain. No second thread
+        // WGC pool, NvOFA surfaces and swapchain. No second thread
         // can overwrite a texture while it is being sampled or copied.
         while(g_running.load(std::memory_order_acquire)){
             if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
@@ -562,7 +547,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 captureWaitMs=4;
             }
 
-            // Always poll DXGI capture before a queued prediction. New real
+            // Always poll WGC capture before a queued prediction. New real
             // frames supersede the old prediction train, as in V35's mailbox.
             LARGE_INTEGER captureTime{};
             int next=(current+1)%kNumCapture;
@@ -664,6 +649,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         Status(L"Stopped");
     }catch(const DisplayChanged&){
         return SessionOutcome::Recreate;
+    }catch(const winrt::hresult_error& e){
+        if(!tracked.Exited()&&!g_userStopRequested.load())Status(std::wstring(L"FG error: WGC ")+e.message().c_str());
+        g_running.store(false,std::memory_order_release);
     }catch(const std::exception& e){
         if(!tracked.Exited() && !g_userStopRequested.load())
             Status(L"FG error: "+Wide(e.what()));
@@ -688,7 +676,7 @@ void Engine(Game game){
         const ULONGLONG now=GetTickCount64();
         if(now-windowStart>10000){windowStart=now;restartCount=0;}
         if(++restartCount>3){
-            Status(L"Source error: DXGI capture repeatedly invalidated. "
+            Status(L"Source error: WGC capture repeatedly invalidated. "
                    L"Full capture restart failed; check the display mode and driver.");
             break;
         }
@@ -700,7 +688,7 @@ void Engine(Game game){
     g_running.store(false,std::memory_order_release);
     g_lastGameExited.store(tracked.Exited(),std::memory_order_release);
     // Publish completion only AFTER all sessions and capture threads have
-    // returned; never treat a transient DXGI capture recreation as a full stop.
+    // returned; never treat a transient WGC capture recreation as a full stop.
     g_engineFinished.store(true,std::memory_order_release);
     if(g_control)PostMessageW(g_control,WM_FG_STOPPED,tracked.Exited()?1u:0u,0);
 }
@@ -849,7 +837,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         StyleControl(g_centerFeatherEdit);
         SendMessageW(g_centerFeatherEdit,EM_SETLIMITTEXT,3,0);
         // The timer is a fallback for a missed/late worker completion message.
-        // It never enables Start while DXGI capture is still restarting or tearing down.
+        // It never enables Start while WGC capture is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
         RefreshGames();return 0;
     }
@@ -976,7 +964,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_FG_STOPPED:
-        // A session can temporarily stop for DXGI capture recovery. Only the final
+        // A session can temporarily stop for WGC capture recovery. Only the final
         // outer Engine() completion is allowed to unlock another Start.
         if(!g_engineFinished.load(std::memory_order_acquire))return 0;
         if(g_worker.joinable())g_worker.join();
