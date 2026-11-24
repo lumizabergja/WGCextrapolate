@@ -1,8 +1,8 @@
-name: FG WGC 320 Native12 Both Modes
+name: FG WGC 320 Native12 Mask Only
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-native12-both-modes']
+    branches: ['fg-wgc-320-native12-mask-only']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-Native12-BothModes-Windows-x64
+          name: FG-WGC-320-Native12-MaskOnly-Windows-x64
           path: |
             bin/FG.exe
             README.md
