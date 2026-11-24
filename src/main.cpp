@@ -13,6 +13,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <vector>
 #include <array>
@@ -534,7 +535,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         };
         LONGLONG priorSource=0,arrival=0,realPresented=0,lastPresented=0;
         double interval=16.667,pair=0.0,slotMs=3.125;
-        int current=-1,previous=-1,lastFlowCurrent=-1;
+        int current=-1,previous=-1;
+        uint64_t captureSerial=0,lastFlowSerial=0;
         bool flowReady=false,realPending=false,wasFocused=false;
         unsigned nextPrediction=1,maxPredictions=0;
         int measurements=0,warmup=0;
@@ -559,7 +561,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
-                lastFlowCurrent=-1;priorSource=0;interval=16.667;pair=0;
+                captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
                 flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
                 realPresented=lastPresented=0;
             }
@@ -568,7 +570,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             // New real frames always win the mailbox, including when a present slot
             // becomes available while we were waiting on the timer.
             if(dx.Grab(game.window,next,0,stamp)){
-                arrival=now();
+                arrival=now();++captureSerial;
                 if(dx.warp.initialized)dx.warp.sourcePose();
                 previous=current;current=next;pair=0.0;
                 if(priorSource>0&&stamp.QuadPart>priorSource){
@@ -600,9 +602,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const LONGLONG expiry=arrival+ticks(interval*1.10);
                 if(maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
                     realPresented+ticks(slotMs*.70)<expiry){
-                    const bool continuous=lastFlowCurrent==previous;
+                    const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
                     flow.Calculate(current,previous,continuous);
-                    lastFlowCurrent=current;flowReady=true;
+                    lastFlowSerial=captureSerial;flowReady=true;
                 }
                 continue;
             }
