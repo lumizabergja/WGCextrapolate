@@ -126,20 +126,22 @@ struct OverlayWindow {
         visible=active;
     }
     void Init(HWND target){
-        // Fullscreen non-layered topmost HWNDs cannot reliably pass menu clicks
-        // to CS2. Use a permanently layered, nonactivating click-through HWND.
-        // The source game stays in control of keyboard/mouse input.
+        // Warp OFF: opaque, non-layered fullscreen flip-model presenter.
+        // Warp ON: preserve the original layered presenter and behavior.
+        // HTTRANSPARENT remains best-effort for cross-process mouse input.
         HMONITOR monitor=MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{sizeof(mi)};
         if(!GetMonitorInfoW(monitor,&mi))throw Error("GetMonitorInfo failed",GetLastError());
         RECT r=mi.rcMonitor;width=r.right-r.left;height=r.bottom-r.top;
         originX=r.left;originY=r.top;
-        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW;
+        const bool layered=fgwarp::requested.load();
+        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|
+            (layered?WS_EX_LAYERED:0u);
         hwnd=CreateWindowExW(normalEx,
             L"FGDXGIOverlay",L"FG",WS_POPUP,r.left,r.top,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!hwnd)throw Error("Create presenter window failed",GetLastError());
-        // Full-opacity layered click-through overlay: input reaches CS2 underneath.
-        if(!SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA))
+        // Do not apply layered-window composition to Warp OFF.
+        if(layered&&!SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA))
             throw Error("SetLayeredWindowAttributes failed",GetLastError());
         // Fail closed: without capture exclusion the presenter can recursively capture itself.
         if(!SetWindowDisplayAffinity(hwnd,0x00000011))throw Error("WDA_EXCLUDEFROMCAPTURE unsupported",GetLastError());
@@ -222,7 +224,11 @@ struct DxDevices {
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
         if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
-        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
+        else {
+            sc.Scaling=DXGI_SCALING_NONE; // output-sized swapchain; no compositor scaling
+            Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
+            Check(f2->MakeWindowAssociation(output,DXGI_MWA_NO_ALT_ENTER),"Disable automatic fullscreen toggle");
+        }
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
