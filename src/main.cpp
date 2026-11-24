@@ -1,25 +1,18 @@
-// FG WGC D3D11 direct-texture experimental backend.
-// Requires Windows 10 22H2 SDK, C++/WinRT and NVIDIA Optical Flow SDK headers.
+// V15 Clean v16 with DXGI Desktop Duplication capture.
+#ifndef UNICODE
 #define UNICODE
+#endif
 #define _UNICODE
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
-#include <windows.graphics.capture.interop.h>
-#include <windows.graphics.directx.direct3d11.interop.h>
-#include <winrt/base.h>
-#include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.Graphics.h>
-#include <winrt/Windows.Graphics.Capture.h>
-#include <winrt/Windows.Graphics.DirectX.h>
-#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
-#include <memory>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <string>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include <array>
@@ -34,12 +27,11 @@
 #include <uxtheme.h>
 #include <commctrl.h>
 #include <nvOpticalFlowD3D11.h>
+#include "warp_presenter.h"
 
 using Microsoft::WRL::ComPtr;
-namespace wgc = winrt::Windows::Graphics::Capture;
-namespace winrt_d3d = winrt::Windows::Graphics::DirectX::Direct3D11;
 namespace {
-constexpr int kNumCapture = 5; // WGC pool includes current, previous, newest and in-flight buffers.
+constexpr int kNumCapture = 3;
 constexpr int kOpticalFlowGrid = 4; // This app has a fixed NvOFA FAST 4x4 path.
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
@@ -56,14 +48,14 @@ std::atomic<bool> g_running{false};
 // Separate user-requested Stop from a transient invalidated capture session.
 // The latter ends one GPU session before the supervisor restarts it.
 std::atomic<bool> g_userStopRequested{false};
-// The presenter may temporarily stop during WGC recovery. Only the outer
+// The presenter may temporarily stop during DXGI capture recovery. Only the outer
 // Engine() completion marks the launcher as ready for a fresh Start.
 std::atomic<bool> g_engineFinished{true};
 std::atomic<bool> g_lastGameExited{false};
 constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
 std::atomic<int> g_fgMode{2};
-std::atomic<int> g_targetHz{0};
+std::atomic<int> g_targetHz{320};
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -72,7 +64,13 @@ std::wstring g_statusText;
 struct Game {HWND window;DWORD pid;std::wstring name;};
 std::vector<Game> g_games;
 
+struct SessionState{
+    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather;
+    wchar_t error[512],stage[96];
+};
+SessionState* session{};
 void Status(const std::wstring& s) {
+    if(session && (s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0))lstrcpynW(session->error,s.c_str(),512);
     {std::lock_guard<std::mutex> l(g_statusLock);g_statusText=s;}
     if(g_control) PostMessageW(g_control,WM_FG_STATUS,0,0);
 }
@@ -82,10 +80,12 @@ std::runtime_error Error(const std::string& what,HRESULT hr=0) {
 }
 void Check(HRESULT hr,const char* what) {if(FAILED(hr)) throw Error(what,hr);}
 void NvCheck(NV_OF_STATUS s,const char* what) {if(s!=NV_OF_SUCCESS)throw Error(what,static_cast<HRESULT>(s));}
-// Frame-pool resize or window topology changes need a complete WGC/OFA rebuild.
-struct WgcNeedsRecreate : std::runtime_error {
-    explicit WgcNeedsRecreate(const char* reason) : std::runtime_error(reason) {}
-};
+struct DisplayChanged {};
+void CheckDuplication(HRESULT hr,const char* operation){
+    if(hr==DXGI_ERROR_ACCESS_LOST || hr==DXGI_ERROR_SESSION_DISCONNECTED ||
+       hr==DXGI_ERROR_MODE_CHANGE_IN_PROGRESS)throw DisplayChanged{};
+    Check(hr,operation);
+}
 std::wstring Wide(const std::string& s) {int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,nullptr,0);if(n<1)return L"Error";std::wstring w(size_t(n),L'\0');MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,w.data(),n);w.pop_back();return w;}
 BOOL CALLBACK FindWindows(HWND h,LPARAM) {
     if(!IsWindowVisible(h)||h==g_control||h==g_overlay||GetWindow(h,GW_OWNER))return TRUE;
@@ -139,13 +139,13 @@ struct OverlayWindow {
         originX=r.left;originY=r.top;
         const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW;
         hwnd=CreateWindowExW(normalEx,
-            L"FGWGCOverlay",L"FG",WS_POPUP,r.left,r.top,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+            L"FGDXGIOverlay",L"FG",WS_POPUP,r.left,r.top,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!hwnd)throw Error("Create presenter window failed",GetLastError());
-        // WGC targets the selected GAME HWND, not the display. The presenter's
-        // different HWND cannot be captured recursively by this session.
         // Full-opacity layered click-through overlay: input reaches CS2 underneath.
         if(!SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA))
             throw Error("SetLayeredWindowAttributes failed",GetLastError());
+        // Fail closed: without capture exclusion the presenter can recursively capture itself.
+        if(!SetWindowDisplayAffinity(hwnd,0x00000011))throw Error("WDA_EXCLUDEFROMCAPTURE unsupported",GetLastError());
         // Do not show over the control window; engine reveals it only when game has focus.
         ShowWindow(hwnd,SW_HIDE);
         visible=false;
@@ -155,42 +155,64 @@ struct OverlayWindow {
 };
 
 struct DxDevices {
+    fgwarp::Presenter warp;
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
     ComPtr<IDXGISwapChain2> lowLatencySwap;
-    HANDLE frameReady{}; // Borrowed swapchain waitable handle (do not CloseHandle).
+    HANDLE frameReady{}; // Closed before releasing the swapchain.
     bool allowTearing{};
+    ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> constants;
+    ComPtr<ID3D11Texture2D> history[kNumCapture];
+    ComPtr<ID3D11ShaderResourceView> frameSRV[kNumCapture];
     UINT srcW{},srcH{},screenW{},screenH{};
-    // Native input frames and OFA remain at CS2 resolution. Only the final
-    // swapchain matches the current logical output monitor size.
-    // NVIDIA fullscreen scaling does not automatically apply to a
-    // separate fullscreen flip-model presenter HWND.
+    ComPtr<IDXGIAdapter> matchingAdapter;
+    ComPtr<IDXGIOutputDuplication> duplication;
+    DXGI_OUTPUT_DESC desktop{};
+    ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
     void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
         srcW=w;srcH=h;screenW=outputW;screenH=outputH;
-        // A single D3D11 device is shared by WGC, the predictor, NvOFA and DXGI.
-        // The driver-backed default GPU must be the same physical GPU as the capture source.
+        HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
+        ComPtr<IDXGIFactory1> factory;
+        Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"Create DXGI factory");
+        ComPtr<IDXGIOutput1> captureOutput;
+        for(UINT i=0;!captureOutput;++i){
+            ComPtr<IDXGIAdapter1> adapter;
+            HRESULT hr=factory->EnumAdapters1(i,&adapter);
+            if(hr==DXGI_ERROR_NOT_FOUND)break;
+            Check(hr,"Enumerate adapters");
+            for(UINT j=0;;++j){
+                ComPtr<IDXGIOutput> candidate;
+                hr=adapter->EnumOutputs(j,&candidate);
+                if(hr==DXGI_ERROR_NOT_FOUND)break;
+                Check(hr,"Enumerate outputs");
+                Check(candidate->GetDesc(&desktop),"Read output description");
+                if(desktop.Monitor!=monitor)continue;
+                Check(candidate.As(&captureOutput),"Query duplication output");
+                matchingAdapter=adapter;
+                break;
+            }
+        }
+        if(!captureOutput)throw Error("Selected monitor unavailable");
+        if(desktop.Rotation!=DXGI_MODE_ROTATION_IDENTITY)
+            throw Error("Select an unrotated monitor");
         D3D_FEATURE_LEVEL obtained{};
-        Check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,
-            &dev11,&obtained,&ctx11),"D3D11CreateDevice WGC/presenter");
-        ComPtr<IDXGIDevice> dxgiDev;
-        Check(dev11.As(&dxgiDev),"Query IDXGIDevice");
-        ComPtr<IDXGIAdapter> adapter;
-        Check(dxgiDev->GetAdapter(&adapter),"Query DXGI adapter");
-        ComPtr<IDXGIFactory2> f2;Check(adapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
+        Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
+        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
+        ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sc.BufferCount=2;sc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;sc.Scaling=DXGI_SCALING_STRETCH;
         sc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;
         // DXGI cannot have a literal maximum frame latency of 0: its minimum is 1.
-        // Keep zero *software* backlog by draining WGC down to its newest frame;
-        // do not submit a new Present until DXGI frees a frame slot.
+        // Retain the newest source while the display slot is busy and
+        // do not submit a new present until DXGI frees a frame slot.
         ComPtr<IDXGIFactory5> factory5;
         if(SUCCEEDED(f2.As(&factory5))){
             BOOL supported=FALSE;
@@ -200,17 +222,24 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
+        if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
+        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        ComPtr<ID3D11Texture2D> bb;Check(swap->GetBuffer(0,IID_PPV_ARGS(&bb)),"GetBuffer");
-        Check(dev11->CreateRenderTargetView(bb.Get(),nullptr,&rtv),"CreateRenderTargetView");
-        // No intermediate color allocations: each WGC frame supplies its own
-        // D3D11 resource, and Draw samples it through a direct SRV.
+        if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+        Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
+        D3D11_TEXTURE2D_DESC input{};
+        input.Width=w;input.Height=h;input.ArraySize=1;input.MipLevels=1;
+        input.SampleDesc.Count=1;input.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+        input.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        for(int i=0;i<kNumCapture;++i){
+            Check(dev11->CreateTexture2D(&input,nullptr,&history[i]),"Allocate capture history");
+            Check(dev11->CreateShaderResourceView(history[i].Get(),nullptr,&frameSRV[i]),"Capture history SRV");
+        }
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
-        // Preserve the exact original FG-Fast-Crosshair extrapolation shader.
+        // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
         static const char* shader=R"HLSL(
 Texture2D<float4> currentFrame:register(t0);
 Texture2D<int2> rawFlow:register(t1);
@@ -276,18 +305,39 @@ float4 PS(V i):SV_Target {
         D3D11_BUFFER_DESC bd{};bd.ByteWidth=48;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
     }
-    // The display can switch 1920x1080 <-> 1280x960 on Alt+Tab.
-    // Resize only the final output; preserve native capture, NvOFA and shader.
-    void ResizeOutput(UINT outputW,UINT outputH){
-        if(outputW==screenW&&outputH==screenH)return;
-        ctx11->OMSetRenderTargets(0,nullptr,nullptr);
-        rtv.Reset();
-        ctx11->Flush();
-        Check(swap->ResizeBuffers(0,outputW,outputH,DXGI_FORMAT_UNKNOWN,0),"DX11 ResizeBuffers after display mode switch");
-        ComPtr<ID3D11Texture2D> bb;
-        Check(swap->GetBuffer(0,IID_PPV_ARGS(&bb)),"DX11 GetBuffer after resize");
-        Check(dev11->CreateRenderTargetView(bb.Get(),nullptr,&rtv),"DX11 RTV after resize");
-        screenW=outputW;screenH=outputH;
+    bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
+        DXGI_OUTDUPL_FRAME_INFO info{};
+        ComPtr<IDXGIResource> resource;
+        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
+        if(hr==DXGI_ERROR_WAIT_TIMEOUT)return false;
+        CheckDuplication(hr,"Acquire desktop frame");
+        struct Lease {
+            IDXGIOutputDuplication* owner;
+            ~Lease(){if(owner)owner->ReleaseFrame();}
+        } lease{duplication.Get()};
+        // DXGI has already masked protected pixels in the acquired texture.
+        bool updated=info.LastPresentTime.QuadPart!=0;
+        if(updated){
+            RECT client{};
+            POINT origin{};
+            if(!GetClientRect(game,&client) || !ClientToScreen(game,&origin))return false;
+            if(UINT(client.right)!=srcW || UINT(client.bottom)!=srcH ||
+               MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
+            LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
+            if(x<0 || y<0 || x+LONG(srcW)>desktop.DesktopCoordinates.right-desktop.DesktopCoordinates.left ||
+               y+LONG(srcH)>desktop.DesktopCoordinates.bottom-desktop.DesktopCoordinates.top)
+                throw Error("Keep the entire game client on the selected monitor");
+            ComPtr<ID3D11Texture2D> texture;
+            Check(resource.As(&texture),"Read desktop texture");
+            D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
+            if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
+            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
+            ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,texture.Get(),0,&region);
+            timestamp=info.LastPresentTime;
+        }
+        lease.owner=nullptr;
+        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
+        return updated;
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
     struct Params{
@@ -296,10 +346,10 @@ float4 PS(V i):SV_Target {
         float centerRadiusPx,centerFeatherPx,outputW,outputH;
     };
     static_assert(sizeof(Params)==48);
-    void Draw(ID3D11ShaderResourceView* current,ID3D11ShaderResourceView* previous,
-              ID3D11ShaderResourceView* rawFlow,float horizon,int grid){
-        ID3D11ShaderResourceView* views[3]{current,rawFlow,previous ? previous : current};
-        // Capture, NvOFA and extrapolation remain at the game's native resolution;
+    void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
+              float horizon,int grid){
+        ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
+        // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
         const Params p{horizon,1.0f/float(srcW),1.0f/float(srcH),0.12f,
               float((srcW+UINT(grid)-1)/UINT(grid)),
@@ -324,98 +374,31 @@ float4 PS(V i):SV_Target {
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
+        Present();
+    }
+    void PresentReal(UINT current,int grid){
+        if(srcW!=screenW || srcH!=screenH){
+            Draw(current,current,nullptr,0.f,grid);
+            return;
+        }
+        // Capture history and flip buffer share BGRA8, sample count and extent.
+        ctx11->CopyResource(backBuffer.Get(),history[current].Get());
+        Present();
+    }
+    void Present(){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        if(warp.initialized){warp.present(flags,srcW,srcH);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
-};
-
-// Selected-window WGC capture: no desktop cropping, D3D9Ex or pixel copies.
-struct CaptureWgc {
-    wgc::GraphicsCaptureItem item{nullptr};
-    wgc::Direct3D11CaptureFramePool pool{nullptr};
-    wgc::GraphicsCaptureSession session{nullptr};
-    winrt::event_token arrivedToken{};
-    struct SafeEvent {
-        HANDLE handle{};
-        ~SafeEvent(){if(handle)CloseHandle(handle);}
-    };
-    std::shared_ptr<SafeEvent> safeEvent;
-    HANDLE arrivalEvent{}; // borrowed; SafeEvent owns it
-    UINT width{},height{};
-    bool subscribed{};
-
-    static wgc::GraphicsCaptureItem SelectWindow(HWND hwnd){
-        if(!wgc::GraphicsCaptureSession::IsSupported())
-            throw Error("Windows Graphics Capture is unsupported on this OS/device");
-        auto interop=winrt::get_activation_factory<wgc::GraphicsCaptureItem,IGraphicsCaptureItemInterop>();
-        wgc::GraphicsCaptureItem item{nullptr};
-        winrt::check_hresult(interop->CreateForWindow(
-            hwnd,winrt::guid_of<wgc::GraphicsCaptureItem>(),winrt::put_abi(item)));
-        return item;
-    }
-    static std::pair<UINT,UINT> Size(const wgc::GraphicsCaptureItem& item){
-        const auto size=item.Size();
-        if(size.Width<16||size.Height<16||size.Width>8192||size.Height>8192)
-            throw Error("Unsupported WGC capture size");
-        return {UINT(size.Width),UINT(size.Height)};
-    }
-    void Init(wgc::GraphicsCaptureItem selected,ID3D11Device* device,UINT w,UINT h){
-        item=std::move(selected);width=w;height=h;
-        ComPtr<IDXGIDevice> dxgi;
-        Check(device->QueryInterface(IID_PPV_ARGS(&dxgi)),"WGC DXGI device query");
-        winrt::com_ptr<::IInspectable> inspectable;
-        Check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(),inspectable.put()),
-              "CreateDirect3D11DeviceFromDXGIDevice");
-        const auto winrtDevice=inspectable.as<winrt_d3d::IDirect3DDevice>();
-        pool=wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            winrtDevice,winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            kNumCapture,{int32_t(width),int32_t(height)});
-        session=pool.CreateCaptureSession(item);
-        // Windows 10 22H2 supports per-session cursor disabling.
-        session.IsCursorCaptureEnabled(false);
-        safeEvent=std::make_shared<SafeEvent>();
-        safeEvent->handle=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-        if(!safeEvent->handle)throw Error("WGC arrival event allocation failed",GetLastError());
-        arrivalEvent=safeEvent->handle;
-        // In-flight callback owns the event until SetEvent completes, even
-        // if Stop destroys the CaptureWgc object concurrently.
-        arrivedToken=pool.FrameArrived([signal=safeEvent](auto const&,auto const&) noexcept {
-            SetEvent(signal->handle);
-        });
-        subscribed=true;
-        session.StartCapture();
-    }
-    // Return only the most recent frame; earlier unread frames are closed.
-    // No texture data is ever read by the CPU or copied into a staging resource.
-    wgc::Direct3D11CaptureFrame DrainLatest(){
-        wgc::Direct3D11CaptureFrame newest{nullptr};
-        for(;;){
-            auto next=pool.TryGetNextFrame();
-            if(!next)break;
-            if(newest)newest.Close();
-            newest=std::move(next);
-        }
-        return newest;
-    }
-    void Close() noexcept {
-        try{
-            if(pool && subscribed){pool.FrameArrived(arrivedToken);subscribed=false;}
-            if(session){session.Close();session=nullptr;}
-            if(pool){pool.Close();pool=nullptr;}
-            item=nullptr;
-        }catch(...){ }
-        arrivalEvent=nullptr;
-        safeEvent.reset();
-    }
-    ~CaptureWgc(){Close();}
 };
 
 struct Flow11 {
     HMODULE library{};
     NV_OF_D3D11_API_FUNCTION_LIST funcs{};
     NvOFHandle handle{};
+    NvOFGPUBufferHandle frames[kNumCapture]{};
     NvOFGPUBufferHandle motion{};
     ComPtr<ID3D11Texture2D> motionTexture;
     ComPtr<ID3D11ShaderResourceView> motionSRV;
@@ -435,15 +418,18 @@ struct Flow11 {
         init.enableOutputCost=NV_OF_FALSE;
         init.enableExternalHints=NV_OF_FALSE;init.inputBufferFormat=NV_OF_BUFFER_FORMAT_ABGR8;
         NvCheck(funcs.nvOFInit(handle,&init),"NVOFA init (selected grid FAST, ABGR8)");
-        // The WGC input surface must be directly accepted by NvOFA.
-        // Fail closed on format/registration rejection; never copy or convert.
+        // Sharing is only valid if OFA accepts this exact D3D11 texture format.
+        // The history texture is registered once and sampled directly.
         UINT count=0;
         NvCheck(funcs.nvOFGetSurfaceFormatCountD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,&count),"NVOFA query input format count");
         if(!count||count>32)throw Error("NVOFA input formats unavailable");
         std::vector<DXGI_FORMAT> formats(count);
         NvCheck(funcs.nvOFGetSurfaceFormatD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,formats.data()),"NVOFA query input formats");
         if(std::find(formats.begin(),formats.end(),DXGI_FORMAT_B8G8R8A8_UNORM)==formats.end())
-            throw Error("NVOFA cannot use WGC BGRA surface; no-copy path refused");
+            throw Error("NVOFA cannot accept BGRA capture history");
+        for(int i=0;i<kNumCapture;++i){
+            NvCheck(funcs.nvOFRegisterResourceD3D11(handle,d.history[i].Get(),&frames[i]),"NVOFA register D3D11 capture history");
+        }
         const UINT fw=(d.srcW+UINT(grid)-1)/UINT(grid),fh=(d.srcH+UINT(grid)-1)/UINT(grid);
         D3D11_TEXTURE2D_DESC desc{};desc.Width=fw;desc.Height=fh;desc.MipLevels=1;desc.ArraySize=1;
         desc.Format=DXGI_FORMAT_R16G16_SINT;desc.SampleDesc.Count=1;
@@ -452,114 +438,21 @@ struct Flow11 {
         NvCheck(funcs.nvOFRegisterResourceD3D11(handle,motionTexture.Get(),&motion),"NVOFA register motion output");
         Check(d.dev11->CreateShaderResourceView(motionTexture.Get(),nullptr,&motionSRV),"NvOFA motion SRV");
     }
-    NvOFGPUBufferHandle Register(ID3D11Texture2D* input){
-        NvOFGPUBufferHandle registered{};
-        NvCheck(funcs.nvOFRegisterResourceD3D11(handle,input,&registered),
-                "NVOFA direct WGC resource registration rejected (no fallback)");
-        return registered;
-    }
-    void Unregister(NvOFGPUBufferHandle& resource) noexcept {
-        if(resource && funcs.nvOFUnregisterResourceD3D11){
-            funcs.nvOFUnregisterResourceD3D11(resource);
-            resource=nullptr;
-        }
-    }
-    void Calculate(NvOFGPUBufferHandle current,NvOFGPUBufferHandle previous){
+    void Calculate(int current,int previous){
         NV_OF_EXECUTE_INPUT_PARAMS in{};
-        in.inputFrame=current;in.referenceFrame=previous;
+        in.inputFrame=frames[current];in.referenceFrame=frames[previous];
         NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
         NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
     }
     ~Flow11(){
         if(handle){
+            for(auto &f:frames)if(f&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(f);
             if(motion&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(motion);
             if(funcs.nvOFDestroy)funcs.nvOFDestroy(handle);
         }
         if(library)FreeLibrary(library);
     }
 };
-
-struct CapturedFrame {
-    Flow11* flowOwner{}; // Flow11 outlives all frame slots in EngineSession.
-    wgc::Direct3D11CaptureFrame frame{nullptr};
-    ComPtr<ID3D11Texture2D> texture;
-    ComPtr<ID3D11ShaderResourceView> srv;
-    ComPtr<ID3D11Query> retirement;
-    NvOFGPUBufferHandle ofInput{};
-    LARGE_INTEGER capturedAt{};
-    void Close() noexcept {
-        if(flowOwner)flowOwner->Unregister(ofInput);
-        srv.Reset();texture.Reset();
-        if(frame){
-            try{frame.Close();}catch(...){/* Windows device may already be lost */}
-            frame=nullptr;
-        }
-        retirement.Reset();
-    }
-    ~CapturedFrame(){Close();}
-};
-using FramePtr = std::unique_ptr<CapturedFrame>;
-
-// GPU completion and WGC frame Close are required EVEN if Present or NvOFA
-// throws. Declare this guard after the frame pointers so it runs first on
-// both normal completion and exception unwinding.
-struct FrameLifetimeGuard {
-    DxDevices& dx;
-    FramePtr& current;
-    FramePtr& previous;
-    std::vector<FramePtr>& retired;
-    ~FrameLifetimeGuard() noexcept {
-        dx.ctx11->ClearState();
-        ComPtr<ID3D11Query> done;
-        D3D11_QUERY_DESC query{};query.Query=D3D11_QUERY_EVENT;
-        if(SUCCEEDED(dx.dev11->CreateQuery(&query,&done))){
-            dx.ctx11->End(done.Get());
-            dx.ctx11->Flush();
-            for(unsigned attempt=0;attempt<1500;++attempt){
-                const HRESULT r=dx.ctx11->GetData(done.Get(),nullptr,0,0);
-                if(r==S_OK||FAILED(r))break;
-                Sleep(1);
-            }
-        }else dx.ctx11->Flush();
-        for(auto& slot:retired){if(slot){slot->Close();slot.reset();}}
-        retired.clear();
-        if(previous){previous->Close();previous.reset();}
-        if(current){current->Close();current.reset();}
-    }
-};
-
-// Accept only the *original* texture WGC provided. Reject unsupported
-// bind flags, dimensions and device identity instead of silently copying.
-FramePtr PrepareFrame(wgc::Direct3D11CaptureFrame frame,DxDevices& dx,Flow11& flow){
-    const auto content=frame.ContentSize();
-    if(content.Width!=int32_t(dx.srcW)||content.Height!=int32_t(dx.srcH)){
-        frame.Close();throw WgcNeedsRecreate("WGC window content size changed");
-    }
-    auto surface=frame.Surface();
-    auto access=surface.as<::IDirect3DDxgiInterfaceAccess>();
-    auto result=std::make_unique<CapturedFrame>();
-    result->flowOwner=&flow;
-    result->frame=std::move(frame);
-    Check(access->GetInterface(IID_PPV_ARGS(&result->texture)),"WGC surface D3D11 texture query");
-    D3D11_TEXTURE2D_DESC desc{};result->texture->GetDesc(&desc);
-    if(desc.Width!=dx.srcW||desc.Height!=dx.srcH||
-       desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM||
-       desc.SampleDesc.Count!=1||
-       !(desc.BindFlags&D3D11_BIND_SHADER_RESOURCE)){
-        throw Error("WGC frame is not a directly sampleable native BGRA texture; strict zero-copy refused");
-    }
-    ComPtr<ID3D11Device> owner;
-    result->texture->GetDevice(&owner);
-    if(owner.Get()!=dx.dev11.Get()){
-        throw Error("WGC texture belongs to a different D3D11 device; no copy permitted");
-    }
-    Check(dx.dev11->CreateShaderResourceView(result->texture.Get(),nullptr,&result->srv),
-          "WGC direct texture SRV refused");
-    D3D11_QUERY_DESC query{};query.Query=D3D11_QUERY_EVENT;
-    Check(dx.dev11->CreateQuery(&query,&result->retirement),"WGC resource retirement fence");
-    QueryPerformanceCounter(&result->capturedAt);
-    return result;
-}
 
 // A user may Alt+Tab or minimize; neither is an exit. Check the original
 // HWND/PID identity and, when permitted, the process termination signal.
@@ -579,196 +472,202 @@ struct TrackedGame {
 };
 enum class SessionOutcome { Stop, Recreate };
 
-// Each session owns the WGC pool, D3D11 textures, NvOFA and presenter.
-// Recreating the session releases all resources before the next attempt.
+// One session owns ALL DXGI capture, D3D11, and NvOFA resources. Returning from
+// this function destroys them in reverse lifetime order before another attempt.
 SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
     try {
         if(tracked.Exited())return SessionOutcome::Stop;
-        // C++/WinRT initializes on this dedicated engine thread.
-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        // Select the game window directly; unlike NvFBC this isn't a display crop.
-        auto item=CaptureWgc::SelectWindow(game.window);
-        const auto [sourceW,sourceH]=CaptureWgc::Size(item);
+        // D3D11 resources are created on this single render thread.
         OverlayWindow overlay;overlay.Init(game.window);
+        RECT rc{};GetClientRect(game.window,&rc);
+        const UINT gameW=UINT(rc.right-rc.left),gameH=UINT(rc.bottom-rc.top);
         MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);
-        UINT monitorHz=240;
+        UINT monitorHz=320;
         if(GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)){
             DEVMODEW dm{};dm.dmSize=sizeof(dm);
             if(EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>=30)
                 monitorHz=dm.dmDisplayFrequency;
         }
+        // Duplicate output pixels inside the selected client rectangle.
+        const UINT sourceW=gameW,sourceH=gameH;
+        if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
+            throw Error("Invalid game native capture resolution");
+        if(session){lstrcpynW(session->stage,L"Capture and presenter initialization",96);
+            if(fgwarp::requested.load()){RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
+            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());}}
         DxDevices dx;dx.Init(overlay.hwnd,sourceW,sourceH,overlay.width,overlay.height);
-        Flow11 flow;flow.Init(dx,kOpticalFlowGrid);
-        CaptureWgc capture;capture.Init(std::move(item),dx.dev11.Get(),sourceW,sourceH);
+        if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
         Status(L"Running");
-        LARGE_INTEGER freq{},last{},now{};
-        QueryPerformanceFrequency(&freq);QueryPerformanceCounter(&last);
-        LARGE_INTEGER previousCaptureAt{},previousPresent{};
-        double sourcePeriod=1.0/60.0;
-        int stableDynamicFactor=1,proposedDynamicFactor=1,proposalSamples=0;
-        FramePtr current,previous;
-        std::vector<FramePtr> retired;
-        FrameLifetimeGuard lifetime{dx,current,previous,retired};
-        bool flowReady=false,realFramePending=false,flowPending=false;
+
+        constexpr int ofGrid=kOpticalFlowGrid;
+        Flow11 flow;flow.Init(dx,ofGrid);
+        // Anchor predictions to the DXGI desktop update timestamp. During
+        // that train, only make zero-timeout duplication calls.
+
+        LARGE_INTEGER freq{};
+        QueryPerformanceFrequency(&freq);
+        LARGE_INTEGER previousCaptureAt{};
+        double realIntervalMs=16.667;
+        double pairIntervalMs=0;
+        int current=-1,previous=-1;
+        bool flowReady=false;
+        bool realFramePending=false;
+        bool flowPending=false;
+        DWORD captureWaitMs=4;
         bool wasFocused=false;
         int resumeWarmup=0;
-        // No capture worker or D3D9Ex synchronization. A WGC event wakes this
-        // same render thread and the newest WGC GPU texture is used directly.
+
+        unsigned nextPrediction=1;
+        unsigned maxPredictions=0;
+        int predictionMode=2;
+        int predictionTargetHz=320;
+        double predictionRealIntervalMs=16.667;
+        // Only the V15 render thread touches the D3D11 immediate context,
+        // DXGI duplication, NvOFA surfaces and swapchain. No second thread
+        // can overwrite a texture while it is being sampled or copied.
         while(g_running.load(std::memory_order_acquire)){
-            // Defer WGC frame Close and NvOFA unregister until the GPU no longer
-            // references the captured texture. Never block the hot render loop.
-            for(size_t i=0;i<retired.size();){
-                const HRESULT r=dx.ctx11->GetData(retired[i]->retirement.Get(),nullptr,0,
-                                                   D3D11_ASYNC_GETDATA_DONOTFLUSH);
-                if(r==S_OK){retired[i]->Close();retired.erase(retired.begin()+i);}
-                else if(r==S_FALSE)++i;
-                else Check(r,"WGC retired texture fence poll");
-            }
+            if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
             MSG message{};
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 TranslateMessage(&message);DispatchMessageW(&message);
             }
             if(tracked.Exited()){
-                g_running.store(false,std::memory_order_release);break;
+                g_running.store(false,std::memory_order_release);
+                break;
             }
             DWORD foregroundPid=0;
             HWND foreground=GetForegroundWindow();
             if(foreground)GetWindowThreadProcessId(foreground,&foregroundPid);
             const bool focused=!IsIconic(game.window)&&foregroundPid==game.pid;
-            if(focused&&overlay.SyncToMonitor(game.window))
-                dx.ResizeOutput(overlay.width,overlay.height);
-            overlay.SetVisible(focused);
+            if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             if(!focused){
-                wasFocused=false;flowReady=false;realFramePending=false;flowPending=false;
-                // Return unread WGC frames promptly while unfocused.
-                if(auto drop=capture.DrainLatest())drop.Close();
-                Sleep(8);continue;
+                overlay.SetVisible(false);
+                wasFocused=false;
+                flowReady=false;
+                realFramePending=false;
+                flowPending=false;
+                nextPrediction=maxPredictions+1;
+                Sleep(8);
+                continue;
             }
             if(!wasFocused){
-                wasFocused=true;resumeWarmup=2;previousPresent={};
-                QueryPerformanceCounter(&last);
-                // Do not extrapolate from frames captured during Alt+Tab.
-                if(current){
-                    dx.ctx11->End(current->retirement.Get());
-                    retired.push_back(std::move(current));
-                }
-                if(previous){
-                    dx.ctx11->End(previous->retirement.Get());
-                    retired.push_back(std::move(previous));
-                }
-                previousCaptureAt={};
-            }
-            FramePtr next;
-            if(auto wgcFrame=capture.DrainLatest())
-                next=PrepareFrame(std::move(wgcFrame),dx,flow);
-            if(next){
-                if(previous){
-                    dx.ctx11->End(previous->retirement.Get());
-                    retired.push_back(std::move(previous));
-                }
-                previous=std::move(current);
-                current=std::move(next);
-                const auto capturedAt=current->capturedAt;
-                if(previousCaptureAt.QuadPart && previous){
-                    const double observed=double(capturedAt.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
-                    if(observed>1.0/400.0 && observed<1.0/15.0)
-                        sourcePeriod=.90*sourcePeriod+.10*observed;
-                }
-                previousCaptureAt=capturedAt;last=capturedAt;
-                flowReady=false;realFramePending=true;
-                flowPending=(previous && resumeWarmup==0);
-                if(resumeWarmup>0)--resumeWarmup;
-            }
-            if(!current){
-                const DWORD wake=MsgWaitForMultipleObjectsEx(1,&capture.arrivalEvent,4,
-                    QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-                if(wake!=WAIT_OBJECT_0 && wake!=WAIT_OBJECT_0+1 && wake!=WAIT_TIMEOUT)
-                    throw Error("WGC arrival wait failed",GetLastError());
-                continue;
-            }
-            QueryPerformanceCounter(&now);
-            const double elapsed=double(now.QuadPart-last.QuadPart)/double(freq.QuadPart);
-            const double sincePresent=previousPresent.QuadPart?
-                double(now.QuadPart-previousPresent.QuadPart)/double(freq.QuadPart):1.0;
-            const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
-            const int configuredTarget=g_targetHz.load(std::memory_order_relaxed);
-            const int target=std::clamp(configuredTarget==0?int(monitorHz):configuredTarget,30,1000);
-            const int measuredFactor=std::clamp(int(std::round(double(target)*sourcePeriod)),1,6);
-            if(mode==0 && current->capturedAt.QuadPart==last.QuadPart && realFramePending){
-                if(measuredFactor!=stableDynamicFactor){
-                    if(measuredFactor==proposedDynamicFactor)++proposalSamples;
-                    else {proposedDynamicFactor=measuredFactor;proposalSamples=1;}
-                    if(proposalSamples>=3){stableDynamicFactor=measuredFactor;proposalSamples=0;}
-                }else proposalSamples=0;
-            }
-            const int factor=(mode==0)?stableDynamicFactor:mode;
-            const double step=(mode==0)?
-                std::max(sourcePeriod/double(factor),1.0/double(target)):
-                sourcePeriod/double(std::max(factor,1));
-            if(!realFramePending&&elapsed>sourcePeriod*1.65){
-                // Stop predicting across missing real frames.
-                const DWORD wake=MsgWaitForMultipleObjectsEx(1,&capture.arrivalEvent,2,
-                    QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-                if(wake==WAIT_FAILED)throw Error("WGC stalled wait failed",GetLastError());
-                continue;
-            }
-            const bool doPresent=realFramePending||sincePresent>=step;
-            if(doPresent){
-                DWORD ready=WaitForSingleObject(dx.frameReady,0);
-                if(ready==WAIT_TIMEOUT){
-                    HANDLE handles[2]{dx.frameReady,capture.arrivalEvent};
-                    const DWORD wake=MsgWaitForMultipleObjectsEx(2,handles,2,
-                        QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-                    if(wake==WAIT_OBJECT_0)ready=WAIT_OBJECT_0;
-                    else if(wake==WAIT_OBJECT_0+1 || wake==WAIT_OBJECT_0+2 || wake==WAIT_TIMEOUT)
-                        continue;
-                    else throw Error("DXGI/WGC event wait failed",GetLastError());
-                }
-                if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
-                const float prediction=(realFramePending||factor<=1||!flowReady)?0.f:
-                    float(std::clamp(elapsed/sourcePeriod,0.0,1.25));
-                dx.Draw(current->srv.Get(),previous?previous->srv.Get():current->srv.Get(),
-                        flowReady&&factor>1?flow.motionSRV.Get():nullptr,prediction,kOpticalFlowGrid);
-                const bool submittedReal=realFramePending;
+                wasFocused=true;
+                resumeWarmup=2;
+                current=-1;previous=-1;previousCaptureAt={};
+                realIntervalMs=16.667;
+                flowReady=false;
                 realFramePending=false;
-                if(submittedReal&&flowPending){
-                    if(factor>1){
-                        // Register WGC's ORIGINAL frame textures only when FG
-                        // needs optical flow; Off mode skips this extra work.
-                        if(!current->ofInput)current->ofInput=flow.Register(current->texture.Get());
-                        if(!previous->ofInput)previous->ofInput=flow.Register(previous->texture.Get());
-                        flow.Calculate(current->ofInput,previous->ofInput);
+                flowPending=false;
+                nextPrediction=maxPredictions+1;
+                captureWaitMs=4;
+            }
+
+            // Always poll DXGI capture before a queued prediction. New real
+            // frames supersede the old prediction train, as in V35's mailbox.
+            LARGE_INTEGER captureTime{};
+            int next=(current+1)%kNumCapture;
+            const bool scheduling=realFramePending || (flowReady && nextPrediction<=maxPredictions);
+            if(!dx.Grab(game.window,next,scheduling?0u:captureWaitMs,captureTime))next=-1;
+            captureWaitMs=4;
+            if(next>=0){
+                if(dx.warp.initialized)dx.warp.sourcePose();
+                previous=current;
+                current=next;
+                pairIntervalMs=0;
+                if(previousCaptureAt.QuadPart>0 && captureTime.QuadPart>previousCaptureAt.QuadPart && freq.QuadPart>0){
+                    const double measured=1000.0*double(captureTime.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
+                    if(measured>=1.0 && measured<=80.0){
+                        pairIntervalMs=measured;
+                        realIntervalMs=std::clamp(realIntervalMs*0.75+measured*0.25,1.0,50.0);
+                    }
+                }
+                previousCaptureAt=captureTime;
+                flowReady=false;
+                realFramePending=true;
+                flowPending=(previous>=0 && resumeWarmup==0 && pairIntervalMs>0);
+                if(resumeWarmup>0)--resumeWarmup;
+                nextPrediction=maxPredictions+1;
+            }
+            if(current<0)continue;
+
+            if(realFramePending){
+                // Non-blocking wait: the separate producer in V35 can keep
+                // capturing during its 250ms wait. In single-thread V15 a
+                // blocking wait prevents new captures, making the image freeze.
+                const DWORD ready=WaitForSingleObject(dx.frameReady,0);
+                if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
+                if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
+
+                dx.PresentReal(UINT(current),ofGrid);
+                overlay.SetVisible(true);
+                realFramePending=false;
+                const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
+                const int configuredTarget=g_targetHz.load(std::memory_order_relaxed);
+                const int target=std::clamp(configuredTarget==0?int(monitorHz):configuredTarget,30,1000);
+                predictionMode=mode;
+                predictionTargetHz=target;
+                predictionRealIntervalMs=realIntervalMs;
+                maxPredictions=mode==0?5u:(mode>1?unsigned(mode-1):0u);
+                // Allow 5% timing jitter when native updates already meet the target.
+                if(mode==0 && predictionRealIntervalMs<=1.05*1000.0/target)
+                    maxPredictions=0;
+                nextPrediction=1;
+                // Avoid optical flow work when the entire prediction window has expired.
+                LARGE_INTEGER afterPresent{};
+                QueryPerformanceCounter(&afterPresent);
+                const double ageMs=1000.0 * double(afterPresent.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
+                if(flowPending){
+                    if(maxPredictions>0 && ageMs<predictionRealIntervalMs){
+                        flow.Calculate(current,previous);
                         flowReady=true;
                     }
                     flowPending=false;
                 }
-                QueryPerformanceCounter(&previousPresent);
-            }else{
-                // Event-driven wait when the next prediction isn't yet due.
-                const DWORD millis=DWORD(std::clamp((step-sincePresent)*1000.,0.,2.));
-                if(millis){
-                    const DWORD wake=MsgWaitForMultipleObjectsEx(1,&capture.arrivalEvent,millis,
-                        QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-                    if(wake==WAIT_FAILED)throw Error("WGC/frame pacing wait failed",GetLastError());
-                }else SwitchToThread();
+                continue;
             }
+            if(!flowReady || nextPrediction>maxPredictions){
+                captureWaitMs=4;
+                continue;
+            }
+            const double slotMs=predictionMode==0 ? 1000.0/predictionTargetHz
+                                                   : predictionRealIntervalMs/predictionMode;
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            const double elapsedMs=1000.0 * double(now.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
+            if(elapsedMs>=predictionRealIntervalMs ||
+               slotMs*nextPrediction>=predictionRealIntervalMs){
+                nextPrediction=maxPredictions+1;
+                continue;
+            }
+            if(elapsedMs<slotMs*nextPrediction){
+                SwitchToThread();
+                continue;
+            }
+            // Submit only the most recent due slot after a delayed GPU or CPU
+            // wakeup. Back-to-back catch-up presents can replace each other.
+            unsigned dueSlot=std::min(maxPredictions,unsigned(elapsedMs/slotMs));
+            nextPrediction=std::max(nextPrediction,dueSlot);
+            const double predictionMs=nextPrediction*slotMs;
+            // A successful wait consumes a presentation slot. Once acquired,
+            // always submit this frame before polling the handle again.
+            const DWORD ready=WaitForSingleObject(dx.frameReady,0);
+            if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
+            if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
+
+            const float fraction=float(std::min(1.0,predictionMs/pairIntervalMs));
+            dx.Draw(UINT(current),UINT(previous>=0?previous:current),
+                    flow.motionSRV.Get(),fraction,ofGrid);
+            ++nextPrediction;
+            captureWaitMs=(nextPrediction<=maxPredictions)?0:4;
         }
-        g_running.store(false,std::memory_order_release);
         overlay.SetVisible(false);
-        capture.Close();
-        // FrameLifetimeGuard flushes the GPU and closes retained WGC frames,
-        // even on exception paths, before NvOFA and D3D11 teardown.
         Status(L"Stopped");
-    }catch(const WgcNeedsRecreate&){
-        g_running.store(false,std::memory_order_release);
-        if(!tracked.Exited()&&!g_userStopRequested.load())return SessionOutcome::Recreate;
-    }catch(const winrt::hresult_error& e){
-        if(!tracked.Exited()&&!g_userStopRequested.load())
-            Status(L"FG error: WGC HRESULT "+Wide(winrt::to_string(e.message())));
-        g_running.store(false,std::memory_order_release);
+    }catch(const DisplayChanged&){
+        return SessionOutcome::Recreate;
     }catch(const std::exception& e){
-        if(!tracked.Exited()&&!g_userStopRequested.load())
+        if(!tracked.Exited() && !g_userStopRequested.load())
             Status(L"FG error: "+Wide(e.what()));
+        else Status(L"Stopped");
         g_running.store(false,std::memory_order_release);
     }
     return SessionOutcome::Stop;
@@ -789,22 +688,24 @@ void Engine(Game game){
         const ULONGLONG now=GetTickCount64();
         if(now-windowStart>10000){windowStart=now;restartCount=0;}
         if(++restartCount>3){
-            Status(L"Source error: WGC window size repeatedly changed. "
-                   L"Full capture restart failed; check window/display mode.");
+            Status(L"Source error: DXGI capture repeatedly invalidated. "
+                   L"Full capture restart failed; check the display mode and driver.");
             break;
         }
         // Allow transient display-mode/topology changes to settle before
-        // rebuilding WGC and NvOFA for the selected game window.
+        // building a NEW D3D11 device, shared textures and NvOFA state.
         for(unsigned i=0;i<10&&!g_userStopRequested.load()&&!tracked.Exited();++i)
             Sleep(10);
     }
     g_running.store(false,std::memory_order_release);
     g_lastGameExited.store(tracked.Exited(),std::memory_order_release);
-    // Publish completion only AFTER all capture sessions have
-    // returned; never treat a transient WGC recreation as a full stop.
+    // Publish completion only AFTER all sessions and capture threads have
+    // returned; never treat a transient DXGI capture recreation as a full stop.
     g_engineFinished.store(true,std::memory_order_release);
     if(g_control)PostMessageW(g_control,WM_FG_STOPPED,tracked.Exited()?1u:0u,0);
 }
+#include "session_process.inc"
+
 
 
 void InitUiStyle(HWND hwnd){
@@ -894,6 +795,14 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
+    if(msg==WM_INPUT){
+        RAWINPUT input{};UINT bytes=sizeof(input);
+        if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))==sizeof(input) &&
+           input.header.dwType==RIM_TYPEMOUSE && !(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
+            fgwarp::mouseX.fetch_add(input.data.mouse.lLastX);fgwarp::mouseY.fetch_add(input.data.mouse.lLastY);
+        }
+        return DefWindowProcW(hwnd,msg,wp,lp);
+    }
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -917,10 +826,13 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             SendMessageW(g_multi,CB_ADDSTRING,0,(LPARAM)mode);
         SendMessageW(g_multi,CB_SETCURSEL,0,0);
         UiLabel(hwnd,L"Target FPS",217,225,95,20,true);
-        g_dynamicTarget=CreateWindowW(L"EDIT",L"240",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
+        g_dynamicTarget=CreateWindowW(L"EDIT",L"320",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
             218,247,100,27,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDynamicTarget)),nullptr,nullptr);
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
+        HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+            36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
+        StyleControl(warpCheck);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -937,7 +849,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         StyleControl(g_centerFeatherEdit);
         SendMessageW(g_centerFeatherEdit,EM_SETLIMITTEXT,3,0);
         // The timer is a fallback for a missed/late worker completion message.
-        // It never enables Start while WGC is still restarting or tearing down.
+        // It never enables Start while DXGI capture is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
         RefreshGames();return 0;
     }
@@ -975,7 +887,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
            !IsWindowEnabled(g_start)){
             // Engine owns GPU teardown; only the GUI joins after completion.
             if(g_worker.joinable())g_worker.join();
-            EnableWindow(g_start,TRUE);
+            EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);
             EnableWindow(g_stop,FALSE);
             if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         }
@@ -988,6 +900,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
+        case 120:
+            fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
+            break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
@@ -1041,8 +956,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_userStopRequested.store(false,std::memory_order_release);
             g_lastGameExited.store(false,std::memory_order_release);
             g_engineFinished.store(false,std::memory_order_release);
-            g_running.store(true);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
-            g_worker=std::thread([game]{Engine(game);});
+            g_running.store(true);EnableWindow(GetDlgItem(hwnd,120),FALSE);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
+            g_worker=std::thread([game]{RunIsolated(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
             break;
@@ -1061,11 +976,11 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_FG_STOPPED:
-        // A session can temporarily stop for WGC recovery. Only the final
+        // A session can temporarily stop for DXGI capture recovery. Only the final
         // outer Engine() completion is allowed to unlock another Start.
         if(!g_engineFinished.load(std::memory_order_acquire))return 0;
         if(g_worker.joinable())g_worker.join();
-        EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
+        EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
         if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         return 0;
     case WM_DESTROY:
@@ -1083,16 +998,17 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 } // namespace
-int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR args,int){
     // Obtain physical monitor/window dimensions rather than DPI-virtualized pixels.
     if(!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
     WNDCLASSW o{};o.hInstance=instance;o.lpfnWndProc=OverlayProc;
-    o.lpszClassName=L"FGWGCOverlay";o.hCursor=nullptr;
+    o.lpszClassName=L"FGDXGIOverlay";o.hCursor=nullptr;
     o.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));
     if(!RegisterClassW(&o))return 1;
+    if(wcsncmp(args,L"--fg-session ",13)==0)return RunChild(wcstoul(args+13,nullptr,10));
     WNDCLASSW c{};c.hInstance=instance;c.lpfnWndProc=ControlProc;
-    c.lpszClassName=L"FGWGCControl";c.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+    c.lpszClassName=L"FGDXGIControl";c.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     c.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));
     c.hbrBackground=CreateSolidBrush(kBackground);
     if(!RegisterClassW(&c))return 1;
