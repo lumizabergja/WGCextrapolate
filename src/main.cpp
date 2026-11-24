@@ -630,8 +630,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // output slots per native interval rather than always rounding down.
                 if(mode==0){
                     double slots=std::clamp(predictionRealIntervalMs*target/1000.0,1.0,6.0);
-                    const double near=std::round(slots);
-                    if(std::abs(slots-near)<0.10)slots=near;
+                    const double nearestSlot=std::round(slots);
+                    if(std::abs(slots-nearestSlot)<0.10)slots=nearestSlot;
                     const double desired=slots+dynamicCarry;
                     const unsigned count=std::clamp(unsigned(std::floor(desired)),1u,6u);
                     dynamicCarry=std::clamp(desired-double(count),0.0,0.999);
