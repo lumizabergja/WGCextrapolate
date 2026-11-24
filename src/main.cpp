@@ -211,7 +211,7 @@ struct DxDevices {
         if(session)InterlockedExchange(&session->backend,1);
         native.stageCallback=[](const wchar_t* stage){if(session)lstrcpynW(session->stage,stage,96);};
         if(!native.Init(dev11.Get(),matchingAdapter.Get(),desktop))
-            throw Error(native.detail);
+            throw std::runtime_error(native.detail);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -323,7 +323,7 @@ float4 PS(V i):SV_Target {
         const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
         if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
         if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
-        throw Error(native.detail);
+        throw std::runtime_error(native.detail);
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
     struct Params{
