@@ -1,8 +1,8 @@
-name: FG DXGI 320 All-Frame Late Warp
+name: FG WGC 320 Windows 11 26H2
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-dxgi-320-allframe-latewarp']
+    branches: ['fg-wgc-320-26h2']
 permissions:
   contents: read
 jobs:
@@ -17,14 +17,14 @@ jobs:
           if not defined VSROOT exit /b 1
           call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b 1
+          echo Windows SDK: %WindowsSDKVersion%
           call Build.cmd
           if errorlevel 1 exit /b 1
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-DXGI-320-AllFrameLateWarp-Windows-x64
+          name: FG-WGC-320-26H2-Windows-x64
           path: |
             bin/FG.exe
-            bin/FrameWarpRuntime/**
             README.md
           if-no-files-found: error
