@@ -55,6 +55,7 @@ constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
 std::atomic<int> g_fgMode{2};
 std::atomic<int> g_targetHz{320};
+std::atomic<bool> g_immediatePresent{false};
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -147,13 +148,28 @@ struct OverlayWindow {
     ~OverlayWindow(){if(hwnd)DestroyWindow(hwnd);g_overlay=nullptr;}
 };
 
+// Short interruptible pacing without a global timer-resolution change.
+struct PaceTimer {
+    HANDLE timer{};
+    PaceTimer(){timer=CreateWaitableTimerExW(nullptr,nullptr,0x2,TIMER_ALL_ACCESS);
+        if(!timer)timer=CreateWaitableTimerW(nullptr,FALSE,nullptr);}
+    ~PaceTimer(){if(timer)CloseHandle(timer);}
+    void Pause(unsigned us=150){
+        if(!timer){SwitchToThread();return;}
+        LARGE_INTEGER due{};due.QuadPart=-10LL*us;
+        if(SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE))
+            WaitForSingleObject(timer,2);
+        else SwitchToThread();
+    }
+};
 struct DxDevices {
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
     ComPtr<IDXGISwapChain2> lowLatencySwap;
     HANDLE frameReady{}; // Closed before releasing the swapchain.
-    bool allowTearing{};
+    bool allowTearing{},immediate{},frameHeld{};
+    ComPtr<IDXGIResource> acquiredResource;
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
@@ -166,7 +182,23 @@ struct DxDevices {
     ComPtr<IDXGIAdapter> matchingAdapter;
     ComPtr<IDXGIOutputDuplication> duplication;
     DXGI_OUTPUT_DESC desktop{};
-    ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
+    void ReleaseAcquired(){
+        if(!frameHeld)return;
+        acquiredResource.Reset();
+        frameHeld=false;
+        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
+    }
+    ~DxDevices(){
+        if(frameHeld&&duplication){acquiredResource.Reset();duplication->ReleaseFrame();}
+        if(frameReady)CloseHandle(frameReady);
+    }
+    bool Ready(){
+        if(immediate)return true;
+        const DWORD r=WaitForSingleObject(frameReady,0);
+        if(r==WAIT_TIMEOUT)return false;
+        if(r!=WAIT_OBJECT_0)throw Error("Swapchain frame latency wait failed",GetLastError());
+        return true;
+    }
     void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
         srcW=w;srcH=h;screenW=outputW;screenH=outputH;
         HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
@@ -196,7 +228,12 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
+        ComPtr<IDXGIOutput5> output5;
+        if(SUCCEEDED(captureOutput.As(&output5))){
+            const DXGI_FORMAT formats[]={DXGI_FORMAT_B8G8R8A8_UNORM};
+            CheckDuplication(output5->DuplicateOutput1(dev11.Get(),0,1,formats,&duplication),"DuplicateOutput1 BGRA8");
+        }else CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"DuplicateOutput fallback");
+        immediate=g_immediatePresent.load(std::memory_order_relaxed);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -212,13 +249,18 @@ struct DxDevices {
                     &supported,sizeof(supported))) && supported)
                 allowTearing=true;
         }
-        sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+        sc.Flags=(immediate?0u:DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
         Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd low latency");
-        Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
-        Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
-        frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
-        if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
+        if(immediate){
+            ComPtr<IDXGIDevice1> deviceLatency;Check(dev11.As(&deviceLatency),"Query device latency");
+            Check(deviceLatency->SetMaximumFrameLatency(1),"Set device max frame latency 1");
+        }else{
+            Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
+            Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1");
+            frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
+            if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
+        }
         Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
         D3D11_TEXTURE2D_DESC input{};
@@ -298,14 +340,12 @@ float4 PS(V i):SV_Target {
     }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
         DXGI_OUTDUPL_FRAME_INFO info{};
-        ComPtr<IDXGIResource> resource;
-        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
+        // Keep ownership through rendering; release immediately before the next acquisition.
+        ReleaseAcquired();
+        HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&acquiredResource);
         if(hr==DXGI_ERROR_WAIT_TIMEOUT)return false;
         CheckDuplication(hr,"Acquire desktop frame");
-        struct Lease {
-            IDXGIOutputDuplication* owner;
-            ~Lease(){if(owner)owner->ReleaseFrame();}
-        } lease{duplication.Get()};
+        frameHeld=true;
         // DXGI has already masked protected pixels in the acquired texture.
         bool updated=info.LastPresentTime.QuadPart!=0;
         if(updated){
@@ -319,15 +359,14 @@ float4 PS(V i):SV_Target {
                y+LONG(srcH)>desktop.DesktopCoordinates.bottom-desktop.DesktopCoordinates.top)
                 throw Error("Keep the entire game client on the selected monitor");
             ComPtr<ID3D11Texture2D> texture;
-            Check(resource.As(&texture),"Read desktop texture");
+            Check(acquiredResource.As(&texture),"Read desktop texture");
             D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
             if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
+            if(desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM)throw Error("V4 requires SDR BGRA8 capture");
             D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
             ctx11->CopySubresourceRegion(history[slot].Get(),0,0,0,0,texture.Get(),0,&region);
             timestamp=info.LastPresentTime;
         }
-        lease.owner=nullptr;
-        CheckDuplication(duplication->ReleaseFrame(),"Release desktop frame");
         return updated;
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
@@ -337,7 +376,7 @@ float4 PS(V i):SV_Target {
         float centerRadiusPx,centerFeatherPx,outputW,outputH;
     };
     static_assert(sizeof(Params)==48);
-    void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
+    bool Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
               float horizon,int grid){
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
@@ -365,22 +404,23 @@ float4 PS(V i):SV_Target {
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
-        Present();
+        return Present();
     }
-    void PresentReal(UINT current,int grid){
+    bool PresentReal(UINT current,int grid){
         if(srcW!=screenW || srcH!=screenH){
-            Draw(current,current,nullptr,0.f,grid);
-            return;
+            return Draw(current,current,nullptr,0.f,grid);
         }
         // Capture history and flip buffer share BGRA8, sample count and extent.
         ctx11->CopyResource(backBuffer.Get(),history[current].Get());
-        Present();
+        return Present();
     }
-    void Present(){
-        // Present with sync=0; request tearing only when supported and enabled
-        // on the swapchain.  This leaves actual Independent Flip up to Windows.
-        const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        Check(swap->Present(0,flags),"DX11 low-latency Present");
+    bool Present(){
+        const UINT flags=(allowTearing?DXGI_PRESENT_ALLOW_TEARING:0u)|
+                         (immediate?DXGI_PRESENT_DO_NOT_WAIT:0u);
+        const HRESULT hr=swap->Present(0,flags);
+        if(hr==DXGI_ERROR_WAS_STILL_DRAWING)return false;
+        Check(hr,"DX11 low-latency Present");
+        return true;
     }
 };
 
@@ -393,7 +433,7 @@ struct Flow11 {
     ComPtr<ID3D11Texture2D> motionTexture;
     ComPtr<ID3D11ShaderResourceView> motionSRV;
     void Init(DxDevices& d,int grid){
-        library=LoadLibraryW(L"nvofapi64.dll");if(!library)throw Error("nvofapi64.dll missing");
+        library=LoadLibraryExW(L"nvofapi64.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);if(!library)throw Error("nvofapi64.dll missing");
         auto entry=(decltype(&NvOFAPICreateInstanceD3D11))GetProcAddress(library,"NvOFAPICreateInstanceD3D11");
         if(!entry)throw Error("NvOFAPICreateInstanceD3D11 missing");
         NvCheck(entry(NV_OF_API_VERSION,&funcs),"NVOFA D3D11 API initialization");
@@ -460,7 +500,7 @@ struct TrackedGame {
             GetWindowThreadProcessId(game.window,&owner)==0||owner!=game.pid;
     }
 };
-#include "primary_probe.h"
+
 enum class SessionOutcome { Stop, Recreate };
 
 // One session owns ALL DXGI capture, D3D11, and NvOFA resources. Returning from
@@ -488,12 +528,14 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
+        PaceTimer timer;
         // Anchor predictions to the DXGI desktop update timestamp. During
         // that train, only make zero-timeout duplication calls.
 
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
-        LARGE_INTEGER previousCaptureAt{};
+        LARGE_INTEGER previousCaptureAt{},lastRealSubmit{};
+        double dynamicCarry=0.0;
         double realIntervalMs=16.667;
         int current=-1,previous=-1;
         bool flowReady=false;
@@ -505,8 +547,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
 
         unsigned nextPrediction=1;
         unsigned maxPredictions=0;
-        int predictionMode=2;
-        int predictionTargetHz=320;
+        double predictionSlotMs=3.125;
         double predictionRealIntervalMs=16.667;
         // Only the V15 render thread touches the D3D11 immediate context,
         // DXGI duplication, NvOFA surfaces and swapchain. No second thread
@@ -526,6 +567,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const bool focused=!IsIconic(game.window)&&foregroundPid==game.pid;
             if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             if(!focused){
+                dx.ReleaseAcquired();
                 overlay.SetVisible(false);
                 wasFocused=false;
                 flowReady=false;
@@ -538,7 +580,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused){
                 wasFocused=true;
                 resumeWarmup=2;
-                current=-1;previous=-1;previousCaptureAt={};
+                current=-1;previous=-1;previousCaptureAt={};lastRealSubmit={};dynamicCarry=0.0;
                 realIntervalMs=16.667;
                 flowReady=false;
                 realFramePending=false;
@@ -552,7 +594,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             LARGE_INTEGER captureTime{};
             int next=(current+1)%kNumCapture;
             const bool scheduling=realFramePending || (flowReady && nextPrediction<=maxPredictions);
-            if(!dx.Grab(game.window,next,scheduling?0u:captureWaitMs,captureTime))next=-1;
+            if(!dx.Grab(game.window,next,scheduling?0u:std::min<DWORD>(captureWaitMs,1u),captureTime))next=-1;
             captureWaitMs=4;
             if(next>=0){
                 previous=current;
@@ -575,28 +617,32 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // Non-blocking wait: the separate producer in V35 can keep
                 // capturing during its 250ms wait. In single-thread V15 a
                 // blocking wait prevents new captures, making the image freeze.
-                const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-                if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
-                if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
-
-                dx.PresentReal(UINT(current),ofGrid);
+                if(!dx.Ready()){timer.Pause();continue;}
+                if(!dx.PresentReal(UINT(current),ofGrid)){timer.Pause();continue;}
+                QueryPerformanceCounter(&lastRealSubmit);
                 overlay.SetVisible(true);
                 realFramePending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
                 const int configuredTarget=g_targetHz.load(std::memory_order_relaxed);
                 const int target=std::clamp(configuredTarget==0?int(monitorHz):configuredTarget,30,1000);
-                predictionMode=mode;
-                predictionTargetHz=target;
                 predictionRealIntervalMs=realIntervalMs;
-                maxPredictions=mode==0?5u:(mode>1?unsigned(mode-1):0u);
-                // Allow 5% timing jitter when native updates already meet the target.
-                if(mode==0 && predictionRealIntervalMs<=1.05*1000.0/target)
-                    maxPredictions=0;
+                // Fractional dynamic multiplier: e.g. 60 -> 320 alternates 5/6
+                // output slots per native interval rather than always rounding down.
+                if(mode==0){
+                    double slots=std::clamp(predictionRealIntervalMs*target/1000.0,1.0,6.0);
+                    const double near=std::round(slots);
+                    if(std::abs(slots-near)<0.10)slots=near;
+                    const double desired=slots+dynamicCarry;
+                    const unsigned count=std::clamp(unsigned(std::floor(desired)),1u,6u);
+                    dynamicCarry=std::clamp(desired-double(count),0.0,0.999);
+                    maxPredictions=count-1;
+                }else{dynamicCarry=0;maxPredictions=mode>1?unsigned(mode-1):0u;}
+                predictionSlotMs=predictionRealIntervalMs/double(maxPredictions+1);
                 nextPrediction=1;
                 // Avoid optical flow work when the entire prediction window has expired.
                 LARGE_INTEGER afterPresent{};
                 QueryPerformanceCounter(&afterPresent);
-                const double ageMs=1000.0 * double(afterPresent.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
+                const double ageMs=1000.0 * double(afterPresent.QuadPart-lastRealSubmit.QuadPart) / double(freq.QuadPart);
                 if(flowPending){
                     if(maxPredictions>0 && ageMs<predictionRealIntervalMs){
                         flow.Calculate(current,previous);
@@ -610,18 +656,17 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 captureWaitMs=4;
                 continue;
             }
-            const double slotMs=predictionMode==0 ? 1000.0/predictionTargetHz
-                                                   : predictionRealIntervalMs/predictionMode;
+            const double slotMs=predictionSlotMs;
             LARGE_INTEGER now{};
             QueryPerformanceCounter(&now);
-            const double elapsedMs=1000.0 * double(now.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
-            if(elapsedMs>=predictionRealIntervalMs ||
+            const double elapsedMs=1000.0 * double(now.QuadPart-lastRealSubmit.QuadPart) / double(freq.QuadPart);
+            if(elapsedMs>=predictionRealIntervalMs+slotMs*0.35 ||
                slotMs*nextPrediction>=predictionRealIntervalMs){
                 nextPrediction=maxPredictions+1;
                 continue;
             }
             if(elapsedMs<slotMs*nextPrediction){
-                SwitchToThread();
+                timer.Pause(unsigned(std::clamp((slotMs*nextPrediction-elapsedMs)*1000.0,50.0,200.0)));
                 continue;
             }
             // Submit only the most recent due slot after a delayed GPU or CPU
@@ -631,13 +676,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const double predictionMs=nextPrediction*slotMs;
             // A successful wait consumes a presentation slot. Once acquired,
             // always submit this frame before polling the handle again.
-            const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-            if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
-            if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
+            if(!dx.Ready()){timer.Pause();continue;}
 
-            const float fraction=float(predictionMs/predictionRealIntervalMs);
-            dx.Draw(UINT(current),UINT(previous>=0?previous:current),
-                    flow.motionSRV.Get(),fraction,ofGrid);
+            const float fraction=float(std::clamp(predictionMs/predictionRealIntervalMs,0.0,1.0));
+            if(!dx.Draw(UINT(current),UINT(previous>=0?previous:current),
+                    flow.motionSRV.Get(),fraction,ofGrid)){timer.Pause();continue;}
             ++nextPrediction;
             captureWaitMs=(nextPrediction<=maxPredictions)?0:4;
         }
@@ -790,7 +833,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             386,135,140,31,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefresh)),nullptr,nullptr);
         StyleControl(g_refresh);
         UiLabel(hwnd,L"FRAME GENERATION",36,176,180,18,true);
-        g_primaryProbe=CreateWindowW(L"BUTTON",L"D3DKMT probe",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+        g_primaryProbe=CreateWindowW(L"BUTTON",L"Immediate present (test)",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
             285,173,240,25,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPrimaryProbe)),nullptr,nullptr);
         SendMessageW(g_primaryProbe,WM_SETFONT,(WPARAM)g_fontSmall,TRUE);
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
@@ -926,7 +969,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_engineFinished.store(false,std::memory_order_release);
             g_running.store(true);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
             const bool probe=SendMessageW(g_primaryProbe,BM_GETCHECK,0,0)==BST_CHECKED;
-            g_worker=std::thread([game,probe]{if(probe)PrimaryProbeEngine(game);else Engine(game);});
+            g_immediatePresent.store(probe,std::memory_order_relaxed);
+            g_worker=std::thread([game]{Engine(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
             break;
@@ -942,8 +986,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // No Ready/Running/Stopped display. Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
             MessageBoxW(hwnd,s.c_str(),L"FG error",MB_OK|MB_ICONERROR);
-        else if(s.rfind(L"Probe result:",0)==0)
-            MessageBoxW(hwnd,s.c_str(),L"D3DKMT probe",MB_OK|MB_ICONINFORMATION);
+        
         return 0;
     }
     case WM_FG_STOPPED:
