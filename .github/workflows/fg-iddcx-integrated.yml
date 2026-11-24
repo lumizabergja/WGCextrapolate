@@ -1,0 +1,20 @@
+name: FG Mask 320 IddCx integrated Windows x64
+on:
+  push:
+    branches: [fg-320-iddcx-integrated]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile driver and FG
+        shell: pwsh
+        run: ./Build-IddBridge.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FG-320-IddCx-Integrated-x64
+          path: package/
+          if-no-files-found: error

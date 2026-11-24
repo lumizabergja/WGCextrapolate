@@ -3,8 +3,8 @@ image: Visual Studio 2022
 platform: x64
 configuration: Release
 build_script:
-  - ps: '& .\Build-IddProbe.ps1'
+  - ps: '& .\Build-IddBridge.ps1'
 test: off
 artifacts:
-  - path: FG-320-IddCx-Probe-x64-UNSIGNED.zip
-    name: FG-320-IddCx-Probe-x64-UNSIGNED
+  - path: FG-320-IddCx-Integrated-x64.zip
+    name: FG-320-IddCx-Integrated-x64
