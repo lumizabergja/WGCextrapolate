@@ -23,7 +23,7 @@ inline void ofcheck(NV_OF_STATUS s,const char* api){
 }
 struct Handle {HANDLE value{};~Handle(){if(value)CloseHandle(value);}};
 struct Presenter {
-    bool initialized{};
+    bool initialized{},warpEnabled{};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
@@ -43,20 +43,30 @@ struct Presenter {
     static float angle(long long n){return float(std::remainder(n*radiansPerCount,6.283185307179586));}
     void sourcePose(){camera.yaw=angle(mouseX.load());camera.pitch=angle(mouseY.load());}
     void open(IDXGIAdapter* adapter,HWND window,DXGI_SWAP_CHAIN_DESC1 desc,UINT srcW,UINT srcH,
-              IDXGISwapChain1** swap,ID3D11Device** d11,ID3D11DeviceContext** c11){
-        v124::FactoryFn factoryFn{};v124::DeviceFn create{};
-        initialized=true;v124::Load(factoryFn,create);
-        ComPtr<IDXGIFactory2> factory;check(factoryFn(IID_PPV_ARGS(&factory)),"Warp factory");
-        ComPtr<IDXGIAdapter1> adapter1;check(adapter->QueryInterface(IID_PPV_ARGS(&adapter1)),"Warp adapter");
-        check(create(adapter,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"Warp device");
-        v124::Bind(device.Get());v124::CheckAdapter(adapter1.Get());
-        D3D12_COMMAND_QUEUE_DESC q{};check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"Warp queue");
-        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen{};fullscreen.Windowed=TRUE;fullscreen.RefreshRate.Denominator=1;
-        check(factory->CreateSwapChainForHwnd(queue.Get(),window,&desc,&fullscreen,nullptr,swap),"Warp swap chain");
-        v124::RequireSwapchainProxy(*swap);check((*swap)->QueryInterface(IID_PPV_ARGS(&chain)),"Warp chain index");
-        ComPtr<ID3D12Device> native;v124::NativeInterface(device.Get(),reinterpret_cast<void**>(native.GetAddressOf()));
-        ComPtr<ID3D12CommandQueue> nativeQueue;v124::NativeInterface(queue.Get(),reinterpret_cast<void**>(nativeQueue.GetAddressOf()));
-        queue=std::move(nativeQueue);device=native;
+              IDXGISwapChain1** swap,ID3D11Device** d11,ID3D11DeviceContext** c11,bool enableWarp){
+        initialized=true;warpEnabled=enableWarp;
+        ComPtr<IDXGIFactory2> factory;
+        if(warpEnabled){
+            v124::FactoryFn factoryFn{};v124::DeviceFn create{};
+            v124::Load(factoryFn,create);
+            check(factoryFn(IID_PPV_ARGS(&factory)),"Warp factory");
+            ComPtr<IDXGIAdapter1> adapter1;check(adapter->QueryInterface(IID_PPV_ARGS(&adapter1)),"Warp adapter");
+            check(create(adapter,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"Warp device");
+            v124::Bind(device.Get());v124::CheckAdapter(adapter1.Get());
+        }else{
+            check(adapter->GetParent(IID_PPV_ARGS(&factory)),"Native12 factory");
+            check(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"Native12 device");
+        }
+        D3D12_COMMAND_QUEUE_DESC q{};check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"Native12 graphics queue");
+        check(factory->CreateSwapChainForHwnd(queue.Get(),window,&desc,nullptr,nullptr,swap),"Native12 swapchain");
+        if(warpEnabled)v124::RequireSwapchainProxy(*swap);
+        check((*swap)->QueryInterface(IID_PPV_ARGS(&chain)),"Native12 chain index");
+        if(warpEnabled){
+            ComPtr<ID3D12Device> native;v124::NativeInterface(device.Get(),reinterpret_cast<void**>(native.GetAddressOf()));
+            ComPtr<ID3D12CommandQueue> nativeQueue;
+            v124::NativeInterface(queue.Get(),reinterpret_cast<void**>(nativeQueue.GetAddressOf()));
+            queue=std::move(nativeQueue);device=native;
+        }
         IUnknown* queues[]={queue.Get()};
         check(D3D11On12CreateDevice(device.Get(),D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,queues,1,0,d11,c11,nullptr),"D3D11On12 capture device");
         check((*d11)->QueryInterface(IID_PPV_ARGS(&on12)),"ID3D11On12Device2");
@@ -73,8 +83,8 @@ struct Presenter {
         srvStep=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         rtvStep=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         for(UINT i=0;i<2;++i){check(chain->GetBuffer(i,IID_PPV_ARGS(&buffers[i])),"Native swapchain buffer");auto h=rtvHeap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(i)*rtvStep;device->CreateRenderTargetView(buffers[i].Get(),nullptr,h);}
-        v124::InitializePlanes(device.Get(),queue.Get(),width,height,srcW,srcH,2,UINT(1000.0*srcW/srcH));
-        camera.aspect=float(srcW)/srcH;camera.verticalFov=73.74f;v124::Enable();
+        if(warpEnabled){v124::InitializePlanes(device.Get(),queue.Get(),width,height,srcW,srcH,2,UINT(1000.0*srcW/srcH));
+        camera.aspect=float(srcW)/srcH;camera.verticalFov=73.74f;v124::Enable();}
     }
     void shaders(ID3DBlob* vs,ID3DBlob* ps,ID3DBlob* rvs,ID3DBlob* rps){
         D3D12_DESCRIPTOR_RANGE range{};range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;range.NumDescriptors=3;range.BaseShaderRegister=0;
@@ -125,9 +135,10 @@ struct Presenter {
     }
     static void sampleRealPose(v124::Camera& c){MSG input{};for(unsigned k=0;k<32&&PeekMessageW(&input,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++k)DispatchMessageW(&input);c.lateYaw=angle(mouseX.load());c.latePitch=angle(mouseY.load());}
     static void samplePredictedPose(v124::Camera& c){c.lateYaw=c.yaw;c.latePitch=c.pitch;}
+    bool slotReady()const{const UINT64 completed=fence->GetCompletedValue();if(completed==UINT64_MAX)throw std::runtime_error("Native12 device removed");return completed>=retired[chain->GetCurrentBackBufferIndex()];}
     void render(ID3D12Resource* current,ID3D12Resource* previous,ID3D12Resource* motion,const void* params,
-                bool real,UINT flags,UINT w,UINT h){
-        UINT i=chain->GetCurrentBackBufferIndex();wait(retired[i]);
+                bool real,UINT flags,UINT w,UINT h,UINT radius,UINT feather){
+        UINT i=chain->GetCurrentBackBufferIndex();if(!slotReady())throw std::runtime_error("Native12 graphics slot not ready");
         check(allocator[i]->Reset(),"Native12 allocator reset");check(list->Reset(allocator[i].Get(),real?realPipeline.Get():fakePipeline.Get()),"Native12 list reset");
         auto cpu=srvHeap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(i)*3*srvStep;
         auto gpu=srvHeap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(i)*3*srvStep;
@@ -151,15 +162,15 @@ struct Presenter {
         if(!real&&previous!=current)barrier(previous,read,D3D12_RESOURCE_STATE_COMMON);
         if(!real)barrier(motion,read,D3D12_RESOURCE_STATE_COMMON);
         check(list->Close(),"Native12 draw close");ID3D12CommandList* lists[]={list.Get()};queue->ExecuteCommandLists(1,lists);
-        // The original Streamline 2.7 path still needs its separate HUD-less color copy.
-        v124::Frame frame{};frame.back=back;frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.camera=camera;
-        v124::Prepare(frame);
-        // Obtain the next Streamline token before reading the latest mouse pose.
-        // Preserve real-only correction to avoid double-predicting camera motion.
-        v124::LatchCamera(camera,real?&sampleRealPose:&samplePredictedPose);check(chain->Present(0,flags),"Native12 Frame Warp Present");v124::PresentEnd();
+        if(warpEnabled){
+            v124::Frame frame{};frame.back=back;frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.centerRadiusPx=radius;frame.centerFeatherPx=feather;frame.camera=camera;
+            v124::Prepare(frame);
+            v124::LatchCamera(camera,real?&sampleRealPose:&samplePredictedPose);
+            check(chain->Present(0,flags),"Native12 Frame Warp Present");v124::PresentEnd();
+        }else check(chain->Present(0,flags),"Native12 direct Present");
         retired[i]=signal();
     }
-    ~Presenter(){if(initialized){try{drain();}catch(...){}v124::Disable();v124::ReleasePlanes();for(auto& b:buffers)b.Reset();chain.Reset();list.Reset();for(auto& a:allocator)a.Reset();on12.Reset();queue.Reset();device.Reset();v124::Shutdown();}}
+    ~Presenter(){if(initialized){try{drain();}catch(...){}if(warpEnabled){v124::Disable();v124::ReleasePlanes();}for(auto& b:buffers)b.Reset();chain.Reset();list.Reset();for(auto& a:allocator)a.Reset();on12.Reset();queue.Reset();device.Reset();if(warpEnabled)v124::Shutdown();}}
 };
 
 struct NativeFlow {

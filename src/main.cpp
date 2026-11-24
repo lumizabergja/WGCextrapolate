@@ -134,7 +134,7 @@ struct OverlayWindow {
         if(!GetMonitorInfoW(monitor,&mi))throw Error("GetMonitorInfo failed",GetLastError());
         RECT r=mi.rcMonitor;width=r.right-r.left;height=r.bottom-r.top;
         originX=r.left;originY=r.top;
-        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW;
+        const DWORD normalEx=WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOREDIRECTIONBITMAP;
         hwnd=CreateWindowExW(normalEx,
             L"FGDXGIOverlay",L"FG",WS_POPUP,r.left,r.top,width,height,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
         if(!hwnd)throw Error("Create presenter window failed",GetLastError());
@@ -142,7 +142,7 @@ struct OverlayWindow {
         if(!SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA))
             throw Error("SetLayeredWindowAttributes failed",GetLastError());
         // Fail closed: without capture exclusion the presenter can recursively capture itself.
-        if(!SetWindowDisplayAffinity(hwnd,0x00000011))throw Error("WDA_EXCLUDEFROMCAPTURE unsupported",GetLastError());
+        // HWND-specific capture; same fully opaque click-through configuration for both modes.
         // Do not show over the control window; engine reveals it only when game has focus.
         ShowWindow(hwnd,SW_HIDE);
         visible=false;
@@ -273,20 +273,7 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        if(fgwarp::requested.load()){
-            warp.open(matchingAdapter.Get(),output,sc,w,h,swap.GetAddressOf(),dev11.GetAddressOf(),ctx11.GetAddressOf());
-        }else{
-        D3D_FEATURE_LEVEL obtained{};
-        Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        ComPtr<ID3D11Device5> fenceDevice;
-        Check(dev11.As(&fenceDevice),"Zero-copy requires ID3D11Device5");
-        Check(ctx11.As(&fenceContext),"Zero-copy requires ID3D11DeviceContext4");
-        Check(fenceDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&retirementFence)),"Create WGC retirement fence");
-        retireEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-        if(!retireEvent)throw Error("Create GPU retire event",GetLastError());
-            Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
-        }
+        warp.open(matchingAdapter.Get(),output,sc,w,h,swap.GetAddressOf(),dev11.GetAddressOf(),ctx11.GetAddressOf(),fgwarp::requested.load());
         QueryPerformanceFrequency(&captureFrequency);
         capture.Open(dev11.Get(),item,w,h);
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
@@ -394,7 +381,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         if(desc.Width!=srcW||desc.Height!=srcH||desc.MipLevels!=1||desc.ArraySize!=1||
             desc.SampleDesc.Count!=1||desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM)
             throw Error("Zero-copy rejected: WGC texture layout is incompatible");
-        if(!(desc.BindFlags&D3D11_BIND_SHADER_RESOURCE))
+        if(!warp.initialized&&!(desc.BindFlags&D3D11_BIND_SHADER_RESOURCE))
             throw Error("Zero-copy rejected: WGC texture has no shader-resource binding");
         const auto ticks=frame.SystemRelativeTime().count();
         timestamp.QuadPart=static_cast<LONGLONG>(static_cast<long double>(ticks)*captureFrequency.QuadPart/10000000.0L);
@@ -439,7 +426,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
               float(screenW),float(screenH)};
         if(warp.initialized){
             warp.render(history12[current].Get(),history12[previous].Get(),motion12,&p,false,
-                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH);return;
+                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH,UINT(p.centerRadiusPx),UINT(p.centerFeatherPx));return;
         }
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
@@ -462,7 +449,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     void PresentReal(UINT current,int /*grid*/){
         if(warp.initialized){
             warp.render(history12[current].Get(),nullptr,nullptr,nullptr,true,
-                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH);return;
+                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH,g_centerRadiusPx.load(std::memory_order_relaxed),g_centerFeatherPx.load(std::memory_order_relaxed));return;
         }
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
@@ -636,7 +623,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(dx.warp.initialized?L"Running - WGC native12 + Frame Warp":L"Running - WGC direct surfaces");
+        Status(dx.warp.warpEnabled?L"Running - Native12 + Frame Warp":L"Running - Native12 direct");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -718,7 +705,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             // becomes available while we were waiting on the timer.
             if(next>=0&&dx.Grab(game.window,next,0,stamp)){
                 arrival=now();++captureSerial;
-                if(dx.warp.initialized)dx.warp.sourcePose();
+                if(dx.warp.warpEnabled)dx.warp.sourcePose();
                 previous=current;current=next;pair=0.0;
                 dx.RetireExcept(current,previous);
                 if(priorSource>0&&stamp.QuadPart>priorSource){
@@ -734,6 +721,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(realPending){
                 if(!acquireSlot()){waitActivity(now()+ticks(next<0?.25:8.0),true);continue;}
+                if(!dx.warp.slotReady()){waitActivity(now()+ticks(.20),false);continue;}
                 dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
                 realPresented=lastPresented=now();
                 overlay.SetVisible(true);realPending=false;
@@ -777,7 +765,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
-            const double elapsed=ms(t-realPresented);
+            if(!dx.warp.slotReady()){waitActivity(std::min(expiry,now()+ticks(.20)),false);continue;}
+            const LONGLONG submitTime=now();
+            if(submitTime>=expiry){flowReady=false;continue;}
+            const double elapsed=ms(submitTime-realPresented);
             const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));

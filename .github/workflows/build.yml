@@ -1,8 +1,8 @@
-name: FG WGC 320 Native D3D12 Frame Warp
+name: FG WGC 320 Native12 Both Modes
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-26h2-native12-warp']
+    branches: ['fg-wgc-320-native12-both-modes']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-26H2-Native12-Warp-Windows-x64
+          name: FG-WGC-320-Native12-BothModes-Windows-x64
           path: |
             bin/FG.exe
             README.md
