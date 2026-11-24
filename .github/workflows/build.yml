@@ -1,8 +1,8 @@
-name: FG WGC 320 Low Latency Windows 11 26H2
+name: FG WGC 320 Independent Flip Warp OFF
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-26h2-lowlatency']
+    branches: ['fg-wgc-320-26h2-lowlatency-independent-flip']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-26H2-LowLatency-Windows-x64
+          name: FG-WGC-320-26H2-IndependentFlip-Windows-x64
           path: |
             bin/FG.exe
             README.md
