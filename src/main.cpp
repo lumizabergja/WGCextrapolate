@@ -178,6 +178,7 @@ struct DxDevices {
     ComPtr<IDXGIAdapter> matchingAdapter;
     ComPtr<IDXGIOutput1> captureOutput;
     fgnative::Capture native;
+    bool nativeRecreated{};
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
     void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
@@ -323,6 +324,19 @@ float4 PS(V i):SV_Target {
         const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
         if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
         if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
+        if(result==fgnative::Capture::Result::Abandoned && !native.verified && !nativeRecreated){
+            // An abandoned surface must never be reused. One bounded, native-only
+            // recreation before any captured frame has entered motion history.
+            nativeRecreated=true;
+            const auto original=native.detail;
+            native.Reset();
+            Sleep(50);
+            if(!native.Init(dev11.Get(),matchingAdapter.Get(),desktop))
+                throw std::runtime_error(original+"; native recreation failed: "+native.detail);
+            return false;
+        }
+        if(result==fgnative::Capture::Result::Abandoned && nativeRecreated)
+            throw std::runtime_error(native.detail+"; repeated after full native surface recreation");
         throw std::runtime_error(native.detail);
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
