@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <exception>
 #include <cmath>
 #include <cwchar>
 #include <dwmapi.h>
@@ -32,7 +33,7 @@
 
 using Microsoft::WRL::ComPtr;
 namespace {
-constexpr int kNumCapture = 3;
+constexpr int kNumCapture = 6;
 constexpr int kOpticalFlowGrid = 4; // This app has a fixed NvOFA FAST 4x4 path.
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
@@ -195,6 +196,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
+        CaptureMailbox mailbox(dx,game.window,game.pid);
         // Anchor predictions to the DXGI desktop update timestamp. During
         // that train, only make zero-timeout duplication calls.
 
@@ -233,6 +235,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const bool focused=!IsIconic(game.window)&&foregroundPid==game.pid;
             if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             if(!focused){
+                mailbox.SetActive(false);
                 overlay.SetVisible(false);
                 wasFocused=false;
                 flowReady=false;
@@ -244,6 +247,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(!wasFocused){
                 wasFocused=true;
+                mailbox.SetActive(true);
                 resumeWarmup=2;
                 current=-1;previous=-1;previousCaptureAt={};
                 realIntervalMs=16.667;
@@ -257,9 +261,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             // Always poll DXGI capture before a queued prediction. New real
             // frames supersede the old prediction train, as in V35's mailbox.
             LARGE_INTEGER captureTime{};
-            int next=(current+1)%kNumCapture;
-            const bool scheduling=realFramePending || (flowReady && nextPrediction<=maxPredictions);
-            if(!dx.Grab(game.window,next,scheduling?0u:captureWaitMs,captureTime))next=-1;
+            int next=mailbox.Take(captureTime);
             captureWaitMs=4;
             if(next>=0){
                 previous=current;
@@ -276,7 +278,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(resumeWarmup>0)--resumeWarmup;
                 nextPrediction=maxPredictions+1;
             }
-            if(current<0)continue;
+            if(current<0){Sleep(1);continue;}
 
             if(realFramePending){
                 // Non-blocking wait: the separate producer in V35 can keep
@@ -304,17 +306,21 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 LARGE_INTEGER afterPresent{};
                 QueryPerformanceCounter(&afterPresent);
                 const double ageMs=1000.0 * double(afterPresent.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
-                if(flowPending){
-                    if(maxPredictions>0 && ageMs<predictionRealIntervalMs){
-                        flow.Calculate(current,previous);
-                        flowReady=true;
-                    }
-                    flowPending=false;
-                }
+                if(flowPending && maxPredictions>0 && ageMs<predictionRealIntervalMs){
+                    flowReady=flow.Calculate(current,previous);
+                    flowPending=!flowReady;
+                }else flowPending=false;
                 continue;
+            }
+            if(flowPending && maxPredictions>0){
+                LARGE_INTEGER t{};QueryPerformanceCounter(&t);
+                const double age=1000.0*double(t.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
+                if(age>=predictionRealIntervalMs)flowPending=false;
+                else if(flow.Calculate(current,previous)){flowReady=true;flowPending=false;}
             }
             if(!flowReady || nextPrediction>maxPredictions){
                 captureWaitMs=4;
+                if(flowPending)SwitchToThread();else Sleep(1);
                 continue;
             }
             const double slotMs=predictionMode==0 ? 1000.0/predictionTargetHz
@@ -349,6 +355,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             ++nextPrediction;
             captureWaitMs=(nextPrediction<=maxPredictions)?0:4;
         }
+        mailbox.Stop();
         overlay.SetVisible(false);
         Status(L"Stopped");
     }catch(const DisplayChanged&){
@@ -498,7 +505,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             386,135,140,31,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefresh)),nullptr,nullptr);
         StyleControl(g_refresh);
         UiLabel(hwnd,L"FRAME GENERATION",36,176,180,18,true);
-        UiLabel(hwnd,L"UltraDirect D3D12",285,176,240,18,true);
+        UiLabel(hwnd,L"UltraDirect V2",285,176,240,18,true);
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
             36,229,160,210,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMultiplier)),nullptr,nullptr);
         StyleControl(g_multi);
