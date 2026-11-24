@@ -178,10 +178,9 @@ struct DxDevices {
     ComPtr<IDXGIAdapter> matchingAdapter;
     ComPtr<IDXGIOutput1> captureOutput;
     fgnative::Capture native;
-    bool nativeRecreated{};
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
-    void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
+    void Init(HWND output,HWND game,UINT w,UINT h,UINT outputW,UINT outputH){
         srcW=w;srcH=h;screenW=outputW;screenH=outputH;
         HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
         ComPtr<IDXGIFactory1> factory;
@@ -213,6 +212,30 @@ struct DxDevices {
         native.stageCallback=[](const wchar_t* stage){if(session)lstrcpynW(session->stage,stage,96);};
         if(!native.Init(dev11.Get(),matchingAdapter.Get(),desktop))
             throw std::runtime_error(native.detail);
+        // Validate the native producer BEFORE creating the presenter or NvOFA.
+        // Use only the selected window's ordinary visible desktop region.
+        D3D11_TEXTURE2D_DESC input{};
+        input.Width=w;input.Height=h;input.ArraySize=1;input.MipLevels=1;
+        input.SampleDesc.Count=1;input.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+        input.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        for(int i=0;i<kNumCapture;++i){
+            Check(dev11->CreateTexture2D(&input,nullptr,&history[i]),"Allocate capture history");
+            Check(dev11->CreateShaderResourceView(history[i].Get(),nullptr,&frameSRV[i]),"Capture history SRV");
+        }
+        LARGE_INTEGER probeStamp{};
+        const ULONGLONG probeStart=GetTickCount64();
+        try{
+            while(!g_userStopRequested.load()&&IsWindow(game)){
+                if(session)InterlockedExchange64(&session->heartbeat,static_cast<LONG64>(GetTickCount64()));
+                if(Grab(game,0,1,probeStamp))break;
+                if(GetTickCount64()-probeStart>4500)throw std::runtime_error("Native pre-presenter validation timed out");
+            }
+        }catch(const std::exception& e){
+            char diagnostic[128];std::snprintf(diagnostic,sizeof(diagnostic),"; device status=0x%08lX; elapsed=%llu ms",
+                (unsigned long)dev11->GetDeviceRemovedReason(),(unsigned long long)(GetTickCount64()-probeStart));
+            throw std::runtime_error(std::string("Before presenter/NvOFA: ")+e.what()+diagnostic);
+        }
+        if(g_userStopRequested.load()||!IsWindow(game))throw std::runtime_error("Native startup cancelled");
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -238,14 +261,6 @@ struct DxDevices {
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
         if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
-        D3D11_TEXTURE2D_DESC input{};
-        input.Width=w;input.Height=h;input.ArraySize=1;input.MipLevels=1;
-        input.SampleDesc.Count=1;input.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
-        input.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        for(int i=0;i<kNumCapture;++i){
-            Check(dev11->CreateTexture2D(&input,nullptr,&history[i]),"Allocate capture history");
-            Check(dev11->CreateShaderResourceView(history[i].Get(),nullptr,&frameSRV[i]),"Capture history SRV");
-        }
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
         static const char* shader=R"HLSL(
@@ -324,19 +339,6 @@ float4 PS(V i):SV_Target {
         const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
         if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
         if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
-        if(result==fgnative::Capture::Result::Abandoned && !native.verified && !nativeRecreated){
-            // An abandoned surface must never be reused. One bounded, native-only
-            // recreation before any captured frame has entered motion history.
-            nativeRecreated=true;
-            const auto original=native.detail;
-            native.Reset();
-            Sleep(50);
-            if(!native.Init(dev11.Get(),matchingAdapter.Get(),desktop))
-                throw std::runtime_error(original+"; native recreation failed: "+native.detail);
-            return false;
-        }
-        if(result==fgnative::Capture::Result::Abandoned && nativeRecreated)
-            throw std::runtime_error(native.detail+"; repeated after full native surface recreation");
         throw std::runtime_error(native.detail);
     }
     // 48-byte constant buffer: motion settings plus center-only protection.
@@ -495,7 +497,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(session){lstrcpynW(session->stage,L"Capture and presenter initialization",96);
             if(fgwarp::requested.load()){RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
             if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());}}
-        DxDevices dx;dx.Init(overlay.hwnd,sourceW,sourceH,overlay.width,overlay.height);
+        DxDevices dx;dx.Init(overlay.hwnd,game.window,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
         Status(L"Running");
 
@@ -977,7 +979,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_FG_BACKEND:
-        SetWindowTextW(hwnd,wp==2?L"FG - D3DKMT Native: validated frames":L"FG - D3DKMT Native Only: waiting");
+        SetWindowTextW(hwnd,wp==2?L"FG - D3DKMT Native: validated frames":L"FG - D3DKMT V3: validating before presenter");
         return 0;
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
