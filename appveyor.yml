@@ -1,0 +1,28 @@
+version: '1.0.{build}'
+image: Visual Studio 2022
+platform: x64
+configuration: Release
+branches:
+  only:
+    - fg-wgc-320-shared-zero-copy
+build_script:
+  - cmd: |
+      for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+      if not defined VSROOT exit /b 1
+      call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+      if errorlevel 1 exit /b 1
+      echo Windows SDK: %WindowsSDKVersion%
+      call Build.cmd
+      if errorlevel 1 exit /b 1
+      if not exist bin\FG.exe exit /b 1
+  - ps: |
+      $ErrorActionPreference = 'Stop'
+      New-Item -ItemType Directory -Force artifacts | Out-Null
+      $files = @('bin/FG.exe','README.md')
+      if (Test-Path 'bin/FrameWarpRuntime') { $files += 'bin/FrameWarpRuntime' }
+      Compress-Archive -Path $files -DestinationPath 'artifacts/FG-WGC-320-SharedZeroCopy-BothModes-Windows-x64.zip' -Force
+      Get-Item 'artifacts/FG-WGC-320-SharedZeroCopy-BothModes-Windows-x64.zip'
+test: off
+artifacts:
+  - path: artifacts/FG-WGC-320-SharedZeroCopy-BothModes-Windows-x64.zip
+    name: FG-WGC-320-SharedZeroCopy-BothModes-Windows-x64
