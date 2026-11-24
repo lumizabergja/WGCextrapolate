@@ -7,3 +7,5 @@ The renderer rechecks capture before optical flow; uses an immediate-context D3D
 Warp OFF presents through native D3D11. Warp ON preserves the original Streamline 2.7 D3D12 presenter and real-only late mouse correction, including required shared-resource synchronization and color copies. Neither mode can force Independent Flip. Verify with PresentMon and confirm mouse click-through on the target PC.
 
 Build with MSVC x64 and a recent Windows SDK. Place the original six FrameWarpRuntime DLLs next to FG.exe under FrameWarpRuntime/. Actual compatibility and latency are untested.
+
+Center protection: both modes use identical output-pixel radius and feather. Warp ON passes the same settings into a per-swapchain-slot R8 NoWarpMask, replacing fixed HUD strips/center disk. Zero/zero disables protection. Mask uploads occur only when settings change. Feather behavior in the legacy Streamline binary must be confirmed on the target GPU.
