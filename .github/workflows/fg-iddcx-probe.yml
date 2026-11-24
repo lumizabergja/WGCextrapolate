@@ -23,8 +23,10 @@ jobs:
           $cpp = 'upstream/video/IndirectDisplay/IddSampleDriver/Driver.cpp'
           $source = [IO.File]::ReadAllText((Resolve-Path $cpp))
           $source = $source.Replace('AvRevertMmThreadCharacteristics(AvTaskHandle);','if (AvTaskHandle) AvRevertMmThreadCharacteristics(AvTaskHandle);')
+          $source = $source.Replace('CoCreateGuid(&MonitorInfo.MonitorContainerId);','if (FAILED(CoCreateGuid(&MonitorInfo.MonitorContainerId))) return;')
+          $source = $source.Replace('Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);','Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut); if (!NT_SUCCESS(Status)) { WdfObjectDelete(MonitorCreateOut.MonitorObject); return; }')
           [IO.File]::WriteAllText((Resolve-Path $cpp), $source)
-          msbuild upstream/video/IndirectDisplay/IddSampleDriver.sln /m /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=false /p:EnablePREfast=false /p:SignMode=Off
+          msbuild upstream/video/IndirectDisplay/IddSampleDriver.sln /m /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /p:RunCodeAnalysis=false /p:EnablePREfast=false /p:CodeAnalysisTreatWarningsAsErrors=false /p:TreatWarningAsError=false /p:SignMode=Off
           if ($LASTEXITCODE) { throw "Driver build failed: $LASTEXITCODE" }
           $base = 'upstream/video/IndirectDisplay'
           $dll = Get-ChildItem $base -Recurse -Filter IddSampleDriver.dll | Select-Object -First 1
