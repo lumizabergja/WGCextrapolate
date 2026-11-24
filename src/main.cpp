@@ -152,6 +152,7 @@ struct OverlayWindow {
 };
 
 struct DxDevices {
+    fgwarp::Presenter warp;
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
@@ -162,7 +163,8 @@ struct DxDevices {
     ComPtr<ID3D11Texture2D> backBuffer;
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps,realPS;
+    ComPtr<ID3D11VertexShader> realVS;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11Buffer> constants;
     // A WGC frame lease owns the original surface until GPU retirement.
@@ -275,12 +277,13 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
+        if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
+        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+        if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
@@ -343,6 +346,19 @@ float4 PS(V i):SV_Target {
         errs.Reset();hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs);
         if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"PS compile",hr);
         Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
+        static const char* realShader=R"HLSL(
+Texture2D<float4> src:register(t0);
+SamplerState s:register(s0);
+struct V{float4 pos:SV_Position;float2 uv:TEXCOORD0;};
+V VS(uint id:SV_VertexID){V v;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);v.pos=float4(p,0,1);v.uv=float2((p.x+1)*.5,1-(p.y+1)*.5);return v;}
+float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
+)HLSL";
+        vsBlob.Reset();psBlob.Reset();errs.Reset();
+        Check(D3DCompile(realShader,strlen(realShader),"FG real",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs),"Compile real VS");
+        Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&realVS),"Real VS");
+        errs.Reset();
+        Check(D3DCompile(realShader,strlen(realShader),"FG real",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs),"Compile real PS");
+        Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&realPS),"Real PS");
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
         Check(dev11->CreateSamplerState(&sd,&sampler),"Sampler");
@@ -416,14 +432,25 @@ float4 PS(V i):SV_Target {
         ctx11->VSSetShaderResources(0,3,nullViews);
         Present(horizon==0.f);
     }
-    void PresentReal(UINT current,int grid){
-        // Real frames also sample the leased WGC texture directly into the flip buffer.
-        Draw(current,current,nullptr,0.f,grid);
+    void PresentReal(UINT current,int /*grid*/){
+        D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
+        ctx11->RSSetViewports(1,&vp);
+        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+        ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx11->VSSetShader(realVS.Get(),nullptr,0);
+        ctx11->PSSetShader(realPS.Get(),nullptr,0);
+        ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
+        ctx11->PSSetShaderResources(0,1,frameSRV[current].GetAddressOf());
+        ctx11->Draw(3,0);
+        ID3D11ShaderResourceView* empty=nullptr;
+        ctx11->PSSetShaderResources(0,1,&empty);
+        Present(true);
     }
-    void Present(bool /*real*/){
+    void Present(bool real){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        if(warp.initialized){warp.present(flags,srcW,srcH,real);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
 };
@@ -549,9 +576,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
             throw Error("Invalid game native capture resolution");
         if(session)lstrcpynW(session->stage,L"Strict zero-copy WGC initialization",96);
+        if(fgwarp::requested.load()){
+            RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
+            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());
+        }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(L"Running - WGC direct surfaces");
+        Status(dx.warp.initialized?L"Running - WGC direct + Frame Warp":L"Running - WGC direct surfaces");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -596,7 +627,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
         uint64_t captureSerial=0,lastFlowSerial=0;
-        bool flowReady=false,realPending=false,wasFocused=false;
+        bool flowReady=false,realPending=false,flowPending=false,wasFocused=false;
         unsigned nextPrediction=1,maxPredictions=0;
         int measurements=0,warmup=0;
         while(g_running.load(std::memory_order_acquire)){
@@ -613,7 +644,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
             flow.Reap();
             if(!focused){
-                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;
+                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;flowPending=false;
                 dx.RetireExcept(-1,-1);
                 // Release queued WGC frames while unfocused so resume starts fresh.
                 if(auto dropped=dx.capture.Latest(0))dropped.Close();
@@ -623,16 +654,17 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
-                flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
+                flowReady=false;realPending=false;flowPending=false;maxPredictions=0;nextPrediction=1;
                 realPresented=lastPresented=0;
             }
             LARGE_INTEGER stamp{};
             const int next=dx.FreeSlot();
-            if(next<0){waitActivity(now()+ticks(0.5),false);continue;}
+
             // New real frames always win the mailbox, including when a present slot
             // becomes available while we were waiting on the timer.
-            if(dx.Grab(game.window,next,0,stamp)){
+            if(next>=0&&dx.Grab(game.window,next,0,stamp)){
                 arrival=now();++captureSerial;
+                if(dx.warp.initialized)dx.warp.sourcePose();
                 previous=current;current=next;pair=0.0;
                 dx.RetireExcept(current,previous);
                 if(priorSource>0&&stamp.QuadPart>priorSource){
@@ -643,11 +675,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     }
                 }
                 priorSource=stamp.QuadPart;
-                realPending=true;flowReady=false;maxPredictions=0;nextPrediction=1;
+                realPending=true;flowReady=false;flowPending=false;maxPredictions=0;nextPrediction=1;
                 if(warmup>0)--warmup;
             }
             if(realPending){
-                if(!acquireSlot()){waitActivity(now()+ticks(8),true);continue;}
+                if(!acquireSlot()){waitActivity(now()+ticks(next<0?.25:8.0),true);continue;}
                 dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
                 realPresented=lastPresented=now();
                 overlay.SetVisible(true);realPending=false;
@@ -662,8 +694,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
                 const LONGLONG expiry=arrival+ticks(interval*1.10);
-                if(maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
-                    realPresented+ticks(slotMs*.70)<expiry){
+                flowPending=maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
+                    realPresented+ticks(slotMs*.70)<expiry;
+                continue;
+            }
+            if(flowPending){
+                flowPending=false;
+                if(now()+ticks(slotMs*.35)<arrival+ticks(interval*1.10)){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
                     flow.Calculate(current,previous,continuous);
                     lastFlowSerial=captureSerial;flowReady=true;
@@ -671,7 +708,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 continue;
             }
             if(!flowReady||nextPrediction>maxPredictions){
-                waitActivity(now()+ticks(8),false);continue;
+                waitActivity(now()+ticks(next<0?.25:8.0),false);continue;
             }
             const LONGLONG t=now();
             // Pacing begins at actual real submission, not WGC's earlier source
@@ -867,7 +904,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
         HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
             36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
-        StyleControl(warpCheck);EnableWindow(warpCheck,FALSE);SetWindowTextW(warpCheck,L"Frame Warp (off - zero copy)");
+        StyleControl(warpCheck);SetWindowTextW(warpCheck,L"Reflex 2 Frame Warp (optional)");
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -936,7 +973,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:{
         switch(LOWORD(wp)){
         case 120:
-            fgwarp::requested.store(false);
+            fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
             break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
