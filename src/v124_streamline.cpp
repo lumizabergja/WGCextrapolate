@@ -137,20 +137,7 @@ void Prepare(const Frame& f){Stage(L"Latewarp native resource copy");if(!active|
 // Native 2.7 binary reads camera frame N+1 in its Present evaluator. Submit
 // that token with the actual new pose and the exact source pose in the
 // prevRendered fields, AFTER preparing the source and immediately before Present.
-void LatchCamera(const Camera& source,LatePoseSampler sample){
-    Stage(L"Latewarp next camera token");
-    if(!active||!currentToken||!sample)throw std::runtime_error("V124 missing current token or pose sampler");
-    uint32_t next=frameId+1;sl27::FrameToken* t{};
-    Check(newToken(t,&next),"next Reflex camera token");
-    if(!t)throw std::runtime_error("V124 next frame token null");
-    const auto sourceMatrix=CameraMatrix(source.yaw,source.pitch),projection=Projection(source);
-    Camera target=source;
-    // All resource preparation and token acquisition precede this sample.
-    // Do not wait, copy, schedule or dispatch unrelated messages after it.
-    sample(target);
-    CameraData(*t,CameraMatrix(target.lateYaw,target.latePitch),sourceMatrix,projection);
-    Check(marker(sl27::PCLMarker::ePresentStart,*currentToken),"Reflex Present start");
-}
+void LatchCamera(const Camera& c){Stage(L"Latewarp next camera token");if(!active||!currentToken)throw std::runtime_error("V124 missing current token");uint32_t next=frameId+1;sl27::FrameToken* t{};Check(newToken(t,&next),"next Reflex camera token");if(!t)throw std::runtime_error("V124 next frame token null");CameraData(*t,CameraMatrix(c.lateYaw,c.latePitch),CameraMatrix(c.yaw,c.pitch),Projection(c));Check(marker(sl27::PCLMarker::ePresentStart,*currentToken),"Reflex Present start");}
 void PresentEnd(){Stage(L"Latewarp Present end");if(currentToken){Check(marker(sl27::PCLMarker::ePresentEnd,*currentToken),"Reflex Present end");currentToken=nullptr;++frameId;}}
 void ResetCameraHistory() noexcept{first=true;}
 void ReleasePlanes() noexcept{try{if(fence&&queue){HR(queue->Signal(fence.Get(),++serial),"Latewarp drain");Wait(serial);}}catch(...){}slots.clear();depth.Reset();zeroMotion.Reset();fixedMask.Reset();zeroUI.Reset();fence.Reset();queue.Reset();device.Reset();if(eventHandle){CloseHandle(eventHandle);eventHandle=nullptr;}serial=0;}
