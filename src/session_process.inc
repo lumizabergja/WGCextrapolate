@@ -17,9 +17,8 @@ void RunIsolated(Game game){
         if(!mapping.value || GetLastError()==ERROR_ALREADY_EXISTS)throw Error("Create session mapping",GetLastError());
         MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
         if(!v.data)throw Error("Map session settings",GetLastError());
-        auto& s=*v.data;s.game=game.window;s.pid=game.pid;s.warp=fgwarp::requested.load();s.native=g_nativeRequested.load();s.backend=s.native?1:0;CopySettings(s);
+        auto& s=*v.data;s.game=game.window;s.pid=game.pid;s.warp=fgwarp::requested.load();s.native=1;s.backend=1;CopySettings(s);
         wchar_t file[32768]{};if(!GetModuleFileNameW(nullptr,file,32768))throw Error("Find FG executable",GetLastError());
-        bool retried=false;
         for(;;){
             auto cmd=L"\""+std::wstring(file)+L"\" --fg-session "+std::to_wstring(pid);
             STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION child{};
@@ -35,24 +34,17 @@ void RunIsolated(Game game){
                     InterlockedExchange(&s.stop,1);
                     if(!stopping)stopping=GetTickCount64();
                     if(GetTickCount64()-stopping>4000)TerminateProcess(proc.value,ERROR_CANCELLED);
-                }else if(!retried&&(backend==1||backend==2)){
+                }else if(backend==1||backend==2){
                     // Private native calls may block despite the nonblocking mutex.
-                    // Keep the launcher alive and restart with supported DXGI.
+                    // Keep the launcher alive; terminate the stuck native session without retry.
                     const auto hb=static_cast<ULONGLONG>(InterlockedCompareExchange64(&s.heartbeat,0,0));
                     if(GetTickCount64()-hb>6000){watchdog=true;TerminateProcess(proc.value,ERROR_TIMEOUT);}
                 }
             }
             DWORD code=0;GetExitCodeProcess(proc.value,&code);
-            const LONG backend=InterlockedCompareExchange(&s.backend,0,0);
-            if(!retried&&!g_userStopRequested.load()&&IsWindow(game.window)&&
-                (backend==1||backend==2)&&(watchdog||code||*s.error)){
-                retried=true;s.native=0;s.error[0]=0;s.stage[0]=0;
-                InterlockedExchange(&s.backend,3);InterlockedExchange(&s.stop,0);
-                PostMessageW(g_control,WM_FG_BACKEND,3,0);
-                continue;
-            }
             if(!g_userStopRequested.load()){
-                if(*s.error)Status(s.error);
+                if(watchdog){wchar_t msg[256];swprintf(msg,256,L"FG error: D3DKMT native watchdog timeout. Last stage: %ls",s.stage);Status(msg);}
+                else if(*s.error)Status(s.error);
                 else if(code){wchar_t msg[160];swprintf(msg,160,L"FG error: Capture session exited (0x%08lX). Stage: %ls",code,s.stage);Status(msg);}
             }
             break;
@@ -69,7 +61,7 @@ int RunChild(DWORD parent){
     if(!mapping.value||!owner.value)return ERROR_INVALID_HANDLE;
     MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
     if(!v.data)return ERROR_INVALID_DATA;
-    session=v.data;v124::stageCallback=[](const wchar_t* stage){lstrcpynW(session->stage,stage,96);};fgwarp::requested.store(session->warp!=0);g_nativeRequested.store(session->native!=0);
+    session=v.data;v124::stageCallback=[](const wchar_t* stage){lstrcpynW(session->stage,stage,96);};fgwarp::requested.store(session->warp!=0);g_nativeRequested.store(true);
     std::atomic<bool> finished{false};
     std::thread monitor([&]{
         while(!finished.load()){
