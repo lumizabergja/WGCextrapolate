@@ -170,6 +170,7 @@ struct DxDevices {
     // A WGC frame lease owns the original surface until GPU retirement.
     wgc::Direct3D11CaptureFrame leases[kNumCapture]{nullptr,nullptr,nullptr,nullptr};
     ComPtr<ID3D11Texture2D> history[kNumCapture];
+    ComPtr<ID3D12Resource> history12[kNumCapture];
     ComPtr<ID3D11DeviceContext4> fenceContext;
     ComPtr<ID3D11Fence> retirementFence;
     UINT64 nextFence{};
@@ -183,11 +184,15 @@ struct DxDevices {
     ~DxDevices(){
         // Flow11 has already retired GPU work and unregistered OFA resources.
         capture.StopSession();
-        for(int i=0;i<kNumCapture;++i)ReleaseLease(i);
+        for(int i=0;i<kNumCapture;++i){try{ReleaseLease(i);}catch(...){}}
         if(retireEvent)CloseHandle(retireEvent);
         if(frameReady)CloseHandle(frameReady);
     }
-    void ReleaseLease(int i) noexcept{
+    void ReleaseLease(int i){
+        if(history12[i]){
+            warp.giveBack(history[i].Get(),retiring[i]?retiring[i]:warp.serial);
+            history12[i].Reset();
+        }
         frameSRV[i].Reset();history[i].Reset();retiring[i]=0;
         if(leases[i]){try{leases[i].Close();}catch(...){}leases[i]=nullptr;}
     }
@@ -200,21 +205,23 @@ struct DxDevices {
         for(int i=0;i<kNumCapture;++i)
             if(leases[i]&&!retiring[i]&&i!=current&&i!=previous)pending=true;
         if(!pending)return;
-        const UINT64 value=++nextFence;
-        Check(fenceContext->Signal(retirementFence.Get(),value),"Signal WGC retirement fence");
+        UINT64 value{};
+        if(warp.initialized)value=warp.signal();
+        else{value=++nextFence;Check(fenceContext->Signal(retirementFence.Get(),value),"Signal WGC retirement fence");}
         for(int i=0;i<kNumCapture;++i)
             if(leases[i]&&!retiring[i]&&i!=current&&i!=previous)retiring[i]=value;
         // OFA may have queued work after the previous Present; submit once per
         // retired batch, without waiting on the render thread.
-        ctx11->Flush();
+        if(!warp.initialized)ctx11->Flush();
     }
     UINT64 Completed() const {
-        const UINT64 v=retirementFence->GetCompletedValue();
+        const UINT64 v=warp.initialized?warp.fence->GetCompletedValue():retirementFence->GetCompletedValue();
         if(v==UINT64_MAX)throw Error("WGC retirement device removed",dev11->GetDeviceRemovedReason());
         return v;
     }
     void DrainForShutdown() noexcept{
         capture.StopSession(); // no producer can reuse surfaces during teardown
+        if(warp.initialized){try{warp.drain();}catch(...){}return;}
         if(!fenceContext||!retirementFence||!retireEvent)return;
         const UINT64 value=++nextFence;
         if(FAILED(fenceContext->Signal(retirementFence.Get(),value)))return;
@@ -249,17 +256,6 @@ struct DxDevices {
         if(!captureOutput)throw Error("Selected monitor unavailable");
         if(desktop.Rotation!=DXGI_MODE_ROTATION_IDENTITY)
             throw Error("Select an unrotated monitor");
-        D3D_FEATURE_LEVEL obtained{};
-        Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        ComPtr<ID3D11Device5> fenceDevice;
-        Check(dev11.As(&fenceDevice),"Zero-copy requires ID3D11Device5");
-        Check(ctx11.As(&fenceContext),"Zero-copy requires ID3D11DeviceContext4");
-        Check(fenceDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&retirementFence)),"Create WGC retirement fence");
-        retireEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-        if(!retireEvent)throw Error("Create GPU retire event",GetLastError());
-        QueryPerformanceFrequency(&captureFrequency);
-        capture.Open(dev11.Get(),item,w,h);
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -277,14 +273,30 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
-        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
+        if(fgwarp::requested.load()){
+            warp.open(matchingAdapter.Get(),output,sc,w,h,swap.GetAddressOf(),dev11.GetAddressOf(),ctx11.GetAddressOf());
+        }else{
+        D3D_FEATURE_LEVEL obtained{};
+        Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
+        ComPtr<ID3D11Device5> fenceDevice;
+        Check(dev11.As(&fenceDevice),"Zero-copy requires ID3D11Device5");
+        Check(ctx11.As(&fenceContext),"Zero-copy requires ID3D11DeviceContext4");
+        Check(fenceDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&retirementFence)),"Create WGC retirement fence");
+        retireEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if(!retireEvent)throw Error("Create GPU retire event",GetLastError());
+            Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
+        }
+        QueryPerformanceFrequency(&captureFrequency);
+        capture.Open(dev11.Get(),item,w,h);
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
-        Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
+        if(!warp.initialized){
+            Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+            Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
+        }
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
         static const char* shader=R"HLSL(
@@ -342,10 +354,11 @@ float4 PS(V i):SV_Target {
         ComPtr<ID3DBlob> vsBlob,psBlob,errs;
         HRESULT hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs);
         if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"VS compile",hr);
-        Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&vs),"VertexShader");
+        if(!warp.initialized)Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&vs),"VertexShader");
         errs.Reset();hr=D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs);
         if(FAILED(hr))throw Error(errs?std::string((char*)errs->GetBufferPointer(),errs->GetBufferSize()):"PS compile",hr);
-        Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
+        if(!warp.initialized)Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
+        ComPtr<ID3DBlob> fakeVSBlob=vsBlob,fakePSBlob=psBlob;
         static const char* realShader=R"HLSL(
 Texture2D<float4> src:register(t0);
 SamplerState s:register(s0);
@@ -355,9 +368,10 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
 )HLSL";
         vsBlob.Reset();psBlob.Reset();errs.Reset();
         Check(D3DCompile(realShader,strlen(realShader),"FG real",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs),"Compile real VS");
-        Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&realVS),"Real VS");
+        if(!warp.initialized)Check(dev11->CreateVertexShader(vsBlob->GetBufferPointer(),vsBlob->GetBufferSize(),nullptr,&realVS),"Real VS");
         errs.Reset();
         Check(D3DCompile(realShader,strlen(realShader),"FG real",nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&psBlob,&errs),"Compile real PS");
+        if(warp.initialized){warp.shaders(fakeVSBlob.Get(),fakePSBlob.Get(),vsBlob.Get(),psBlob.Get());return;}
         Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&realPS),"Real PS");
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
@@ -387,11 +401,20 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         if(timestamp.QuadPart<=0)QueryPerformanceCounter(&timestamp);
         if(timestamp.QuadPart<=lastCaptureStamp.QuadPart){frame.Close();return false;}
         // No CopyResource, staging, cross-API sharing or CPU readback.
-        ComPtr<ID3D11ShaderResourceView> view;
-        Check(dev11->CreateShaderResourceView(source.Get(),nullptr,&view),"Zero-copy WGC SRV");
-        history[slot]=std::move(source);
-        frameSRV[slot]=std::move(view);
-        leases[slot]=frame;
+        if(warp.initialized){
+            // Checkout the same underlying D3D12 allocation; no NT handle or copy.
+            history12[slot]=warp.unwrap(source.Get(),ctx11.Get());
+            history[slot]=std::move(source);leases[slot]=frame;
+            const auto native=history12[slot]->GetDesc();
+            if(native.Width!=srcW||native.Height!=srcH||native.Format!=DXGI_FORMAT_B8G8R8A8_UNORM||
+                (native.Flags&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+                throw Error("Strict native12 WGC surface incompatible");
+            warp.signal();
+        }else{
+            ComPtr<ID3D11ShaderResourceView> view;
+            Check(dev11->CreateShaderResourceView(source.Get(),nullptr,&view),"Zero-copy WGC SRV");
+            history[slot]=std::move(source);frameSRV[slot]=std::move(view);leases[slot]=frame;
+        }
         lastCaptureStamp=timestamp;
         return true;
     }
@@ -403,7 +426,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     };
     static_assert(sizeof(Params)==48);
     void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
-              float horizon,int grid){
+              float horizon,int grid,ID3D12Resource* motion12=nullptr){
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
@@ -414,6 +437,10 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
               float(g_centerRadiusPx.load(std::memory_order_relaxed)),
               float(g_centerFeatherPx.load(std::memory_order_relaxed)),
               float(screenW),float(screenH)};
+        if(warp.initialized){
+            warp.render(history12[current].Get(),history12[previous].Get(),motion12,&p,false,
+                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH);return;
+        }
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
@@ -433,6 +460,10 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         Present(horizon==0.f);
     }
     void PresentReal(UINT current,int /*grid*/){
+        if(warp.initialized){
+            warp.render(history12[current].Get(),nullptr,nullptr,nullptr,true,
+                allowTearing?DXGI_PRESENT_ALLOW_TEARING:0,srcW,srcH);return;
+        }
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
         ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
@@ -446,17 +477,19 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->PSSetShaderResources(0,1,&empty);
         Present(true);
     }
-    void Present(bool real){
+    void Present(bool /*real*/){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH,real);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
 };
 
 struct Flow11 {
     DxDevices* owner{};
+    fgwarp::NativeFlow native;
+    NvOFGPUBufferHandle frames12[kNumCapture]{};
+    UINT64 ofUse[kNumCapture]{};
     HMODULE library{};
     NV_OF_D3D11_API_FUNCTION_LIST funcs{};
     NvOFHandle handle{};
@@ -466,6 +499,7 @@ struct Flow11 {
     ComPtr<ID3D11ShaderResourceView> motionSRV;
     void Init(DxDevices& d,int grid){
         owner=&d;
+        if(d.warp.initialized){native.init(d.warp,d.srcW,d.srcH);return;}
         library=LoadLibraryW(L"nvofapi64.dll");if(!library)throw Error("nvofapi64.dll missing");
         auto entry=(decltype(&NvOFAPICreateInstanceD3D11))GetProcAddress(library,"NvOFAPICreateInstanceD3D11");
         if(!entry)throw Error("NvOFAPICreateInstanceD3D11 missing");
@@ -502,6 +536,10 @@ struct Flow11 {
         const UINT64 done=owner->Completed();
         for(int i=0;i<kNumCapture;++i){
             if(!owner->retiring[i]||owner->retiring[i]>done)continue;
+            if(owner->warp.initialized){
+                if(ofUse[i]>native.completed())continue;
+                native.unregister(frames12[i]);ofUse[i]=0;
+            }
             if(frames[i]){
                 NvCheck(funcs.nvOFUnregisterResourceD3D11(frames[i]),"Unregister retired WGC surface");
                 frames[i]=nullptr;
@@ -516,16 +554,32 @@ struct Flow11 {
         NvCheck(funcs.nvOFRegisterResourceD3D11(handle,owner->history[slot].Get(),&frames[slot]),
             "Zero-copy rejected: NvOFA direct WGC registration");
     }
-    void Calculate(int current,int previous,bool continuous){
+    bool Ready()const{return !owner->warp.initialized||native.ready();}
+    bool Calculate(int current,int previous,bool continuous){
+        if(owner->warp.initialized){
+            // Never enqueue new flow behind old flow. Real frames do not wait for OFA.
+            if(native.completed()<native.serial)return false;
+            for(int slot:{current,previous}){
+                if(!frames12[slot]){
+                    native.registerResource(owner->history12[slot].Get(),frames12[slot]);
+                    ofUse[slot]=native.serial;
+                }
+            }
+            native.execute(frames12[current],frames12[previous],continuous);
+            ofUse[current]=ofUse[previous]=native.serial;
+            return true;
+        }
         Register(current);Register(previous);
         NV_OF_EXECUTE_INPUT_PARAMS in{};
         in.inputFrame=frames[current];in.referenceFrame=frames[previous];
         in.disableTemporalHints=continuous?NV_OF_FALSE:NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
         NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
+        return true;
     }
     ~Flow11(){
         if(owner)owner->DrainForShutdown();
+        if(owner&&owner->warp.initialized){try{native.drain();for(auto& f:frames12)native.unregister(f);}catch(...){}}
         if(handle){
             for(auto &f:frames)if(f&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(f);
             if(motion&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(motion);
@@ -582,7 +636,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(dx.warp.initialized?L"Running - WGC direct + Frame Warp":L"Running - WGC direct surfaces");
+        Status(dx.warp.initialized?L"Running - WGC native12 + Frame Warp":L"Running - WGC direct surfaces");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -702,8 +756,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 flowPending=false;
                 if(now()+ticks(slotMs*.35)<arrival+ticks(interval*1.10)){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
-                    flow.Calculate(current,previous,continuous);
-                    lastFlowSerial=captureSerial;flowReady=true;
+                    flowReady=flow.Calculate(current,previous,continuous);
+                    if(flowReady)lastFlowSerial=captureSerial;
                 }
                 continue;
             }
@@ -719,6 +773,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                                         lastPresented+ticks(slotMs*.85));
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
+            if(!flow.Ready()){waitActivity(std::min(expiry,now()+ticks(.25)),false);continue;}
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
@@ -726,7 +781,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
-            dx.Draw(UINT(current),UINT(previous),flow.motionSRV.Get(),fraction,ofGrid);
+            dx.Draw(UINT(current),UINT(previous),flow.motionSRV.Get(),fraction,ofGrid,flow.native.motion.Get());
             slotHeld=false;lastPresented=now();++nextPrediction;
         }
         overlay.SetVisible(false);
@@ -904,7 +959,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
         HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
             36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
-        StyleControl(warpCheck);SetWindowTextW(warpCheck,L"Reflex 2 Frame Warp (optional)");
+        StyleControl(warpCheck);SetWindowTextW(warpCheck,L"Reflex 2 (Native D3D12)");
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
