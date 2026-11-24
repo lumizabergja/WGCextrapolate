@@ -31,6 +31,7 @@ struct Frame {
     ID3D12Resource* mask{};
     ID3D12Resource* motion{};
     UINT index{},sourceWidth{},sourceHeight{};
+    UINT centerRadiusPx{},centerFeatherPx{};
     Camera camera;
 };
 // Records only the resource preparation, then supplies frame tags and the
