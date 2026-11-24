@@ -1,7 +1,7 @@
-name: FG Mask 320 UltraDirect V2 Windows x64
+name: FG Mask 320 UltraDirect V3 Windows x64
 on:
   push:
-    branches: [fg-320-ultradirect-v2]
+    branches: [fg-320-ultradirect-v3]
   workflow_dispatch:
 permissions:
   contents: read
@@ -27,6 +27,6 @@ jobs:
           Get-Item package/FG.exe | Format-List Name,Length
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-320-UltraDirect-V2-Windows-x64
+          name: FG-320-UltraDirect-V3-Windows-x64
           path: package/
           if-no-files-found: error

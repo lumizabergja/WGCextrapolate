@@ -9,14 +9,7 @@ struct DxDevices {
     ComPtr<ID3D11Device5> dev5;
     ComPtr<ID3D11DeviceContext4> ctx4;
     ComPtr<ID3D12Device> dev12;
-    ComPtr<ID3D12CommandQueue> queue,copyQueue;
-    ComPtr<ID3D12CommandAllocator> copyAlloc;
-    ComPtr<ID3D12GraphicsCommandList> copyList;
-    HANDLE copyEvent{};
-    struct SharedSource {ComPtr<ID3D11Texture2D> src; ComPtr<ID3D12Resource> dst;};
-    std::vector<SharedSource> sourceCache;
-    bool directSupported=true;
-    std::atomic<UINT64> directFrames{0},fallbackFrames{0};
+    ComPtr<ID3D12CommandQueue> queue;
     UINT64 motionRead{};
     ComPtr<ID3D12Fence> captureFence,renderFence,ofFence;
     ComPtr<ID3D11Fence> capture11;
@@ -51,7 +44,7 @@ struct DxDevices {
         if(ofFence&&ofValue)WaitFence(ofFence.Get(),ofValue);
         if(renderFence&&renderValue)WaitFence(renderFence.Get(),renderValue);
     }
-    ~DxDevices(){try{Drain();}catch(...){}if(frameReady)CloseHandle(frameReady);if(eventHandle)CloseHandle(eventHandle);if(copyEvent)CloseHandle(copyEvent);}
+    ~DxDevices(){try{Drain();}catch(...){}if(frameReady)CloseHandle(frameReady);if(eventHandle)CloseHandle(eventHandle);}
     void MakeTexture(UINT w,UINT h,DXGI_FORMAT format,bool share,ID3D12Resource** res){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;hp.CreationNodeMask=1;hp.VisibleNodeMask=1;
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;
@@ -94,12 +87,6 @@ struct DxDevices {
         Check(D3D12CreateDevice(matchingAdapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&dev12)),"D3D12 device");
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
         Check(dev12->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"D3D12 direct queue");
-        q.Type=D3D12_COMMAND_LIST_TYPE_COPY;
-        Check(dev12->CreateCommandQueue(&q,IID_PPV_ARGS(&copyQueue)),"D3D12 capture copy queue");
-        Check(dev12->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&copyAlloc)),"Capture copy allocator");
-        Check(dev12->CreateCommandList(0,q.Type,copyAlloc.Get(),nullptr,IID_PPV_ARGS(&copyList)),"Capture copy list");
-        Check(copyList->Close(),"Close initial capture list");
-        copyEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!copyEvent)throw Error("Capture fence event",GetLastError());
         eventHandle=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!eventHandle)throw Error("Create fence event",GetLastError());
         Check(dev12->CreateFence(0,D3D12_FENCE_FLAG_SHARED,IID_PPV_ARGS(&captureFence)),"Shared capture fence");
         HANDLE shared{};
@@ -215,27 +202,6 @@ float4 PS(V i):SV_Target {
         pd.NumRenderTargets=1;pd.RTVFormats[0]=sc.Format;pd.SampleDesc.Count=1;
         Check(dev12->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&pso)),"Create D3D12 extrapolation PSO");
     }
-    // Looking Glass-style: try opening the acquired duplication texture as a D3D12 resource.
-    // Do not keep reading an acquired image after ReleaseFrame. Copy into private history first.
-    ID3D12Resource* OpenSource(ID3D11Texture2D* tex){
-        if(!directSupported)return nullptr;
-        for(auto& entry:sourceCache)if(entry.src.Get()==tex)return entry.dst.Get();
-        if(sourceCache.size()>=16){directSupported=false;return nullptr;}
-        ComPtr<IDXGIResource1> res;
-        if(FAILED(tex->QueryInterface(IID_PPV_ARGS(&res)))){directSupported=false;return nullptr;}
-        HANDLE handle{};
-        if(FAILED(res->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ,nullptr,&handle))){directSupported=false;return nullptr;}
-        SharedSource entry;entry.src=tex;
-        HRESULT hr=dev12->OpenSharedHandle(handle,IID_PPV_ARGS(&entry.dst));CloseHandle(handle);
-        if(FAILED(hr)){directSupported=false;return nullptr;}
-        sourceCache.push_back(std::move(entry));return sourceCache.back().dst.Get();
-    }
-    void CompleteCapture(UINT64 v){
-        if(Done(captureFence.Get(),v))return;
-        if(captureFence->GetCompletedValue()==UINT64_MAX)throw Error("Capture device removed");
-        Check(captureFence->SetEventOnCompletion(v,copyEvent),"Capture fence event");
-        if(WaitForSingleObject(copyEvent,2000)!=WAIT_OBJECT_0)throw Error("Capture GPU fence timeout");
-    }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
         // Slot ownership is reserved by the mailbox producer before acquisition.
         DXGI_OUTDUPL_FRAME_INFO info{};
@@ -265,29 +231,11 @@ float4 PS(V i):SV_Target {
             if(UINT(x)+srcW>desc.Width || UINT(y)+srcH>desc.Height)throw DisplayChanged{};
             D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
             if(desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM)throw Error("UltraDirect requires SDR BGRA8 capture");
-            if(auto* source=OpenSource(texture.Get())){
-                Check(ctx4->Signal(capture11.Get(),++captureValue),"Signal acquired image");
-                ctx11->Flush();
-                Check(copyQueue->Wait(captureFence.Get(),captureValue),"Copy queue wait for acquisition");
-                Check(copyAlloc->Reset(),"Reset copy allocator");
-                Check(copyList->Reset(copyAlloc.Get(),nullptr),"Reset capture copy list");
-                D3D12_TEXTURE_COPY_LOCATION from{},to{};
-                from.pResource=source;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                to.pResource=history[slot].Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                D3D12_BOX box{region.left,region.top,region.front,region.right,region.bottom,region.back};
-                copyList->CopyTextureRegion(&to,0,0,0,&from,&box);
-                Check(copyList->Close(),"Close capture copy list");
-                ID3D12CommandList* lists[]={copyList.Get()};copyQueue->ExecuteCommandLists(1,lists);
-                Check(copyQueue->Signal(captureFence.Get(),++captureValue),"Copy complete");
-                ++directFrames;
-            }else{
-                ctx11->CopySubresourceRegion(history11[slot].Get(),0,0,0,0,texture.Get(),0,&region);
-                Check(ctx4->Signal(capture11.Get(),++captureValue),"Signal fallback capture GPU fence");
-                ctx11->Flush();++fallbackFrames;
-            }
-            // Acquisition lifetime stays valid until the GPU has finished reading it.
-            // Only this capture thread waits; the presenter never waits on this copy.
-            CompleteCapture(captureValue);
+            // All source access is submitted on the duplication device itself.
+            // Private shared history is protected by the signal and consumer fences.
+            ctx11->CopySubresourceRegion(history11[slot].Get(),0,0,0,0,texture.Get(),0,&region);
+            Check(ctx4->Signal(capture11.Get(),++captureValue),"Signal capture GPU fence");
+            ctx11->Flush();
             captured[slot]=captureValue;
             timestamp=info.LastPresentTime;
         }
@@ -425,15 +373,26 @@ struct CaptureMailbox {
     std::mutex lock;
     std::atomic<bool> stopping{false};
     std::thread thread;
+    HANDLE wake{},timer{};
     int latest=-1,pinCurrent=-1,pinPrevious=-1;
     LARGE_INTEGER stamp{};
     std::exception_ptr failure;
     bool active=false;
     UINT epoch=0;
     CaptureMailbox(DxDevices& d,HWND h,DWORD p):dx(d),game(h),pid(p){
-        thread=std::thread([this]{Run();});
+        wake=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        timer=CreateWaitableTimerExW(nullptr,nullptr,0x2,TIMER_ALL_ACCESS);
+        if(!timer)timer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
+        if(!wake||!timer){if(wake)CloseHandle(wake);if(timer)CloseHandle(timer);throw Error("Create pacing events",GetLastError());}
+        try{thread=std::thread([this]{Run();});}catch(...){CloseHandle(wake);CloseHandle(timer);throw;}
     }
-    ~CaptureMailbox(){Stop();}
+    ~CaptureMailbox(){Stop();CloseHandle(wake);CloseHandle(timer);}
+    void Pause(unsigned us=250){
+        LARGE_INTEGER due{};due.QuadPart=-10LL*us;
+        if(!SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE)){SwitchToThread();return;}
+        HANDLE handles[]={wake,timer};
+        WaitForMultipleObjects(2,handles,FALSE,2);
+    }
     void Stop(){stopping=true;if(thread.joinable())thread.join();}
     void SetActive(bool enabled){
         std::lock_guard<std::mutex> guard(lock);
@@ -456,7 +415,8 @@ struct CaptureMailbox {
                         e=epoch;
                         for(int i=0;i<kNumCapture;++i){
                             if(i==pinCurrent||i==pinPrevious||i==latest)continue;
-                            if(!DxDevices::Done(dx.renderFence.Get(),dx.renderRead[i])||
+                            if(!DxDevices::Done(dx.captureFence.Get(),dx.captured[i])||
+                               !DxDevices::Done(dx.renderFence.Get(),dx.renderRead[i])||
                                !DxDevices::Done(dx.ofFence.Get(),dx.ofRead[i]))continue;
                             slot=i;break;
                         }
@@ -469,11 +429,11 @@ struct CaptureMailbox {
                 if(!dx.Grab(game,slot,4,ts))continue;
                 {
                     std::lock_guard<std::mutex> guard(lock);
-                    if(active&&epoch==e){latest=slot;stamp=ts;}
+                    if(active&&epoch==e){latest=slot;stamp=ts;SetEvent(wake);}
                 }
             }
         }catch(...){
-            std::lock_guard<std::mutex> guard(lock);failure=std::current_exception();
+            std::lock_guard<std::mutex> guard(lock);failure=std::current_exception();SetEvent(wake);
         }
     }
 };

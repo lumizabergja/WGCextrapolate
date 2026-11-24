@@ -197,12 +197,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
         CaptureMailbox mailbox(dx,game.window,game.pid);
+        Status(L"Capture path: single-copy async");
         // Anchor predictions to the DXGI desktop update timestamp. During
         // that train, only make zero-timeout duplication calls.
 
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
-        LARGE_INTEGER previousCaptureAt{};
+        LARGE_INTEGER previousCaptureAt{},lastRealSubmit{};
         double realIntervalMs=16.667;
         int current=-1,previous=-1;
         bool flowReady=false;
@@ -210,7 +211,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         bool flowPending=false;
         DWORD captureWaitMs=4;
         bool wasFocused=false;
-        int lastPath=-1;
         int resumeWarmup=0;
 
         unsigned nextPrediction=1;
@@ -250,7 +250,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 wasFocused=true;
                 mailbox.SetActive(true);
                 resumeWarmup=2;
-                current=-1;previous=-1;previousCaptureAt={};
+                current=-1;previous=-1;previousCaptureAt={};lastRealSubmit={};
                 realIntervalMs=16.667;
                 flowReady=false;
                 realFramePending=false;
@@ -265,8 +265,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             int next=mailbox.Take(captureTime);
             captureWaitMs=4;
             if(next>=0){
-                const int path=dx.fallbackFrames.load()?1:0;
-                if(lastPath!=path){lastPath=path;Status(path?L"Capture path: D3D11 fallback":L"Capture path: direct D3D12");}
                 previous=current;
                 current=next;
                 if(previousCaptureAt.QuadPart>0 && captureTime.QuadPart>previousCaptureAt.QuadPart && freq.QuadPart>0){
@@ -281,17 +279,18 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(resumeWarmup>0)--resumeWarmup;
                 nextPrediction=maxPredictions+1;
             }
-            if(current<0){Sleep(1);continue;}
+            if(current<0){mailbox.Pause();continue;}
 
             if(realFramePending){
                 // Non-blocking wait: the separate producer in V35 can keep
                 // capturing during its 250ms wait. In single-thread V15 a
                 // blocking wait prevents new captures, making the image freeze.
                 const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-                if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
+                if(ready==WAIT_TIMEOUT){captureWaitMs=1;mailbox.Pause();continue;}
                 if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
 
                 dx.PresentReal(UINT(current),ofGrid);
+                QueryPerformanceCounter(&lastRealSubmit);
                 overlay.SetVisible(true);
                 realFramePending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
@@ -308,7 +307,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // Avoid optical flow work when the entire prediction window has expired.
                 LARGE_INTEGER afterPresent{};
                 QueryPerformanceCounter(&afterPresent);
-                const double ageMs=1000.0 * double(afterPresent.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
+                const double ageMs=1000.0 * double(afterPresent.QuadPart-lastRealSubmit.QuadPart) / double(freq.QuadPart);
                 if(flowPending && maxPredictions>0 && ageMs<predictionRealIntervalMs){
                     flowReady=flow.Calculate(current,previous);
                     flowPending=!flowReady;
@@ -317,27 +316,27 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(flowPending && maxPredictions>0){
                 LARGE_INTEGER t{};QueryPerformanceCounter(&t);
-                const double age=1000.0*double(t.QuadPart-previousCaptureAt.QuadPart)/double(freq.QuadPart);
+                const double age=1000.0*double(t.QuadPart-lastRealSubmit.QuadPart)/double(freq.QuadPart);
                 if(age>=predictionRealIntervalMs)flowPending=false;
                 else if(flow.Calculate(current,previous)){flowReady=true;flowPending=false;}
             }
             if(!flowReady || nextPrediction>maxPredictions){
                 captureWaitMs=4;
-                if(flowPending)SwitchToThread();else Sleep(1);
+                mailbox.Pause();
                 continue;
             }
             const double slotMs=predictionMode==0 ? 1000.0/predictionTargetHz
                                                    : predictionRealIntervalMs/predictionMode;
             LARGE_INTEGER now{};
             QueryPerformanceCounter(&now);
-            const double elapsedMs=1000.0 * double(now.QuadPart-previousCaptureAt.QuadPart) / double(freq.QuadPart);
-            if(elapsedMs>=predictionRealIntervalMs ||
+            const double elapsedMs=1000.0 * double(now.QuadPart-lastRealSubmit.QuadPart) / double(freq.QuadPart);
+            if(elapsedMs>=predictionRealIntervalMs+slotMs*0.5 ||
                slotMs*nextPrediction>=predictionRealIntervalMs){
                 nextPrediction=maxPredictions+1;
                 continue;
             }
             if(elapsedMs<slotMs*nextPrediction){
-                SwitchToThread();
+                mailbox.Pause();
                 continue;
             }
             // Submit only the most recent due slot after a delayed GPU or CPU
@@ -347,12 +346,12 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const double predictionMs=nextPrediction*slotMs;
             // A successful wait consumes a presentation slot. Once acquired,
             // always submit this frame before polling the handle again.
-            if(!DxDevices::Done(dx.ofFence.Get(),dx.ofValue)){SwitchToThread();continue;}
+            if(!DxDevices::Done(dx.ofFence.Get(),dx.ofValue)){mailbox.Pause();continue;}
             const DWORD ready=WaitForSingleObject(dx.frameReady,0);
-            if(ready==WAIT_TIMEOUT){captureWaitMs=1;SwitchToThread();continue;}
+            if(ready==WAIT_TIMEOUT){captureWaitMs=1;mailbox.Pause();continue;}
             if(ready!=WAIT_OBJECT_0)throw Error("DXGI frame latency wait failed",GetLastError());
 
-            const float fraction=float(predictionMs/predictionRealIntervalMs);
+            const float fraction=float(std::clamp(predictionMs/predictionRealIntervalMs,0.0,1.0));
             dx.Draw(UINT(current),UINT(previous>=0?previous:current),
                     flow.motionSRV,fraction,ofGrid);
             ++nextPrediction;
@@ -508,7 +507,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             386,135,140,31,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefresh)),nullptr,nullptr);
         StyleControl(g_refresh);
         UiLabel(hwnd,L"FRAME GENERATION",36,176,180,18,true);
-        UiLabel(hwnd,L"UltraDirect V2",285,176,240,18,true);
+        UiLabel(hwnd,L"UltraDirect V3",285,176,240,18,true);
         g_multi=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL,
             36,229,160,210,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMultiplier)),nullptr,nullptr);
         StyleControl(g_multi);
@@ -655,8 +654,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
         // Show the actual capture route in the title, without logging.
-        if(s.rfind(L"Capture path:",0)==0)SetWindowTextW(hwnd,(L"FG UltraDirect V2 - "+s).c_str());
-        else if(s==L"Stopped")SetWindowTextW(hwnd,L"FG UltraDirect V2");
+        if(s.rfind(L"Capture path:",0)==0)SetWindowTextW(hwnd,(L"FG UltraDirect V3 - "+s).c_str());
+        else if(s==L"Stopped")SetWindowTextW(hwnd,L"FG UltraDirect V3");
         // Keep actionable errors visible.
         if(s.rfind(L"FG error:",0)==0||s.rfind(L"Source error:",0)==0)
             MessageBoxW(hwnd,s.c_str(),L"FG error",MB_OK|MB_ICONERROR);
