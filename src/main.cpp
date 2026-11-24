@@ -28,6 +28,7 @@
 #include <commctrl.h>
 #include <nvOpticalFlowD3D11.h>
 #include "warp_presenter.h"
+#include "native_duplication.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -37,7 +38,7 @@ constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
     kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109;
-constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
+constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78, WM_FG_BACKEND = WM_APP+79;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
 HWND g_refresh{};
@@ -56,6 +57,8 @@ constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
 std::atomic<int> g_fgMode{2};
 std::atomic<int> g_targetHz{320};
+std::atomic<bool> g_nativeRequested{true};
+// 0=DXGI, 1=trying native, 2=native frames validated, 3=DXGI fallback.
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -65,7 +68,8 @@ struct Game {HWND window;DWORD pid;std::wstring name;};
 std::vector<Game> g_games;
 
 struct SessionState{
-    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather;
+    HWND game;DWORD pid;LONG warp,native;volatile LONG stop,mode,target,radius,feather,backend;
+    alignas(8) volatile LONG64 heartbeat;
     wchar_t error[512],stage[96];
 };
 SessionState* session{};
@@ -173,6 +177,9 @@ struct DxDevices {
     UINT srcW{},srcH{},screenW{},screenH{};
     ComPtr<IDXGIAdapter> matchingAdapter;
     ComPtr<IDXGIOutputDuplication> duplication;
+    ComPtr<IDXGIOutput1> captureOutput;
+    fgnative::Capture native;
+    bool nativeActive{};
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){if(frameReady)CloseHandle(frameReady);}
     void Init(HWND output,UINT w,UINT h,UINT outputW,UINT outputH){
@@ -180,7 +187,6 @@ struct DxDevices {
         HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
         ComPtr<IDXGIFactory1> factory;
         Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"Create DXGI factory");
-        ComPtr<IDXGIOutput1> captureOutput;
         for(UINT i=0;!captureOutput;++i){
             ComPtr<IDXGIAdapter1> adapter;
             HRESULT hr=factory->EnumAdapters1(i,&adapter);
@@ -204,7 +210,11 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
-        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
+        if(g_nativeRequested.load()){
+            if(session)InterlockedExchange(&session->backend,1);
+            nativeActive=native.Init(dev11.Get(),matchingAdapter.Get(),desktop);
+            if(!nativeActive)Fallback();
+        }else OpenDXGI();
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -305,7 +315,33 @@ float4 PS(V i):SV_Target {
         D3D11_BUFFER_DESC bd{};bd.ByteWidth=48;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
     }
+    void OpenDXGI(){
+        // Original DXGI fallback: preserve existing behavior and driver support.
+        CheckDuplication(captureOutput->DuplicateOutput(dev11.Get(),&duplication),"Create desktop duplication");
+    }
+    void Fallback(){
+        const bool wasVerified=native.verified;
+        native.Reset();nativeActive=false;g_nativeRequested.store(false);
+        if(session)InterlockedExchange(&session->backend,3);
+        // If a native frame was already presented, restart the whole GPU session
+        // to discard any cross-backend motion history and hide the old overlay.
+        if(wasVerified)throw DisplayChanged{};
+        OpenDXGI();
+    }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
+        if(nativeActive){
+            RECT client{};POINT origin{};
+            if(!GetClientRect(game,&client)||!ClientToScreen(game,&origin))return false;
+            if(UINT(client.right)!=srcW||UINT(client.bottom)!=srcH||MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
+            const LONG x=origin.x-desktop.DesktopCoordinates.left,y=origin.y-desktop.DesktopCoordinates.top;
+            if(x<0||y<0||UINT(x)+srcW>native.w||UINT(y)+srcH>native.h||srcW<64||srcH<64){Fallback();return false;}
+            D3D11_BOX region{UINT(x),UINT(y),0,UINT(x)+srcW,UINT(y)+srcH,1};
+            const auto result=native.Grab(ctx11.Get(),history[slot].Get(),region,timestamp);
+            if(result==fgnative::Capture::Result::Frame){if(session)InterlockedExchange(&session->backend,2);return true;}
+            if(result==fgnative::Capture::Result::None){if(timeout)Sleep(1);return false;}
+            Fallback();
+        }
+
         DXGI_OUTDUPL_FRAME_INFO info{};
         ComPtr<IDXGIResource> resource;
         HRESULT hr=duplication->AcquireNextFrame(timeout,&info,&resource);
@@ -374,7 +410,7 @@ float4 PS(V i):SV_Target {
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
-        Present();
+        Present(horizon==0.f);
     }
     void PresentReal(UINT current,int grid){
         if(srcW!=screenW || srcH!=screenH){
@@ -383,13 +419,13 @@ float4 PS(V i):SV_Target {
         }
         // Capture history and flip buffer share BGRA8, sample count and extent.
         ctx11->CopyResource(backBuffer.Get(),history[current].Get());
-        Present();
+        Present(true);
     }
-    void Present(){
+    void Present(bool real){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH);return;}
+        if(warp.initialized){warp.present(flags,srcW,srcH,real);return;}
         Check(swap->Present(0,flags),"DX11 low-latency Present");
     }
 };
@@ -526,7 +562,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         // DXGI duplication, NvOFA surfaces and swapchain. No second thread
         // can overwrite a texture while it is being sampled or copied.
         while(g_running.load(std::memory_order_acquire)){
-            if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
+            if(session){InterlockedExchange64(&session->heartbeat,static_cast<LONG64>(GetTickCount64()));g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
             MSG message{};
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 TranslateMessage(&message);DispatchMessageW(&message);
@@ -831,8 +867,12 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
         HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
-            36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
+            36,285,220,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
         StyleControl(warpCheck);
+        HWND nativeCheck=CreateWindowW(L"BUTTON",L"D3DKMT (experimental)",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+            278,285,248,30,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
+        StyleControl(nativeCheck,false,true);
+        SendMessageW(nativeCheck,BM_SETCHECK,BST_CHECKED,0);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -887,7 +927,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
            !IsWindowEnabled(g_start)){
             // Engine owns GPU teardown; only the GUI joins after completion.
             if(g_worker.joinable())g_worker.join();
-            EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);
+            EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(GetDlgItem(hwnd,121),TRUE);EnableWindow(g_start,TRUE);
             EnableWindow(g_stop,FALSE);
             if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         }
@@ -900,6 +940,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
+        case 121:
+            g_nativeRequested.store(IsDlgButtonChecked(hwnd,121)==BST_CHECKED);
+            break;
         case 120:
             fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
             break;
@@ -952,11 +995,12 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             const Game game=g_games[size_t(selection)];
             auto chosen=SendMessageW(g_multi,CB_GETCURSEL,0,0);
             g_fgMode.store(chosen==CB_ERR?0:int(chosen));
+            g_nativeRequested.store(IsDlgButtonChecked(hwnd,121)==BST_CHECKED);
             if(g_worker.joinable())g_worker.join();
             g_userStopRequested.store(false,std::memory_order_release);
             g_lastGameExited.store(false,std::memory_order_release);
             g_engineFinished.store(false,std::memory_order_release);
-            g_running.store(true);EnableWindow(GetDlgItem(hwnd,120),FALSE);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
+            g_running.store(true);EnableWindow(GetDlgItem(hwnd,120),FALSE);EnableWindow(GetDlgItem(hwnd,121),FALSE);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
             g_worker=std::thread([game]{RunIsolated(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
@@ -968,6 +1012,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         }
         return 0;
     }
+    case WM_FG_BACKEND:
+        SetWindowTextW(hwnd,wp==1?L"FG - testing D3DKMT":wp==2?L"FG - D3DKMT experimental":wp==3?L"FG - DXGI fallback":L"FG - DXGI");
+        return 0;
     case WM_FG_STATUS:{
         std::wstring s;{std::lock_guard<std::mutex> l(g_statusLock);s=g_statusText;}
         // No Ready/Running/Stopped display. Keep actionable errors visible.
@@ -980,7 +1027,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // outer Engine() completion is allowed to unlock another Start.
         if(!g_engineFinished.load(std::memory_order_acquire))return 0;
         if(g_worker.joinable())g_worker.join();
-        EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
+        EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(GetDlgItem(hwnd,121),TRUE);EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
         if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         return 0;
     case WM_DESTROY:

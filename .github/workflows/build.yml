@@ -1,13 +1,13 @@
-name: FG DXGI 320 All-Frame Late Warp
+name: FG D3DKMT 320 LateInput Windows x64
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-dxgi-320-allframe-latewarp']
+    branches: ['fg-d3dkmt-320-lateinput-build']
 permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Compile with MSVC x64
@@ -22,9 +22,8 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-DXGI-320-AllFrameLateWarp-Windows-x64
+          name: FG-D3DKMT-320-LateInput-Windows-x64
           path: |
             bin/FG.exe
-            bin/FrameWarpRuntime/**
             README.md
           if-no-files-found: error

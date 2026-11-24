@@ -3,7 +3,6 @@
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include <atomic>
-#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -73,17 +72,7 @@ struct Presenter {
         check(fence->SetEventOnCompletion(n,event.value),"Warp fence event");
         if(WaitForSingleObject(event.value,3000)!=WAIT_OBJECT_0)throw std::runtime_error("Warp GPU timed out");
     }}
-    // Both captured and extrapolated frames use the same final pose callback.
-    // The source pose stays anchored to the captured image; never feed a late
-    // target back into the source pose for the following synthetic frame.
-    static void sampleLatePose(v124::Camera& pose){
-        MSG input{};
-        for(unsigned n=0;n<64 && PeekMessageW(&input,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++n)
-            DispatchMessageW(&input);
-        pose.lateYaw=angle(mouseX.load(std::memory_order_relaxed));
-        pose.latePitch=angle(mouseY.load(std::memory_order_relaxed));
-    }
-    void present(UINT flags,UINT w,UINT h){
+    void present(UINT flags,UINT w,UINT h,bool real){
         UINT i=chain->GetCurrentBackBufferIndex();wait(retired[i]);
         check(context->Signal(fence11.Get(),++serial),"Publish DXGI frame");context->Flush();
         check(queue->Wait(fence.Get(),serial),"Wait for DXGI color");
@@ -96,10 +85,15 @@ struct Presenter {
         ID3D12CommandList* lists[]={list.Get()};queue->ExecuteCommandLists(1,lists);
         v124::Frame frame{};frame.back=back.Get();frame.index=i;frame.sourceWidth=w;frame.sourceHeight=h;frame.camera=camera;
         v124::Prepare(frame);
-        // Resolve the next camera token and source matrices first; drain raw
-        // input and latch the final target pose as late as the legacy API allows.
-        v124::LatchCamera(camera,&sampleLatePose);
-        check(chain->Present(0,flags),"Native Frame Warp Present");v124::PresentEnd();
+        // The overlay and presenter share a thread. Dispatch mouse reports
+        // queued during GPU preparation before sampling the late pose.
+        if(real){
+            MSG input{};
+            for(unsigned i=0;i<32 && PeekMessageW(&input,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++i)
+                DispatchMessageW(&input);
+        }
+        camera.lateYaw=real?angle(mouseX.load()):camera.yaw;camera.latePitch=real?angle(mouseY.load()):camera.pitch;
+        v124::LatchCamera(camera);check(chain->Present(0,flags),"Native Frame Warp Present");v124::PresentEnd();
         check(queue->Signal(fence.Get(),++serial),"Retire warp frame");retired[i]=serial;
         check(context->Wait(fence11.Get(),serial),"Return shared color");
     }
