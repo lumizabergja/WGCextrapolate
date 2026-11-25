@@ -17,7 +17,7 @@ void RunIsolated(Game game){
         if(!mapping.value || GetLastError()==ERROR_ALREADY_EXISTS)throw Error("Create session mapping",GetLastError());
         MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
         if(!v.data)throw Error("Map session settings",GetLastError());
-        auto& s=*v.data;s.game=game.window;s.pid=game.pid;s.warp=fgwarp::requested.load();CopySettings(s);
+        auto& s=*v.data;s.game=game.window;s.pid=game.pid;s.warp=fgwarp::requested.load();s.mouseMode=g_mouseMode.load();CopySettings(s);
         wchar_t file[32768]{};if(!GetModuleFileNameW(nullptr,file,32768))throw Error("Find FG executable",GetLastError());
         auto cmd=L"\""+std::wstring(file)+L"\" --fg-session "+std::to_wstring(pid);
         STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION child{};
@@ -50,6 +50,7 @@ int RunChild(DWORD parent){
     MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
     if(!v.data)return ERROR_INVALID_DATA;
     session=v.data;fgwarp::stageCallback=[](const wchar_t* stage){lstrcpynW(session->stage,stage,96);};fgwarp::requested.store(session->warp!=0);
+    g_mouseMode.store(std::clamp(int(session->mouseMode),0,2));
     std::atomic<bool> finished{false};
     std::thread monitor([&]{
         while(!finished.load()){

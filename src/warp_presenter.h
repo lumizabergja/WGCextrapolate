@@ -37,7 +37,7 @@ struct Presenter {
     static constexpr double radiansPerCount=-.022*1.5*3.141592653589793/180.;
     static float angle(long long n){return float(std::remainder(n*radiansPerCount,6.283185307179586));}
     static std::array<float,16> camera(float y,float p){float cy=std::cos(y),sy=std::sin(y),cp=std::cos(p),sp=std::sin(p);return {cy,sy*sp,-sy*cp,0,0,cp,sp,0,sy,-cy*sp,cy*cp,0,0,0,0,1};}
-    void sourcePose(){yaw=angle(mouseX.load());pitch=angle(mouseY.load());}
+    void sourcePose(long long x,long long y){yaw=angle(x);pitch=angle(y);}
     ComPtr<ID3D11Texture2D> tex(DXGI_FORMAT fmt,UINT bind,const void* initial=nullptr,UINT pitchBytes=0){
         D3D11_TEXTURE2D_DESC d{};d.Width=w;d.Height=h;d.MipLevels=d.ArraySize=1;d.Format=fmt;d.SampleDesc.Count=1;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=bind;
         D3D11_SUBRESOURCE_DATA data{initial,pitchBytes,0};ComPtr<ID3D11Texture2D> out;check(device->CreateTexture2D(&d,initial?&data:nullptr,&out),"Native NGX DX11 texture");return out;
