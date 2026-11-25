@@ -32,12 +32,46 @@ public:
             if(samples[(first+mid)%capacity].t<=t)lo=mid+1;else hi=mid;}
         const auto& s=samples[(first+lo-1)%capacity];out={double(s.x),double(s.y)};return true;
     }
-    Correction correction(int64_t previous,int64_t current,int64_t latest,double horizon) const {
+    // Estimate future relative counts from three recent, coherent intervals.
+    // Receipt timestamps are not hardware timestamps; reject bursts and stale data.
+    Counts predict(int64_t latest,double ticksPerMs,double maxMs=3.) const {
+        if(count<4||ticksPerMs<=0||maxMs<=0)return {};
+        const auto& last=samples[(head+capacity-1)%capacity];
+        const double age=double(latest-last.t)/ticksPerMs;
+        if(age<0||age>=2.)return {};
+        Counts v[3]{};double speed[3]{};
+        for(std::size_t i=0;i<3;++i){
+            const auto& a=samples[(head+capacity-4+i)%capacity];
+            const auto& b=samples[(head+capacity-3+i)%capacity];
+            const double dt=double(b.t-a.t)/ticksPerMs;
+            if(dt<.45||dt>2.)return {};
+            v[i]={double(b.x-a.x)/dt,double(b.y-a.y)/dt};
+            speed[i]=std::hypot(v[i].x,v[i].y);
+            if(speed[i]<.25)return {};
+        }
+        double coherence=1.;
+        for(int i=0;i<2;++i){
+            const double dot=(v[i].x*v[2].x+v[i].y*v[2].y)/(speed[i]*speed[2]);
+            const double ratio=std::min(speed[i],speed[2])/std::max(speed[i],speed[2]);
+            if(dot<.85||ratio<.55)return {};
+            coherence=std::min(coherence,std::min(dot,ratio));
+        }
+        const double stability=std::clamp((coherence-.55)/.45,0.,1.);
+        const double freshness=std::clamp(2.-age,0.,1.);
+        const double lead=std::min(maxMs,3.)*(.25+.75*stability)*freshness;
+        Counts out{lead*(.2*v[0].x+.3*v[1].x+.5*v[2].x),
+                   lead*(.2*v[0].y+.3*v[1].y+.5*v[2].y)};
+        // Separate prediction-only clamp: 1.5 degrees at the configured sensitivity.
+        const double scale=std::max(1.,std::hypot(out.x,out.y)/(1.5/(.022*1.5)));
+        return {out.x/scale,out.y/scale};
+    }
+    Correction correction(int64_t previous,int64_t current,int64_t latest,double horizon,double ticksPerMs=0.) const {
         Counts p,c,n;
         if(previous>=current||latest<current||!at(previous,p)||!at(current,c)||!at(latest,n))return {};
         constexpr double rad=.022*1.5*3.14159265358979323846/180.;
         constexpr double limit=4.*3.14159265358979323846/180.;
-        const double ax=(n.x-c.x)*rad,ay=(n.y-c.y)*rad;
+        const auto future=predict(latest,ticksPerMs);
+        const double ax=(n.x-c.x+future.x)*rad,ay=(n.y-c.y+future.y)*rad;
         const double rx=ax-horizon*(c.x-p.x)*rad,ry=ay-horizon*(c.y-p.y)*rad;
         // Bound fast flicks rather than expose large missing image regions.
         auto bounded=[&](double a,double b){const double scale=std::max(1.,std::hypot(a,b)/limit);return Angles{float(a/scale),float(b/scale)};};

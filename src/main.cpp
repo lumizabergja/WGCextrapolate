@@ -936,7 +936,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // WGC timestamps are not game input sample timestamps. Start with
                 // a conservative 5ms estimated source input-to-capture offset.
                 const auto offset=ticks(5.0);
-                camera=mouseHistory.correction(previousSource-offset,priorSource-offset,now(),fraction);
+                camera=mouseHistory.correction(previousSource-offset,priorSource-offset,now(),fraction,double(freq.QuadPart)/1000.0);
             }
             const UINT64 readFence=flow.ReserveShaderRead();
             dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence,camera);

@@ -26,5 +26,23 @@ int main(){
     for(int i=0;i<3000;++i)h.push(50+i,1,0);
     assert(!h.at(20,at));assert(!h.correction(20,30,4000,.5).valid);
     h.reset(5000);assert(!h.correction(4000,5000,6000,.5).valid);
+    // 1000 QPC ticks/ms; synthetic 1000 Hz mouse samples.
+    fglate::History q;q.reset(0);
+    q.push(1000,10,0);q.push(2000,10,0);q.push(3000,10,0);
+    assert(std::abs(q.predict(3000,1000).x-30.)<1e-9);
+    assert(std::abs(q.predict(4500,1000).x-15.)<1e-9);
+    assert(q.predict(5000,1000).x==0.);
+    assert(q.predict(3000,1000,0).x==0.);
+    auto plain=q.correction(0,2000,3000,.5);
+    auto pred=q.correction(0,2000,3000,.5,1000);
+    assert(pred.valid&&pred.actual.x>plain.actual.x&&pred.residual.x>plain.residual.x);
+    q.push(4000,-10,0);assert(q.predict(4000,1000).x==0.);
+    q.reset(0);q.push(1000,10,0);q.push(2000,10,0);q.push(3000,2,0);
+    assert(q.predict(3000,1000).x==0.);
+    q.reset(0);q.push(1000,100,0);q.push(2000,100,0);q.push(3000,100,0);
+    assert(std::abs(q.predict(3000,1000).x-1.5/(.022*1.5))<1e-8);
+    q.push(3001,100,0);assert(q.predict(3001,1000).x==0.);
+    q.reset(0);q.push(1000,10,0);q.push(2000,10,0);q.push(3000,8,0);
+    assert(q.predict(3000,1000).x>0.&&q.predict(3000,1000).x<30.);
     std::cout<<"PASS: timestamp lookup, steady motion, stop, idle, fresh input, reversal, flick clamp, history overflow, reset\n";
 }
