@@ -23,7 +23,7 @@ ComPtr<ID3DBlob> compile(const char* entry,const char* profile){
     if(FAILED(hr)&&error)std::fprintf(stderr,"%s\n",static_cast<const char*>(error->GetBufferPointer()));
     check(hr,entry);return code;
 }
-void near(float value,float expected,float epsilon,const char* test){
+void expectNear(float value,float expected,float epsilon,const char* test){
     if(!(std::abs(value-expected)<=epsilon)){
         std::fprintf(stderr,"%s: got %.7f, expected %.7f +/- %.7f\n",test,value,expected,epsilon);
         throw std::runtime_error(test);
@@ -84,7 +84,7 @@ int main(){
         constexpr UINT x=64,y=48;
         constexpr float epsilon=.08f/256;
         auto base=draw(x,y);
-        near(base[0],x/256.f,epsilon,"unshifted image");
+        expectNear(base[0],x/256.f,epsilon,"unshifted image");
         // At image center the focal length is 64 px. Choose rotations that
         // map to exactly four and two source pixels of horizontal camera motion.
         auto yaw=[](double pixels){
@@ -92,23 +92,23 @@ int main(){
             return cs2::Rotation{float(std::sin(angle)),float(std::cos(angle)),0,1};
         };
         params.camera.live=yaw(2);
-        near(draw(x,y)[0],(x+2)/256.f,epsilon,"camera-only first response with no motion texture");
+        expectNear(draw(x,y)[0],(x+2)/256.f,epsilon,"camera-only first response with no motion texture");
         params.horizon=.5f;params.camera.previous=yaw(4);
-        near(draw(x,y)[0],(x+2)/256.f,epsilon,"steady pan counted once");
+        expectNear(draw(x,y)[0],(x+2)/256.f,epsilon,"steady pan counted once");
         params.camera.live={};
-        near(draw(x,y)[0],x/256.f,epsilon,"camera stops while old optical flow points right");
+        expectNear(draw(x,y)[0],x/256.f,epsilon,"camera stops while old optical flow points right");
         params.camera.live=yaw(-2);
-        near(draw(x,y)[0],(x-2)/256.f,epsilon,"immediate reversal");
+        expectNear(draw(x,y)[0],(x-2)/256.f,epsilon,"immediate reversal");
         params.camera.previous={};
-        near(draw(x,y)[0],x/256.f,epsilon,"independent object flow still contributes");
+        expectNear(draw(x,y)[0],x/256.f,epsilon,"independent object flow still contributes");
         params.camera={};
-        near(draw(x,y)[0],(x+2)/256.f,epsilon,"optical-flow-only baseline");
+        expectNear(draw(x,y)[0],(x+2)/256.f,epsilon,"optical-flow-only baseline");
         params.horizon=0;params.camera.live=cs2::fromCounts(0,100,8);
-        near(draw(x,y)[1],(y+64*std::tan(.033*100*3.141592653589793/180))/256.f,epsilon,"mouse-down pitch");
+        expectNear(draw(x,y)[1],(y+64*std::tan(.033*100*3.141592653589793/180))/256.f,epsilon,"mouse-down pitch");
         params.centerRadiusPx=3;params.centerFeatherPx=2;
-        near(draw(x,y)[1],base[1],epsilon,"protected center");
+        expectNear(draw(x,y)[1],base[1],epsilon,"protected center");
         params.centerRadiusPx=0;params.centerFeatherPx=0;params.camera.live=yaw(4);
-        near(draw(width-1,y)[0],(width-1)/256.f,epsilon,"exposed edge uses current image");
+        expectNear(draw(width-1,y)[0],(width-1)/256.f,epsilon,"exposed edge uses current image");
         std::puts("D3D11 mouse reprojection, flow composition, center and edge tests passed.");
         return 0;
     }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}
