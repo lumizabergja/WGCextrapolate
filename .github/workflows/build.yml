@@ -1,8 +1,8 @@
-name: FG WGC 320 Shared ZeroCopy Both Modes
+name: FG native DX11 NGX probe
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-shared-zero-copy']
+    branches: ['fg-dx11-ngx-latewarp-probe']
 permissions:
   contents: read
 jobs:
@@ -10,21 +10,20 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile with MSVC x64
+      - name: Build
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
           if not defined VSROOT exit /b 1
           call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b 1
-          echo Windows SDK: %WindowsSDKVersion%
-          call Build.cmd
+          call Build-Probe.cmd
           if errorlevel 1 exit /b 1
-          if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-SharedZeroCopy-BothModes-Windows-x64
+          name: FG-NGX-DX11-Probe
           path: |
-            bin/FG.exe
-            README.md
+            bin/FG-NGX-DX11-Probe.exe
+            Test.cmd
+            PROBE.md
           if-no-files-found: error
