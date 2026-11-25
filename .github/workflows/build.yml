@@ -1,8 +1,8 @@
-name: FG DX11 Native NGX Dual OFA
+name: FG WGC 320 Input Aware
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-dx11-native-ngx-dual-ofa']
+    branches: ['fg-wgc-320-earlyflow-input-aware']
 permissions:
   contents: read
 jobs:
@@ -23,8 +23,9 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64
+          name: FG-WGC-320-EarlyFlow-InputAware-Windows-x64
           path: |
             bin/FG.exe
             README.md
+            INPUT-AWARE.md
           if-no-files-found: error

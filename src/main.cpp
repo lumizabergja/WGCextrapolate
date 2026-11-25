@@ -30,6 +30,7 @@
 #include <nvOpticalFlowD3D11.h>
 #include "warp_presenter.h"
 #include "wgc_capture.h"
+#include "late_input.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -58,6 +59,9 @@ constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 // 0=Dynamic (target refresh), 1=Off, 2..6=static x2..x6.
 std::atomic<int> g_fgMode{0};
 std::atomic<int> g_targetHz{320};
+std::atomic<bool> g_lateInput{true};
+thread_local fglate::History mouseHistory;
+thread_local DWORD inputGamePid=0;
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -67,7 +71,7 @@ struct Game {HWND window;DWORD pid;std::wstring name;};
 std::vector<Game> g_games;
 
 struct SessionState{
-    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather;
+    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather,lateInput;
     wchar_t error[512],stage[96];
 };
 SessionState* session{};
@@ -309,7 +313,7 @@ Texture2D<float4> currentFrame:register(t0);
 Texture2D<int2> rawFlow:register(t1);
 Texture2D<float4> previousFrame:register(t2);
 SamplerState samp:register(s0);
-cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float _padding1;float centerRadiusPx;float centerFeatherPx;float2 outputSize;};
+cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float _padding1;float centerRadiusPx;float centerFeatherPx;float2 outputSize;float2 cameraActual;float2 cameraResidual;float2 cameraTan;float cameraActive;float cameraPad;};
 struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;};
 // Use native block centers, including partial cells on odd-sized captures.
 float2 flow(float2 uv){
@@ -340,6 +344,13 @@ float centerMask(float2 uv){
     if(centerFeatherPx<=0.0)return distancePx>centerRadiusPx?1.0:0.0;
     return smoothstep(centerRadiusPx,centerRadiusPx+centerFeatherPx,distancePx);
 }
+// Inverse rotational camera mapping, in source-camera UV coordinates.
+// First-order rotation is bounded to four degrees on CPU.
+float2 cameraUV(float2 uv,float2 a){
+    float2 ray=(uv-.5)*2*cameraTan;
+    float z=max(.25,1-dot(ray,a));
+    return .5+(ray+a)/(2*cameraTan*z);
+}
 float4 PS(V i):SV_Target {
     // NVIDIA's stretched scanout is already scaled into native game-size textures.
     float2 uv=i.uv;
@@ -348,14 +359,25 @@ float4 PS(V i):SV_Target {
     float mask=centerMask(uv);
     [branch] if(mask==0.0)return base;
     float2 v=flow(uv),q=uv+horizon*v;
-    if(any(q<0)||any(q>1))return base;
+    float4 fallback=base;
+    [branch] if(cameraActive>0.5){
+        // Actual input can still move the camera when object-flow confidence is low.
+        float2 inputUV=cameraUV(uv,cameraActual);
+        float edge=min(min(inputUV.x,inputUV.y),min(1-inputUV.x,1-inputUV.y));
+        float fade=smoothstep(0,.025,edge);
+        if(edge>0)fallback=lerp(base,currentFrame.SampleLevel(samp,inputUV,0),mask*fade);
+        // Remove the historical camera extrapolation already in NvOFA, then
+        // replace it with fresh measured input (estimated source input time).
+        q=cameraUV(q,cameraResidual);
+    }
+    if(any(q<0)||any(q>1))return fallback;
     float2 mv=flow(q),old=q+mv;
-    if(any(old<0)||any(old>1)||length(mv)>maxMotion)return base;
+    if(any(old<0)||any(old>1)||length(mv)>maxMotion)return fallback;
     float4 next=currentFrame.SampleLevel(samp,q,0);
     float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
     float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
     float confidence=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
-    return lerp(base,next,saturate(confidence*mask));
+    return lerp(fallback,next,saturate(confidence*mask));
 }
 )HLSL";
         ComPtr<ID3DBlob> vsBlob,psBlob,errs;
@@ -381,7 +403,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
         Check(dev11->CreateSamplerState(&sd,&sampler),"Sampler");
-        D3D11_BUFFER_DESC bd{};bd.ByteWidth=48;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_BUFFER_DESC bd{};bd.ByteWidth=sizeof(Params);bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&bd,nullptr,&constants),"Constants");
     }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
@@ -413,15 +435,18 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         lastCaptureStamp=timestamp;
         return true;
     }
-    // 48-byte constant buffer: motion settings plus center-only protection.
+    // 80-byte constant buffer: motion, center protection and camera correction.
     struct Params{
         float horizon, invW, invH, maxMotion;
         float flowW, flowH, grid, padding1;
         float centerRadiusPx,centerFeatherPx,outputW,outputH;
+        float actualX,actualY,residualX,residualY;
+        float tanX,tanY,cameraActive,cameraPad;
     };
-    static_assert(sizeof(Params)==48);
+    static_assert(sizeof(Params)==80);
     void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
-              float horizon,int grid,ID3D11Fence* motionReadFence,UINT64 motionReadValue){
+              float horizon,int grid,ID3D11Fence* motionReadFence,UINT64 motionReadValue,
+              const fglate::Correction& camera){
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
@@ -431,7 +456,9 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
               float(grid),0.0f,
               float(g_centerRadiusPx.load(std::memory_order_relaxed)),
               float(g_centerFeatherPx.load(std::memory_order_relaxed)),
-              float(screenW),float(screenH)};
+              float(screenW),float(screenH),camera.actual.x,camera.actual.y,
+              camera.residual.x,camera.residual.y,.75f*float(srcW)/float(srcH),.75f,
+              camera.valid?1.f:0.f,0.f};
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
@@ -680,9 +707,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
             throw Error("Invalid game native capture resolution");
         if(session)lstrcpynW(session->stage,L"Strict zero-copy WGC initialization",96);
-        if(fgwarp::requested.load()){
+        inputGamePid=game.pid;
+        {
             RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
-            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register warp mouse",GetLastError());
+            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register mouse input",GetLastError());
         }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
@@ -756,7 +784,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(r==WAIT_TIMEOUT)return false;
             throw Error("DXGI frame latency wait failed",GetLastError());
         };
-        LONGLONG priorSource=0,arrival=0,realSubmitted=0,lastSubmitted=0;
+        LONGLONG priorSource=0,previousSource=0,arrival=0,realSubmitted=0,lastSubmitted=0;
         LONGLONG dynamicPeriod=0,dynamicDeadline=0;
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
@@ -783,13 +811,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     interval=measurements++==0?measured:std::clamp(interval*.60+measured*.40,1.0,80.0);
                 }
             }
-            priorSource=stamp.QuadPart;
+            previousSource=priorSource;priorSource=stamp.QuadPart;
             realPending=true;flowReady=false;maxPredictions=0;nextPrediction=1;
             if(warmup>0)--warmup;
             return true;
         };
         while(g_running.load(std::memory_order_acquire)){
-            if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
+            if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);g_lateInput.store(session->lateInput!=0);}
             MSG message{};
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 TranslateMessage(&message);DispatchMessageW(&message);
@@ -816,7 +844,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
-                captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
+                captureSerial=lastFlowSerial=0;priorSource=previousSource=0;interval=16.667;pair=0;
+                mouseHistory.reset(now());
                 flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
                 realSubmitted=lastSubmitted=0;
                 dynamicPeriod=dynamicDeadline=0;
@@ -898,8 +927,19 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
             auto* motion=flow.MotionFor(captureSerial,current,previous);
+            fglate::Correction camera{};
+            if(g_lateInput.load(std::memory_order_relaxed)&&!dx.warp.initialized){
+                // Process only pending mouse input, as late as possible before Draw.
+                MSG inputMsg{};
+                for(unsigned i=0;i<64&&PeekMessageW(&inputMsg,overlay.hwnd,WM_INPUT,WM_INPUT,PM_REMOVE);++i)
+                    DispatchMessageW(&inputMsg);
+                // WGC timestamps are not game input sample timestamps. Start with
+                // a conservative 5ms estimated source input-to-capture offset.
+                const auto offset=ticks(5.0);
+                camera=mouseHistory.correction(previousSource-offset,priorSource-offset,now(),fraction);
+            }
             const UINT64 readFence=flow.ReserveShaderRead();
-            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence);
+            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence,camera);
             slotHeld=false;lastSubmitted=submitTime;++nextPrediction;
             if(dynamicPeriod)advanceDynamicDeadline(submitTime);
         }
@@ -1046,7 +1086,12 @@ LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         RAWINPUT input{};UINT bytes=sizeof(input);
         if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))==sizeof(input) &&
            input.header.dwType==RIM_TYPEMOUSE && !(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
-            fgwarp::mouseX.fetch_add(input.data.mouse.lLastX);fgwarp::mouseY.fetch_add(input.data.mouse.lLastY);
+            DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+            if(pid&&pid==inputGamePid&&(input.data.mouse.lLastX||input.data.mouse.lLastY)){
+                LARGE_INTEGER q{};QueryPerformanceCounter(&q);
+                mouseHistory.push(q.QuadPart,input.data.mouse.lLastX,input.data.mouse.lLastY);
+                fgwarp::mouseX.fetch_add(input.data.mouse.lLastX);fgwarp::mouseY.fetch_add(input.data.mouse.lLastY);
+            }
         }
         return DefWindowProcW(hwnd,msg,wp,lp);
     }
@@ -1078,8 +1123,11 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
         HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
-            36,285,240,30,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
+            36,278,240,27,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
         StyleControl(warpCheck);SetWindowTextW(warpCheck,L"Reflex 2 Frame Warp (optional)");
+        HWND lateCheck=CreateWindowW(L"BUTTON",L"Late mouse input (FG)",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+            282,278,244,27,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
+        StyleControl(lateCheck);CheckDlgButton(hwnd,121,BST_CHECKED);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
         g_stop=CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE|WS_DISABLED|BS_OWNERDRAW,
@@ -1149,6 +1197,13 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         switch(LOWORD(wp)){
         case 120:
             fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
+            if(fgwarp::requested.load()){CheckDlgButton(hwnd,121,BST_UNCHECKED);g_lateInput.store(false);}
+            break;
+        case 121:
+            g_lateInput.store(IsDlgButtonChecked(hwnd,121)==BST_CHECKED);
+            if(g_lateInput.load()&&fgwarp::requested.load()){
+                CheckDlgButton(hwnd,121,BST_UNCHECKED);g_lateInput.store(false);
+            }
             break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:

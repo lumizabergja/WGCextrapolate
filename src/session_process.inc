@@ -8,6 +8,7 @@ void CopySettings(SessionState& s){
     InterlockedExchange(&s.target,g_targetHz.load());
     InterlockedExchange(&s.radius,g_centerRadiusPx.load());
     InterlockedExchange(&s.feather,g_centerFeatherPx.load());
+    InterlockedExchange(&s.lateInput,g_lateInput.load()?1:0);
 }
 void RunIsolated(Game game){
     try {

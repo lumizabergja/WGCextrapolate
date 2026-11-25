@@ -7,3 +7,7 @@ Both modes use two pre-registered independent motion outputs, one DX11 NvOFA con
 The scheduler checks for a new capture after acquiring DXGI presentation capacity. It keeps the slot for the fresh capture and drops predictions that outlive the final scheduled slot. Both Warp modes share this scheduler. Warp On uses only the center radius and feather mask. Its NGX UI input is fully transparent.
 
 For a one-slot comparison build, set `FG_OFA_SLOT_COUNT=1` before running `Build.cmd`. The default is two. Compare capture-to-display latency and on-time generated frames on the same Windows machine with the same game cap and warp settings. GPU timings for the NGX passes and final draw require a Windows GPU trace.
+
+
+## Input-aware EarlyFlow variant
+See [INPUT-AWARE.md](INPUT-AWARE.md) for build steps, assumptions, testing and limitations.
