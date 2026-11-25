@@ -735,6 +735,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         };
         LONGLONG priorSource=0,arrival=0,realPresented=0,lastPresented=0;
         double interval=16.667,pair=0.0,slotMs=3.125;
+        bool dynamic=false;
+        LONGLONG nextDynamicSlot=0, dynamicPeriod=0;
         int current=-1,previous=-1;
         uint64_t captureSerial=0,lastFlowSerial=0;
         bool flowReady=false,realPending=false,flowPending=false,wasFocused=false;
@@ -765,7 +767,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
                 flowReady=false;realPending=false;flowPending=false;maxPredictions=0;nextPrediction=1;
-                realPresented=lastPresented=0;
+                realPresented=lastPresented=nextDynamicSlot=0;
             }
             LARGE_INTEGER stamp{};
             int next=dx.FreeSlot();
@@ -802,8 +804,22 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const int target=std::clamp(configured==0?int(monitorHz):configured,30,1000);
                 // Dynamic target can exceed x6 when the real FPS is very low.
                 // Bound the maximum prediction horizon to one measured source interval.
-                slotMs=mode==0?1000.0/target:interval/double(std::max(1,mode));
-                maxPredictions=mode==0?std::min(12u,unsigned(std::max(0.0,std::ceil(interval/slotMs)-1.0))):
+                dynamic=mode==0;
+                slotMs=dynamic?1000.0/target:interval/double(std::max(1,mode));
+                const LONGLONG period=std::max<LONGLONG>(1,ticks(slotMs));
+                if(!dynamic){
+                    nextDynamicSlot=0;
+                }else if(!nextDynamicSlot||dynamicPeriod!=period){
+                    dynamicPeriod=period;
+                    nextDynamicSlot=realPresented+period;
+                }else{
+                    // A real frame fills a nearby target slot. Keep the target
+                    // clock running across capture jitter and Present delays.
+                    const LONGLONG occupiedThrough=realPresented+period/3;
+                    if(nextDynamicSlot<=occupiedThrough)
+                        nextDynamicSlot+=((occupiedThrough-nextDynamicSlot)/period+1)*period;
+                }
+                maxPredictions=dynamic?12u:
                     (mode>1?unsigned(mode-1):0u);
                 if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
@@ -830,8 +846,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const LONGLONG expiry=std::min(arrival+ticks(interval*1.10),
                                            realPresented+ticks(slotMs*(maxPredictions+1)));
             if(t>=expiry){flowReady=false;continue;}
-            const LONGLONG due=std::max(realPresented+ticks(slotMs*nextPrediction),
-                                        lastPresented+ticks(slotMs*.85));
+            const LONGLONG due=dynamic
+                ?std::max(nextDynamicSlot,lastPresented+ticks(slotMs*.65))
+                :std::max(realPresented+ticks(slotMs*nextPrediction),lastPresented+ticks(slotMs*.85));
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
             // At a prediction deadline, never block the CPU on optical flow.
@@ -850,13 +867,19 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(submitTime>=expiry){flowReady=false;continue;}
             const double elapsed=ms(submitTime-realPresented);
             const unsigned dueIndex=unsigned(std::max(1.0,std::floor(elapsed/slotMs)));
-            if(dueIndex>maxPredictions){flowReady=false;continue;}
-            nextPrediction=std::max(nextPrediction,dueIndex);
+            if(!dynamic){
+                if(dueIndex>maxPredictions){flowReady=false;continue;}
+                nextPrediction=std::max(nextPrediction,dueIndex);
+            }
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
             auto* motion=flow.MotionFor(captureSerial,current,previous);
             const UINT64 readFence=flow.ReserveShaderRead();
             dx.Draw(UINT(current),UINT(previous),motion,fraction,flow.flowFence.Get(),readFence);
             slotHeld=false;lastPresented=now();++nextPrediction;
+            if(dynamic){
+                // Advance directly past missed slots without a catch-up burst.
+                nextDynamicSlot+=((submitTime-nextDynamicSlot)/dynamicPeriod+1)*dynamicPeriod;
+            }
         }
         overlay.SetVisible(false);
         Status(L"Stopped");
