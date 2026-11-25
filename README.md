@@ -3,3 +3,7 @@ Actual FG app, not probe. Same native DX11 WGC direct leases, NvOFA FAST 4x4 cos
 
 ## Dual-buffer NvOFA experimental variant
 Both modes use two pre-registered independent motion outputs, one DX11 NvOFA context, monotonic GPU fences for completion and shader-read retirement, and exact capture-pair identity checks. A second execution can be submitted while the first completion fence is outstanding; if both slots are busy, drop prediction rather than wait or expand the queue. Capture leases cannot retire until both graphics and OFA use complete. Real frames are submitted before new flow work, as in the parent. Same 4x4 FAST, cost off, shader, UI, 320 Hz target, queue limit, and NGX behavior. Actual hardware execution overlap and latency are not guaranteed; DX11 driver may serialize or block. No additional capture copy, no new thread, no change to current polling/flush policy. Test against parent branch.
+
+The scheduler checks for a new capture after acquiring DXGI presentation capacity. It keeps the slot for the fresh capture and drops predictions that outlive the final scheduled slot. Both Warp modes share this scheduler. Warp On uses only the center radius and feather mask. Its NGX UI input is fully transparent.
+
+For a one-slot comparison build, set `FG_OFA_SLOT_COUNT=1` before running `Build.cmd`. The default is two. Compare capture-to-display latency and on-time generated frames on the same Windows machine with the same game cap and warp settings. GPU timings for the NGX passes and final draw require a Windows GPU trace.

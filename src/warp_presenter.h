@@ -26,7 +26,7 @@ struct Presenter {
     bool initialized{},sdkReady{};
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11Texture2D> color,output,depth,motion,ui,mask;
+    ComPtr<ID3D11Texture2D> color,output,depth,motion,transparentUi,mask;
     ComPtr<ID3D11RenderTargetView> inputRTV;
     ComPtr<ID3D11ShaderResourceView> outputSRV;
     NVSDK_NGX_Parameter* params{};
@@ -64,7 +64,9 @@ struct Presenter {
         std::vector<float> depths(zeros.size(),.999f);
         depth=tex(DXGI_FORMAT_R32_FLOAT,sr,depths.data(),w*4);
         motion=tex(DXGI_FORMAT_R16G16_FLOAT,sr,zeros.data(),w*4);
-        ui=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr,zeros.data(),w*4);
+        // NGX receives a fully transparent UI input. The radial mask below
+        // is the only protection applied to the captured image.
+        transparentUi=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr,zeros.data(),w*4);
         mask=tex(DXGI_FORMAT_R8_UNORM,sr);
         check(device->CreateRenderTargetView(color.Get(),nullptr,&inputRTV),"Native NGX input RTV");
         check(device->CreateShaderResourceView(output.Get(),nullptr,&outputSRV),"Native NGX output SRV");
@@ -72,7 +74,7 @@ struct Presenter {
         projection={f/aspect,0,0,0,0,f,0,0,0,0,z/(z-n),1,0,0,-n*z/(z-n),0};
         auto set=[&](const char* k,ID3D11Texture2D* r){params->Set(k,static_cast<ID3D11Resource*>(r));};
         // Both input tags reference the same read-only color. Output is a separate allocation.
-        set("Latewarp.Backbuffer",color.Get());set("Latewarp.HudlessColor",color.Get());set("Latewarp.UIColorAlpha",ui.Get());
+        set("Latewarp.Backbuffer",color.Get());set("Latewarp.HudlessColor",color.Get());set("Latewarp.UIColorAlpha",transparentUi.Get());
         set("Depth",depth.Get());set("MotionVectors",motion.Get());set("Output",output.Get());set("Latewarp.NoWarpMask",mask.Get());
         for(const char* key:{"Latewarp.Backbuffer","Latewarp.HudlessColor","Latewarp.UIColorAlpha","Latewarp.Output","Latewarp.Depth","Latewarp.MV","Latewarp.NoWarpMask"}){
             const std::string k=key;params->Set((k+".Subrect.Base.X").c_str(),0u);params->Set((k+".Subrect.Base.Y").c_str(),0u);params->Set((k+".Subrect.Width").c_str(),w);params->Set((k+".Subrect.Height").c_str(),h);

@@ -489,7 +489,11 @@ struct Flow11 {
         uint64_t pairSerial{};
         int current{-1},previous{-1};
     };
-    MotionSlot slots[2];
+#ifndef FG_OFA_SLOT_COUNT
+#define FG_OFA_SLOT_COUNT 2
+#endif
+    static_assert(FG_OFA_SLOT_COUNT == 1 || FG_OFA_SLOT_COUNT == 2);
+    MotionSlot slots[FG_OFA_SLOT_COUNT];
     ComPtr<ID3D11Fence> flowFence;
     UINT64 fenceSerial{},inputUse[kNumCapture]{};
     int active{-1};
@@ -585,11 +589,11 @@ struct Flow11 {
         active=-1;
         const UINT64 complete=Completed();
         int chosen=-1;
-        for(int i=0;i<2;++i){
+        for(int i=0;i<FG_OFA_SLOT_COUNT;++i){
             // Never overwrite pending OFA work OR a motion texture still read by graphics.
             if(slots[i].submitted<=complete&&slots[i].lastRead<=complete){chosen=i;break;}
         }
-        if(chosen<0)return false; // bounded two jobs; drop new prediction rather than block/queue unbounded
+        if(chosen<0)return false; // Drop prediction when all motion outputs are busy.
         auto& slot=slots[chosen];
         Register(current);Register(previous);
         NV_OF_EXECUTE_INPUT_PARAMS in{};
@@ -711,6 +715,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(r==WAIT_TIMEOUT)return false;
             throw Error("DXGI frame latency wait failed",GetLastError());
         };
+        auto captureArrived=[&]{
+            return WaitForSingleObject(dx.capture.event.get(),0)==WAIT_OBJECT_0;
+        };
         LONGLONG priorSource=0,arrival=0,realPresented=0,lastPresented=0;
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
@@ -769,6 +776,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             if(realPending){
                 if(!acquireSlot()){waitActivity(now()+ticks(next<0?.25:8.0),true);continue;}
+                // Recheck capture after taking the slot. Keep the slot while
+                // replacing a pending real frame with the newest capture.
+                if(dx.FreeSlot()>=0&&captureArrived())continue;
                 dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
                 realPresented=lastPresented=now();
                 overlay.SetVisible(true);realPending=false;
@@ -802,7 +812,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const LONGLONG t=now();
             // Pacing begins at actual real submission, not WGC's earlier source
             // timestamp. Do not consume fake slots before the real was submitted.
-            const LONGLONG expiry=arrival+ticks(interval*1.10);
+            const LONGLONG expiry=std::min(arrival+ticks(interval*1.10),
+                                           realPresented+ticks(slotMs*(maxPredictions+1)));
             if(t>=expiry){flowReady=false;continue;}
             const LONGLONG due=std::max(realPresented+ticks(slotMs*nextPrediction),
                                         lastPresented+ticks(slotMs*.85));
@@ -815,12 +826,16 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 continue;
             }
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
+            // Keep the DXGI slot for the real frame if capture arrived while
+            // checking motion readiness or acquiring presentation capacity.
+            if(captureArrived())continue;
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
             const LONGLONG submitTime=now();
             if(submitTime>=expiry){flowReady=false;continue;}
             const double elapsed=ms(submitTime-realPresented);
-            const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
+            const unsigned dueIndex=unsigned(std::max(1.0,std::floor(elapsed/slotMs)));
+            if(dueIndex>maxPredictions){flowReady=false;continue;}
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
             auto* motion=flow.MotionFor(captureSerial,current,previous);
