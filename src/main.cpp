@@ -324,7 +324,7 @@ float4 PS(V i):SV_Target {
     float4 next=currentFrame.SampleLevel(samp,q,0);
     float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
     float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
-    float confidence=(1-smoothstep(.045,.20,residual));
+    float confidence=(1-smoothstep(.08,.28,residual));
     return lerp(base,next,saturate(confidence*centerMask(uv)));
 }
 )HLSL";
@@ -484,49 +484,73 @@ Texture2D<float4> previousFrame : register(t1);
 RWTexture2D<int> displacement : register(u0);
 groupshared float costs[256];
 groupshared uint indices[256];
-int2 offset(uint index) { return (int2(index % 15, index / 15) - 7) * 4; }
+groupshared int2 coarseShift;
 
-[numthreads(256,1,1)]
-void CS(uint id : SV_GroupIndex) {
-    uint width,height;
-    currentFrame.GetDimensions(width,height);
-    int2 size=int2(width,height);
-    int2 shift=offset(id);
-    float score=1e6;
-    if(id<225 && width>=256 && height>=256){
-        score=0;
-        // Use sparse patches in the upper and side regions. Each patch has
-        // a capped contribution so an independently moving object cannot dominate.
-        for(int y=0;y<4;++y){
-            for(int x=0;x<6;++x){
-                if(y>=2 && x>=2 && x<=3)continue;
-                int2 center=int2(float2(.17+.13*x,.20+.16*y)*float2(size));
-                float error=0;
-                [unroll] for(int tap=0;tap<4;++tap){
-                    int2 p=center+int2((tap&1)*8-4,(tap/2)*8-4);
-                    float3 delta=abs(currentFrame.Load(int3(p,0)).rgb-previousFrame.Load(int3(p+shift,0)).rgb);
-                    error+=dot(delta,float3(.25,.50,.25));
-                }
-                score+=min(error*.25,.25);
+float matchCost(int2 size,int2 shift) {
+    float score=0;
+    for(int y=0;y<4;++y){
+        for(int x=0;x<6;++x){
+            if(y>=2 && x>=2 && x<=3)continue;
+            int2 center=int2(float2(.17+.13*x,.20+.16*y)*float2(size));
+            float error=0;
+            [unroll] for(int tap=0;tap<4;++tap){
+                int2 p=center+int2((tap&1)*8-4,(tap/2)*8-4);
+                float3 delta=abs(currentFrame.Load(int3(p,0)).rgb-previousFrame.Load(int3(p+shift,0)).rgb);
+                error+=dot(delta,float3(.25,.50,.25));
             }
+            score+=min(error*.25,.25);
         }
-        score=score/20 + .00005*float(dot(float2(shift),float2(shift)))*.0625;
     }
-    costs[id]=score;
-    indices[id]=id;
-    GroupMemoryBarrierWithGroupSync();
-    float stationary=costs[112];
-    GroupMemoryBarrierWithGroupSync();
-    [unroll] for(uint stride=128;stride>0;stride>>=1){
+    return score*.05;
+}
+
+void reduceCosts(uint id,uint count) {
+    for(uint stride=count/2;stride>0;stride>>=1){
         if(id<stride && costs[id+stride]<costs[id]){
             costs[id]=costs[id+stride];
             indices[id]=indices[id+stride];
         }
         GroupMemoryBarrierWithGroupSync();
     }
+}
+
+[numthreads(256,1,1)]
+void CS(uint id : SV_GroupIndex) {
+    uint width,height;
+    currentFrame.GetDimensions(width,height);
+    int2 size=int2(width,height);
+    int2 shift=(int2(id%15,id/15)-7)*4;
+    float score=1e6;
+    if(id<225 && width>=256 && height>=256){
+        score=matchCost(size,shift)+.000003*dot(float2(shift),float2(shift));
+    }
+    costs[id]=score;
+    indices[id]=id;
+    GroupMemoryBarrierWithGroupSync();
+    float stationary=costs[112];
+    GroupMemoryBarrierWithGroupSync();
+    reduceCosts(id,256);
+    if(id==0)coarseShift=(int2(indices[0]%15,indices[0]/15)-7)*4;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Search near the coarse winner and near zero. The latter catches
+    // small movements when the coarse search is distracted by an alias.
+    if(id<64){
+        int2 localShift=int2(id%5,(id%25)/5)-2;
+        if(id<25)localShift+=coarseShift;
+        costs[id]=1e6;
+        if(id<50 && width>=256 && height>=256){
+            costs[id]=matchCost(size,localShift)+.000003*dot(float2(localShift),float2(localShift));
+        }
+        indices[id]=id;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    reduceCosts(id,64);
     if(id==0){
-        int2 best=offset(indices[0]);
-        if(costs[0]>.09 || stationary-costs[0]<.004 || any(abs(best)==28))best=int2(0,0);
+        uint winner=indices[0];
+        int2 best=int2(winner%5,(winner%25)/5)-2;
+        if(winner<25)best+=coarseShift;
+        if(costs[0]>.13 || stationary-costs[0]<.0008 || any(abs(best)>=30))best=int2(0,0);
         displacement[int2(0,0)]=best.x;
         displacement[int2(1,0)]=best.y;
     }
