@@ -715,16 +715,38 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(r==WAIT_TIMEOUT)return false;
             throw Error("DXGI frame latency wait failed",GetLastError());
         };
-        auto captureArrived=[&]{
-            return WaitForSingleObject(dx.capture.event.get(),0)==WAIT_OBJECT_0;
-        };
-        LONGLONG priorSource=0,arrival=0,realPresented=0,lastPresented=0;
+        LONGLONG priorSource=0,arrival=0,realSubmitted=0,lastSubmitted=0;
+        LONGLONG dynamicPeriod=0,dynamicDeadline=0;
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
         uint64_t captureSerial=0,lastFlowSerial=0;
         bool flowReady=false,realPending=false,flowPending=false,wasFocused=false;
         unsigned nextPrediction=1,maxPredictions=0;
         int measurements=0,warmup=0;
+        auto advanceDynamicDeadline=[&](LONGLONG submitted){
+            if(dynamicDeadline<=submitted)
+                dynamicDeadline+=((submitted-dynamicDeadline)/dynamicPeriod+1)*dynamicPeriod;
+        };
+        auto grabLatest=[&]{
+            const int next=dx.FreeSlot();
+            LARGE_INTEGER stamp{};
+            if(next<0||!dx.Grab(game.window,next,0,stamp))return false;
+            arrival=now();++captureSerial;
+            if(dx.warp.initialized)dx.warp.sourcePose();
+            previous=current;current=next;pair=0.0;
+            dx.RetireExcept(current,previous);
+            if(priorSource>0&&stamp.QuadPart>priorSource){
+                const double measured=ms(stamp.QuadPart-priorSource);
+                if(measured>=1.0&&measured<=80.0){
+                    pair=measured;
+                    interval=measurements++==0?measured:std::clamp(interval*.60+measured*.40,1.0,80.0);
+                }
+            }
+            priorSource=stamp.QuadPart;
+            realPending=true;flowReady=false;flowPending=false;maxPredictions=0;nextPrediction=1;
+            if(warmup>0)--warmup;
+            return true;
+        };
         while(g_running.load(std::memory_order_acquire)){
             if(session){g_fgMode.store(session->mode);g_targetHz.store(session->target);g_centerRadiusPx.store(session->radius);g_centerFeatherPx.store(session->feather);}
             MSG message{};
@@ -750,37 +772,22 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
                 flowReady=false;realPending=false;flowPending=false;maxPredictions=0;nextPrediction=1;
-                realPresented=lastPresented=0;
+                realSubmitted=lastSubmitted=0;
+                dynamicPeriod=dynamicDeadline=0;
             }
-            LARGE_INTEGER stamp{};
-            int next=dx.FreeSlot();
-            if(next<0){dx.SubmitRetirement();flow.Reap();next=dx.FreeSlot();}
+            if(dx.FreeSlot()<0){dx.SubmitRetirement();flow.Reap();}
 
             // New real frames always win the mailbox, including when a present slot
             // becomes available while we were waiting on the timer.
-            if(next>=0&&dx.Grab(game.window,next,0,stamp)){
-                arrival=now();++captureSerial;
-                if(dx.warp.initialized)dx.warp.sourcePose();
-                previous=current;current=next;pair=0.0;
-                dx.RetireExcept(current,previous);
-                if(priorSource>0&&stamp.QuadPart>priorSource){
-                    const double measured=ms(stamp.QuadPart-priorSource);
-                    if(measured>=1.0&&measured<=80.0){
-                        pair=measured;
-                        interval=measurements++==0?measured:std::clamp(interval*.60+measured*.40,1.0,80.0);
-                    }
-                }
-                priorSource=stamp.QuadPart;
-                realPending=true;flowReady=false;flowPending=false;maxPredictions=0;nextPrediction=1;
-                if(warmup>0)--warmup;
-            }
+            const bool grabbed=grabLatest();
             if(realPending){
-                if(!acquireSlot()){waitActivity(now()+ticks(next<0?.25:8.0),true);continue;}
-                // Recheck capture after taking the slot. Keep the slot while
-                // replacing a pending real frame with the newest capture.
-                if(dx.FreeSlot()>=0&&captureArrived())continue;
+                if(!acquireSlot()){waitActivity(now()+ticks(dx.FreeSlot()<0?.25:8.0),true);continue;}
+                // If the mailbox was already read this iteration, only drain it
+                // again when WGC reports more work. Submit a pending real once
+                // the slot is available, even if captures keep arriving.
+                if(!grabbed||WaitForSingleObject(dx.capture.event.get(),0)==WAIT_OBJECT_0)grabLatest();
+                realSubmitted=lastSubmitted=now();
                 dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
-                realPresented=lastPresented=now();
                 overlay.SetVisible(true);realPending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
                 const int configured=g_targetHz.load(std::memory_order_relaxed);
@@ -788,13 +795,25 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // Dynamic target can exceed x6 when the real FPS is very low.
                 // Bound the maximum prediction horizon to one measured source interval.
                 slotMs=mode==0?1000.0/target:interval/double(std::max(1,mode));
+                if(mode==0){
+                    const LONGLONG period=std::max<LONGLONG>(1,ticks(slotMs));
+                    if(dynamicPeriod!=period){
+                        dynamicPeriod=period;
+                        dynamicDeadline=realSubmitted;
+                    }
+                    // Real frames can present between deadlines. Keep the output
+                    // clock in phase and skip any deadline they already passed.
+                    advanceDynamicDeadline(realSubmitted);
+                }else{
+                    dynamicPeriod=dynamicDeadline=0;
+                }
                 maxPredictions=mode==0?std::min(12u,unsigned(std::max(0.0,std::ceil(interval/slotMs)-1.0))):
                     (mode>1?unsigned(mode-1):0u);
                 if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
                 const LONGLONG expiry=arrival+ticks(interval*1.10);
                 flowPending=maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
-                    realPresented+ticks(slotMs*.70)<expiry;
+                    now()+ticks(slotMs*.70)<expiry;
                 continue;
             }
             if(flowPending){
@@ -807,16 +826,14 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 continue;
             }
             if(!flowReady||nextPrediction>maxPredictions){
-                waitActivity(now()+ticks(next<0?.25:8.0),false);continue;
+                waitActivity(now()+ticks(dx.FreeSlot()<0?.25:8.0),false);continue;
             }
             const LONGLONG t=now();
-            // Pacing begins at actual real submission, not WGC's earlier source
-            // timestamp. Do not consume fake slots before the real was submitted.
             const LONGLONG expiry=std::min(arrival+ticks(interval*1.10),
-                                           realPresented+ticks(slotMs*(maxPredictions+1)));
+                                           realSubmitted+ticks(slotMs*(maxPredictions+1)));
             if(t>=expiry){flowReady=false;continue;}
-            const LONGLONG due=std::max(realPresented+ticks(slotMs*nextPrediction),
-                                        lastPresented+ticks(slotMs*.85));
+            const LONGLONG scheduled=dynamicPeriod?dynamicDeadline:realSubmitted+ticks(slotMs*nextPrediction);
+            const LONGLONG due=std::max(scheduled,lastSubmitted+ticks(slotMs*.85));
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
             // At a prediction deadline, never block the CPU on optical flow.
@@ -828,20 +845,22 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // Keep the DXGI slot for the real frame if capture arrived while
             // checking motion readiness or acquiring presentation capacity.
-            if(captureArrived())continue;
-            // No burst catch-up; use the newest due prediction, at most one per
-            // present opportunity. Never extrapolate more than one source pair.
+            if(grabLatest())continue;
+            // Submit at most one prediction per opportunity and skip missed ticks.
             const LONGLONG submitTime=now();
             if(submitTime>=expiry){flowReady=false;continue;}
-            const double elapsed=ms(submitTime-realPresented);
-            const unsigned dueIndex=unsigned(std::max(1.0,std::floor(elapsed/slotMs)));
-            if(dueIndex>maxPredictions){flowReady=false;continue;}
-            nextPrediction=std::max(nextPrediction,dueIndex);
+            const double elapsed=ms(submitTime-realSubmitted);
+            if(!dynamicPeriod){
+                const unsigned dueIndex=unsigned(std::max(1.0,std::floor(elapsed/slotMs)));
+                if(dueIndex>maxPredictions){flowReady=false;continue;}
+                nextPrediction=std::max(nextPrediction,dueIndex);
+            }
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
             auto* motion=flow.MotionFor(captureSerial,current,previous);
             const UINT64 readFence=flow.ReserveShaderRead();
             dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence);
-            slotHeld=false;lastPresented=now();++nextPrediction;
+            slotHeld=false;lastSubmitted=submitTime;++nextPrediction;
+            if(dynamicPeriod)advanceDynamicDeadline(submitTime);
         }
         overlay.SetVisible(false);
         Status(L"Stopped");
