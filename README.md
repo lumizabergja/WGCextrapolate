@@ -11,3 +11,5 @@ Experimental external native DX11 NGX latewarp (Reflex 2 Frame Warp path), not a
 
 ## Run
 Build.cmd restores the original NGX SDK download. Copy the original compatible FrameWarpRuntime directory (including nvngx_latewarp.dll) from your working NGX package beside FG.exe. It is not bundled by GitHub Actions. Missing runtime causes an initialization error. Use CS2 800 DPI, sensitivity 1.5, 1000 Hz mouse polling, Dynamic 320, center radius/feather zero to test the automatic mask. Actual game input is never modified.
+
+GitHub Actions validates prediction tests and HLSL before uploading the Windows executable.
