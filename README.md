@@ -11,3 +11,5 @@ External WGC / D3D11 presenter, no injection. Reflex 2/NGX removed from executab
 - Per-pixel HUD/weapon heuristic uses screen-space correspondence and flow disagreement with estimated camera motion. Moving foreground uses its own flow where reliable, not a fixed region. With unreliable/missing flow, newest source pixels may be reused. No semantic masks/depth; flicker reduction is not guaranteed.
 
 Use 800 DPI, 1.5 sensitivity, 1000 Hz; Dynamic 320. Keep center radius and feather at zero to test automatic protection. Disable Late input + Auto HUD / weapon for comparison. Prediction does not change firing or simulation latency. Windows compilation and on-device image quality must be verified. Build.cmd requires MSVC x64 and recent Windows SDK; no NGX download.
+
+GitHub Actions runs CPU prediction tests, MSVC x64 compilation and offline HLSL validation before artifact upload.
