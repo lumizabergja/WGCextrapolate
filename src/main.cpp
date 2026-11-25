@@ -484,7 +484,8 @@ struct Flow11 {
         NvOFGPUBufferHandle output{};
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11ShaderResourceView> srv;
-        UINT64 submitted{},lastRead{};
+        winrt::handle completionEvent;
+        UINT64 submitted{},lastRead{},completionArmed{};
         uint64_t pairSerial{};
         int current{-1},previous{-1};
     };
@@ -526,6 +527,8 @@ struct Flow11 {
         desc.Format=DXGI_FORMAT_R16G16_SINT;desc.SampleDesc.Count=1;
         desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         for(auto& slot:slots){
+            slot.completionEvent.attach(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+            if(!slot.completionEvent)throw Error("Create NvOFA completion event",GetLastError());
             Check(d.dev11->CreateTexture2D(&desc,nullptr,&slot.texture),"Create independent NvOFA output texture");
             NvCheck(funcs.nvOFRegisterResourceD3D11(handle,slot.texture.Get(),&slot.output),"NVOFA register motion output");
             Check(d.dev11->CreateShaderResourceView(slot.texture.Get(),nullptr,&slot.srv),"NvOFA motion SRV");
@@ -560,6 +563,15 @@ struct Flow11 {
     }
     bool Ready(uint64_t pairSerial,int current,int previous)const{
         return Matches(pairSerial,current,previous)&&Completed()>=slots[active].submitted;
+    }
+    HANDLE ArmCompletionEvent(){
+        auto& slot=slots[active];
+        if(slot.completionArmed!=slot.submitted){
+            Check(flowFence->SetEventOnCompletion(slot.submitted,slot.completionEvent.get()),
+                "Arm NvOFA completion event");
+            slot.completionArmed=slot.submitted;
+        }
+        return slot.completionEvent.get();
     }
     ID3D11ShaderResourceView* MotionFor(uint64_t pairSerial,int current,int previous)const{
         if(!Ready(pairSerial,current,previous))throw Error("NvOFA motion pair is not ready");
@@ -675,17 +687,20 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         struct PriorityRestore {int prior;~PriorityRestore(){if(prior!=THREAD_PRIORITY_ERROR_RETURN)SetThreadPriority(GetCurrentThread(),prior);}} priority{originalPriority};
         SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
         bool slotHeld=false;
-        auto waitActivity=[&](LONGLONG deadline,bool needSlot){
+        auto waitActivity=[&](LONGLONG deadline,bool needSlot,HANDLE flowCompletion=nullptr){
             dx.SubmitRetirement();
             const LONGLONG remaining=deadline-now();
             if(remaining<=0)return;
             LARGE_INTEGER due{};
             due.QuadPart=-std::max<LONGLONG>(1,static_cast<LONGLONG>(double(remaining)*10000000.0/double(freq.QuadPart)));
             if(!SetWaitableTimer(timer.handle,&due,0,nullptr,nullptr,FALSE))throw Error("Set prediction timer",GetLastError());
-            HANDLE handles[3]{dx.capture.event.get(),timer.handle,dx.frameReady};
-            const DWORD count=needSlot&&!slotHeld?3u:2u;
+            HANDLE handles[4]{dx.capture.event.get(),timer.handle};
+            DWORD count=2;
+            const bool watchSlot=needSlot&&!slotHeld;
+            if(watchSlot)handles[count++]=dx.frameReady;
+            if(flowCompletion)handles[count++]=flowCompletion;
             const DWORD r=MsgWaitForMultipleObjectsEx(count,handles,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
-            if(count==3&&r==WAIT_OBJECT_0+2)slotHeld=true;
+            if(watchSlot&&r==WAIT_OBJECT_0+2)slotHeld=true;
             if(r==WAIT_FAILED)throw Error("WGC scheduler wait",GetLastError());
             CancelWaitableTimer(timer.handle);
         };
@@ -794,7 +809,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
             // At a prediction deadline, never block the CPU on optical flow.
-            if(!flow.Ready(captureSerial,current,previous)){waitActivity(std::min(expiry,now()+ticks(.20)),false);continue;}
+            if(!flow.Matches(captureSerial,current,previous)){flowReady=false;continue;}
+            if(!flow.Ready(captureSerial,current,previous)){
+                waitActivity(expiry,false,flow.ArmCompletionEvent());
+                continue;
+            }
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
