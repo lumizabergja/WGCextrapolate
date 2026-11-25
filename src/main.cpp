@@ -541,8 +541,7 @@ float4 PS(V v):SV_Target{float a=protection.SampleLevel(s,v.uv,0);return lerp(sr
         if(motionReadFence)Check(fenceContext->Signal(motionReadFence,motionReadValue),"Signal motion shader read completion");
         if(useWarp){
             warp.evaluate(pose,[&](const LateMouse::Pose& src){
-                LARGE_INTEGER q{};QueryPerformanceCounter(&q);
-                return mouse.targetDelta(src,q.QuadPart,ticksPerMs,lead);
+                return mouse.targetDelta(src,ticksPerMs,lead);
             });
             // NGX has cleared context state. Composite protected pixels in the final draw,
             // even if the experimental NGX NoWarpMask parameter is ignored.

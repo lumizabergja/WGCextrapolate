@@ -70,18 +70,19 @@ public:
     ~LateMouse(){close();}
     void reset(int64_t t){std::lock_guard<std::mutex> guard(mutex);history.reset(t);}
     Pose sourcePose(int64_t prev,int64_t cur,double horizon,double ticksPerMs){
-        std::unique_lock<std::mutex> guard(mutex,std::try_to_lock);
-        if(!guard.owns_lock())return {};
+        std::lock_guard<std::mutex> guard(mutex);
         const int64_t offset=static_cast<int64_t>(5.*ticksPerMs);
         fglate::Counts c{},p{};
         if(!history.at(cur-offset,c))return {};
         if(horizon>0&&history.at(prev-offset,p)){c.x+=horizon*(c.x-p.x);c.y+=horizon*(c.y-p.y);}
         return {float(std::remainder(c.x*rad,6.283185307179586)),float(std::remainder(c.y*rad,6.283185307179586)),c.x,c.y,true};
     }
-    fglate::Angles targetDelta(const Pose& pose,int64_t latest,double ticksPerMs,double lead){
+    fglate::Angles targetDelta(const Pose& pose,double ticksPerMs,double lead){
         if(!pose.valid)return {};
-        std::unique_lock<std::mutex> guard(mutex,std::try_to_lock);
-        if(!guard.owns_lock())return {};
+        std::lock_guard<std::mutex> guard(mutex);
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const auto latest=now.QuadPart;
         fglate::Counts c{};
         if(!history.at(latest,c))return {};
         auto p=history.predict(latest,ticksPerMs,lead);
