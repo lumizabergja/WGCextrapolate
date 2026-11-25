@@ -1,8 +1,8 @@
-name: FG DX11 Native NGX
+name: FG DX11 Native NGX Dual OFA
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-dx11-native-ngx']
+    branches: ['fg-wgc-320-dx11-native-ngx-dual-ofa']
 permissions:
   contents: read
 jobs:
@@ -23,7 +23,7 @@ jobs:
           if not exist bin\FG.exe exit /b 1
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-DX11-NativeNGX-Windows-x64
+          name: FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64
           path: |
             bin/FG.exe
             README.md

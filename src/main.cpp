@@ -405,7 +405,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     };
     static_assert(sizeof(Params)==48);
     void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
-              float horizon,int grid){
+              float horizon,int grid,ID3D11Fence* motionReadFence,UINT64 motionReadValue){
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
@@ -433,6 +433,8 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ID3D11ShaderResourceView* nullViews[3]{};
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
+        // Retire the motion SRV after its final shader read, before Present submits the batch.
+        Check(fenceContext->Signal(motionReadFence,motionReadValue),"Signal motion shader read completion");
         Present(horizon==0.f,UINT(p.centerRadiusPx),UINT(p.centerFeatherPx));
     }
     void PresentReal(UINT current,int /*grid*/){
@@ -478,11 +480,18 @@ struct Flow11 {
     NV_OF_D3D11_API_FUNCTION_LIST funcs{};
     NvOFHandle handle{};
     NvOFGPUBufferHandle frames[kNumCapture]{};
-    NvOFGPUBufferHandle motion{};
-    ComPtr<ID3D11Texture2D> motionTexture;
-    ComPtr<ID3D11ShaderResourceView> motionSRV;
+    struct MotionSlot{
+        NvOFGPUBufferHandle output{};
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        UINT64 submitted{},lastRead{};
+        uint64_t pairSerial{};
+        int current{-1},previous{-1};
+    };
+    MotionSlot slots[2];
     ComPtr<ID3D11Fence> flowFence;
-    UINT64 flowSubmitted{};
+    UINT64 fenceSerial{},inputUse[kNumCapture]{};
+    int active{-1};
     void Init(DxDevices& d,int grid){
         owner=&d;
         ComPtr<ID3D11Device5> fenceDevice;
@@ -516,18 +525,21 @@ struct Flow11 {
         D3D11_TEXTURE2D_DESC desc{};desc.Width=fw;desc.Height=fh;desc.MipLevels=1;desc.ArraySize=1;
         desc.Format=DXGI_FORMAT_R16G16_SINT;desc.SampleDesc.Count=1;
         desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        Check(d.dev11->CreateTexture2D(&desc,nullptr,&motionTexture),"Create NvOFA output texture");
-        NvCheck(funcs.nvOFRegisterResourceD3D11(handle,motionTexture.Get(),&motion),"NVOFA register motion output");
-        Check(d.dev11->CreateShaderResourceView(motionTexture.Get(),nullptr,&motionSRV),"NvOFA motion SRV");
+        for(auto& slot:slots){
+            Check(d.dev11->CreateTexture2D(&desc,nullptr,&slot.texture),"Create independent NvOFA output texture");
+            NvCheck(funcs.nvOFRegisterResourceD3D11(handle,slot.texture.Get(),&slot.output),"NVOFA register motion output");
+            Check(d.dev11->CreateShaderResourceView(slot.texture.Get(),nullptr,&slot.srv),"NvOFA motion SRV");
+        }
     }
     void Reap(){
-        const UINT64 done=owner->Completed();
+        const UINT64 done=owner->Completed(),flowDone=Completed();
         for(int i=0;i<kNumCapture;++i){
-            if(!owner->retiring[i]||owner->retiring[i]>done)continue;
+            if(!owner->retiring[i]||owner->retiring[i]>done||inputUse[i]>flowDone)continue;
             if(frames[i]){
                 NvCheck(funcs.nvOFUnregisterResourceD3D11(frames[i]),"Unregister retired WGC surface");
                 frames[i]=nullptr;
             }
+            inputUse[i]=0;
             owner->ReleaseLease(i);
         }
     }
@@ -538,21 +550,49 @@ struct Flow11 {
         NvCheck(funcs.nvOFRegisterResourceD3D11(handle,owner->history[slot].Get(),&frames[slot]),
             "Zero-copy rejected: NvOFA direct WGC registration");
     }
-    bool Ready() const {
+    UINT64 Completed() const {
         const UINT64 complete=flowFence->GetCompletedValue();
         if(complete==UINT64_MAX)throw Error("NvOFA device removed",owner->dev11->GetDeviceRemovedReason());
-        return complete>=flowSubmitted;
+        return complete;
     }
-    bool Calculate(int current,int previous,bool continuous){
-        if(!Ready())return false; // no additional flow job while previous is outstanding
+    bool Matches(uint64_t pairSerial,int current,int previous)const{
+        return active>=0&&slots[active].pairSerial==pairSerial&&slots[active].current==current&&slots[active].previous==previous;
+    }
+    bool Ready(uint64_t pairSerial,int current,int previous)const{
+        return Matches(pairSerial,current,previous)&&Completed()>=slots[active].submitted;
+    }
+    ID3D11ShaderResourceView* MotionFor(uint64_t pairSerial,int current,int previous)const{
+        if(!Ready(pairSerial,current,previous))throw Error("NvOFA motion pair is not ready");
+        return slots[active].srv.Get();
+    }
+    UINT64 ReserveShaderRead(){
+        if(active<0)throw Error("NvOFA active motion missing");
+        return slots[active].lastRead=++fenceSerial;
+    }
+    bool Calculate(int current,int previous,bool continuous,uint64_t pairSerial){
+        active=-1;
+        const UINT64 complete=Completed();
+        int chosen=-1;
+        for(int i=0;i<2;++i){
+            // Never overwrite pending OFA work OR a motion texture still read by graphics.
+            if(slots[i].submitted<=complete&&slots[i].lastRead<=complete){chosen=i;break;}
+        }
+        if(chosen<0)return false; // bounded two jobs; drop new prediction rather than block/queue unbounded
+        auto& slot=slots[chosen];
         Register(current);Register(previous);
         NV_OF_EXECUTE_INPUT_PARAMS in{};
         in.inputFrame=frames[current];in.referenceFrame=frames[previous];
         in.disableTemporalHints=continuous?NV_OF_FALSE:NV_OF_TRUE;
-        NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=motion;
+        NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=slot.output;
         NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
-        Check(owner->fenceContext->Signal(flowFence.Get(),++flowSubmitted),"Signal flow completion");
-        // Explicit submit, never CPU-wait for motion. D3D11 retains implicit resource ordering.
+        const UINT64 value=++fenceSerial;
+        Check(owner->fenceContext->Signal(flowFence.Get(),value),"Signal flow completion");
+        slot.submitted=value;slot.lastRead=0;slot.pairSerial=pairSerial;
+        slot.current=current;slot.previous=previous;
+        inputUse[current]=inputUse[previous]=value;
+        active=chosen;
+        // Same immediate context and temporal history. Driver may serialize execution;
+        // no CPU-side completion gate for the second submission.
         owner->ctx11->Flush();owner->retirementNeedsSubmit=false;
         return true;
     }
@@ -560,7 +600,7 @@ struct Flow11 {
         if(owner)owner->DrainForShutdown();
         if(handle){
             for(auto &f:frames)if(f&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(f);
-            if(motion&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(motion);
+            for(auto& slot:slots)if(slot.output&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(slot.output);
             if(funcs.nvOFDestroy)funcs.nvOFDestroy(handle);
         }
         if(library)FreeLibrary(library);
@@ -736,7 +776,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 flowPending=false;
                 if(now()+ticks(slotMs*.35)<arrival+ticks(interval*1.10)){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
-                    flowReady=flow.Calculate(current,previous,continuous);
+                    flowReady=flow.Calculate(current,previous,continuous,captureSerial);
                     if(flowReady)lastFlowSerial=captureSerial;
                 }
                 continue;
@@ -754,7 +794,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(due>=expiry){flowReady=false;continue;}
             if(t<due){waitActivity(due,false);continue;}
             // At a prediction deadline, never block the CPU on optical flow.
-            if(!flow.Ready()){waitActivity(std::min(expiry,now()+ticks(.20)),false);continue;}
+            if(!flow.Ready(captureSerial,current,previous)){waitActivity(std::min(expiry,now()+ticks(.20)),false);continue;}
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
             // No burst catch-up; use the newest due prediction, at most one per
             // present opportunity. Never extrapolate more than one source pair.
@@ -764,7 +804,9 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             const unsigned dueIndex=std::min(maxPredictions,unsigned(std::max(1.0,std::floor(elapsed/slotMs))));
             nextPrediction=std::max(nextPrediction,dueIndex);
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
-            dx.Draw(UINT(current),UINT(previous),flow.motionSRV.Get(),fraction,ofGrid);
+            auto* motion=flow.MotionFor(captureSerial,current,previous);
+            const UINT64 readFence=flow.ReserveShaderRead();
+            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence);
             slotHeld=false;lastPresented=now();++nextPrediction;
         }
         overlay.SetVisible(false);
