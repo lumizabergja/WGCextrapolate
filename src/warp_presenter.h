@@ -16,6 +16,8 @@
 namespace fgwarp {
 using Microsoft::WRL::ComPtr;
 inline std::atomic<bool> requested{false};
+inline void (*stageCallback)(const wchar_t*){};
+inline void stage(const wchar_t* message) noexcept {if(stageCallback)stageCallback(message);}
 inline std::atomic<long long> mouseX{},mouseY{};
 struct Handle {HANDLE value{};~Handle(){if(value)CloseHandle(value);}};
 inline void check(HRESULT r,const char* name){if(FAILED(r)){char s[160];std::snprintf(s,sizeof(s),"%s (0x%08X)",name,unsigned(r));throw std::runtime_error(s);}}
@@ -41,6 +43,7 @@ struct Presenter {
         D3D11_SUBRESOURCE_DATA data{initial,pitchBytes,0};ComPtr<ID3D11Texture2D> out;check(device->CreateTexture2D(&d,initial?&data:nullptr,&out),"Native NGX DX11 texture");return out;
     }
     void open(ID3D11Device* dev,ID3D11DeviceContext* context,UINT width,UINT height,UINT srcW,UINT srcH){
+        stage(L"Native DX11 NGX initialization");
         device=dev;ctx=context;w=width;h=height;aspect=float(srcW)/srcH;
         wchar_t exe[32768]{};if(!GetModuleFileNameW(nullptr,exe,32768))throw std::runtime_error("Find FG path");
         const auto folder=std::filesystem::path(exe).parent_path()/L"FrameWarpRuntime";
@@ -50,8 +53,10 @@ struct Presenter {
         ngx(NVSDK_NGX_D3D11_Init_with_ProjectID("b6753093-8532-4a55-9109-4806f5c9b91a",NVSDK_NGX_ENGINE_TYPE_CUSTOM,"FG 1.0",logs.c_str(),device.Get(),&common,NVSDK_NGX_Version_API),"Native NGX DX11 init");sdkReady=true;
         ngx(NVSDK_NGX_D3D11_AllocateParameters(&params),"Native NGX DX11 params");
         params->Set("Latewarp.Output.Width",w);params->Set("Latewarp.Output.Height",h);
+        stage(L"Native DX11 NGX Latewarp feature creation");
         ngx(NVSDK_NGX_D3D11_CreateFeature(ctx.Get(),NVSDK_NGX_Feature_Reserved15,params,&feature),"Native NGX DX11 Latewarp create");
         if(!feature)throw std::runtime_error("Native NGX null feature");
+        stage(L"Native DX11 NGX texture allocation");
         constexpr UINT sr=D3D11_BIND_SHADER_RESOURCE;
         color=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr|D3D11_BIND_RENDER_TARGET);
         output=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr|D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_RENDER_TARGET);
@@ -89,6 +94,7 @@ struct Presenter {
         ctx->UpdateSubresource(mask.Get(),0,nullptr,bytes.data(),w,0);radiusCache=radius;featherCache=feather;
     }
     void evaluate(UINT radius,UINT feather){
+        stage(L"Native DX11 NGX center mask and frame registration");
         ctx->OMSetRenderTargets(0,nullptr,nullptr);
         updateMask(radius,feather);
         source=camera(yaw,pitch);target=source;
@@ -100,9 +106,11 @@ struct Presenter {
         MSG msg{};for(unsigned k=0;k<32&&PeekMessageW(&msg,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++k)DispatchMessageW(&msg);
         target=camera(angle(mouseX.load()),angle(mouseY.load()));
         params->Set("Latewarp.IsRenderedFrame",0u);params->Set("Latewarp.FrameID",++frameID);
+        stage(L"Native DX11 NGX warp evaluation");
         ngx(NVSDK_NGX_D3D11_EvaluateFeature(ctx.Get(),feature,params,nullptr),"Native NGX DX11 warp evaluation");
         // NGX is allowed to alter immediate-context state. The caller binds all final draw state.
         ctx->ClearState();
+        stage(L"Native DX11 NGX output presentation");
     }
     ~Presenter(){if(feature)NVSDK_NGX_D3D11_ReleaseFeature(feature);if(params)NVSDK_NGX_D3D11_DestroyParameters(params);if(sdkReady)NVSDK_NGX_D3D11_Shutdown1(device.Get());}
 };
