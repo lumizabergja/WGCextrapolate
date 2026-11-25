@@ -11,3 +11,5 @@ For a one-slot comparison build, set `FG_OFA_SLOT_COUNT=1` before running `Build
 
 ## Input-aware EarlyFlow variant
 See [INPUT-AWARE.md](INPUT-AWARE.md) for build steps, assumptions, testing and limitations.
+
+Predict3: adaptive 0–3 ms visual mouse prediction, enabled with Late mouse input (FG). See INPUT-AWARE.md for limitations.
