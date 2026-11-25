@@ -51,7 +51,7 @@ int RunChild(DWORD parent){
     if(!mapping.value||!owner.value)return ERROR_INVALID_HANDLE;
     MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
     if(!v.data)return ERROR_INVALID_DATA;
-    session=v.data;
+    session=v.data;fgwarp::stageCallback=[](const wchar_t* stage){lstrcpynW(session->stage,stage,96);};
     std::atomic<bool> finished{false};
     std::thread monitor([&]{
         while(!finished.load()){

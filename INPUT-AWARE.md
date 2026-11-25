@@ -1,13 +1,13 @@
-# FG EarlyFlow Predict3 Pro
+# FG EarlyFlow NGX Predict3
 
-External WGC / D3D11 presenter, no injection. Reflex 2/NGX removed from executable and build dependencies. Late input and automatic screen-space layer protection default on. Existing manual center radius/feather remain optional.
+Experimental external native DX11 NGX latewarp (Reflex 2 Frame Warp path), not a game-integrated NVIDIA Reflex 2 implementation. WGC capture, NvOFA FAST 4x4 cost OFF, Dynamic 320. No custom late camera pixel reprojection: optical flow extrapolates motion, then NGX is the only late camera transform.
 
-- Dedicated Raw Input message thread; nonblocking render snapshot.
-- Camera reprojection for real and generated frames, except Off mode.
-- Camera-only fallback when matching NvOFA flow is not ready; no extra GPU pass or frame queue. Shared D3D11 driver scheduling can still serialize GPU work.
-- Prediction budget based on half a display refresh plus 0.35 ms, capped at 3 ms; not a measured scanout phase.
-- Per-draw sparse image alignment selection among estimated 2, 5 and 8 ms capture/input offsets; no game input timestamp available.
-- Bounded acceleration during coherent speed increases; existing reversal/staleness guards retained.
-- Per-pixel HUD/weapon heuristic uses screen-space correspondence and flow disagreement with estimated camera motion. Moving foreground uses its own flow where reliable, not a fixed region. With unreliable/missing flow, newest source pixels may be reused. No semantic masks/depth; flicker reduction is not guaranteed.
+- Dedicated Raw Input message thread, intended for a 1000 Hz mouse. Windows message receipt timestamps are not hardware timestamps; this does not change mouse polling configuration.
+- Real and generated frames each register their input image and evaluate NGX once more with a fresh target camera pose. Adaptive prediction up to 3 ms, reversal/deceleration/staleness suppression, bounded acceleration and 4-degree total target correction.
+- For flow-extrapolated frames estimate their source camera using preceding mouse delta times the extrapolation horizon; for camera-only fallback use the latest real source pose. Source timestamp uses an assumed 5 ms input-to-capture offset. No actual game pose or depth.
+- Automatic mask generated in the existing extrapolation draw using MRT: screen-space appearance, flow disagreement with estimated camera motion, predicted source coordinates, and local neighbor expansion. Moving weapon keeps local flow rather than freezing a rectangular region. Final draw composites protected unwarped (or extrapolated) pixels over NGX output. Fixed manual center radius/feather optional. The heuristic cannot perfectly separate HUD, weapon, and background from flattened capture. Edges can flicker and low-confidence foreground may reuse real pixels. No guaranteed latency benefit.
+- NGX uses synthetic depth/motion and experimental undocumented latewarp parameters. It performs two evaluations per output plus a composite draw; higher GPU work than the previous custom shader. Runtime behavior, latency and visual accuracy require Windows GPU testing.
+- Default checkbox NGX Frame Warp + Predict3 + Auto HUD is ON; unchecking bypasses NGX camera warp. Initial history warmup or unavailable nonblocking pose can bypass warp for a frame. Off multiplier still allows real-frame warp if enabled.
 
-Use 800 DPI, 1.5 sensitivity, 1000 Hz; Dynamic 320. Keep center radius and feather at zero to test automatic protection. Disable Late input + Auto HUD / weapon for comparison. Prediction does not change firing or simulation latency. Windows compilation and on-device image quality must be verified. Build.cmd requires MSVC x64 and recent Windows SDK; no NGX download.
+## Run
+Build.cmd restores the original NGX SDK download. Copy the original compatible FrameWarpRuntime directory (including nvngx_latewarp.dll) from your working NGX package beside FG.exe. It is not bundled by GitHub Actions. Missing runtime causes an initialization error. Use CS2 800 DPI, sensitivity 1.5, 1000 Hz mouse polling, Dynamic 320, center radius/feather zero to test the automatic mask. Actual game input is never modified.

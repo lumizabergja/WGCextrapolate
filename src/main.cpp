@@ -30,7 +30,7 @@
 #include <nvOpticalFlowD3D11.h>
 #include <d3d11_4.h>
 #include <climits>
-#include "late_mouse.h"
+#include "warp_presenter.h"
 #include "wgc_capture.h"
 #include "late_input.h"
 
@@ -173,6 +173,7 @@ struct OverlayWindow {
 };
 
 struct DxDevices {
+    fgwarp::Presenter warp;
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
@@ -305,6 +306,7 @@ struct DxDevices {
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
         Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
+        warp.open(dev11.Get(),ctx11.Get(),screenW,screenH,srcW,srcH);
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
         static const char* shader=R"HLSL(
@@ -378,6 +380,17 @@ float screenLayer(float2 uv,float3 c,float2 historical,float2 v,bool hasFlow){
         float independent=smoothstep(.0015,.008,length(v-(q-uv)));
         stable=max(stable,independent*smoothstep(.018,.10,world-fit)*(1-smoothstep(.05,.19,fit))*activity);
     }
+    if(!hasFlow&&activity>.25&&stable<.65){
+        // When current-pair flow is unavailable (real frames), look for a small
+        // independent screen-space shift, but require a textured neighborhood.
+        float2 stepUV=motionInv*3.;
+        float fit=min(min(diff(c,previousFrame.SampleLevel(samp,uv+float2(stepUV.x,0),0).rgb),
+                          diff(c,previousFrame.SampleLevel(samp,uv-float2(stepUV.x,0),0).rgb)),
+                      min(diff(c,previousFrame.SampleLevel(samp,uv+float2(0,stepUV.y),0).rgb),
+                          diff(c,previousFrame.SampleLevel(samp,uv-float2(0,stepUV.y),0).rgb)));
+        float contrast=diff(c,currentFrame.SampleLevel(samp,uv+stepUV,0).rgb);
+        stable=max(stable,.65*activity*smoothstep(.035,.12,world-fit)*(1-smoothstep(.025,.10,fit))*smoothstep(.02,.10,contrast));
+    }
     return saturate(stable);
 }
 float4 flowPixel(float2 q,float2 v,float4 fallback){
@@ -389,31 +402,39 @@ float4 flowPixel(float2 q,float2 v,float4 fallback){
     float conf=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
     return lerp(fallback,next,conf*fade(q));
 }
-float4 PS(V i):SV_Target{
+float protectAt(float2 uv,float2 historical,bool hasFlow){
+    float2 v=0;if(hasFlow)v=flow(uv);
+    return screenLayer(uv,currentFrame.SampleLevel(samp,uv,0).rgb,historical,v,hasFlow);
+}
+struct Rendered {float4 color:SV_Target0;float mask:SV_Target1;};
+Rendered PS(V i){
     float2 uv=i.uv;
     float4 base=currentFrame.SampleLevel(samp,uv,0);
-    if(i.scene>.9)return base;
-    bool hasFlow=flowActive>.5&&horizon>0.00001;
-    bool hasCamera=i.valid>.5;
-    if(!hasFlow&&!hasCamera)return base;
-    float mask=centerMask(uv);if(mask==0)return base;
+    Rendered o;o.color=base;o.mask=1-centerMask(uv);
+    bool hasFlow=flowActive>.5&&horizon>0.00001&&i.scene<=.9;
     float2 v=0;if(hasFlow)v=flow(uv);
     float2 q=uv+horizon*v;
-    float4 screen=base,world=base;
-    float layer=0;
-    if(hasCamera){
-        float2 inputUV=cameraUV(uv,bounded(i.cam.xy));
-        float4 src=currentFrame.SampleLevel(samp,inputUV,0);
-        world=lerp(base,src,fade(inputUV));
-        layer=screenLayer(uv,base.rgb,i.cam.zw,v,hasFlow);
-        if(fade(inputUV)>0){float2 vv=0;if(hasFlow)vv=flow(inputUV);layer=max(layer,.8*screenLayer(inputUV,src.rgb,i.cam.zw,vv,hasFlow));}
-        if(hasFlow)q=cameraUV(q,bounded(i.cam.xy-horizon*i.cam.zw));
+    if(hasFlow)o.color=lerp(base,flowPixel(q,v,base),centerMask(uv));
+    // Camera transforms below are correspondence tests ONLY; no late pixel reprojection.
+    if(i.valid>.5&&i.scene<=.9){
+        float2 historical=i.cam.zw;
+        float layer=protectAt(uv,historical,hasFlow);
+        // Include the predicted source location, and expand a few pixels around boundaries.
+        if(hasFlow&&fade(q)>0)layer=max(layer,protectAt(q,historical,true));
+        float2 dx=float2(2.0*motionInv.x,0),dy=float2(0,2.0*motionInv.y);
+        float neighbors=max(max(protectAt(uv+dx,historical,hasFlow),protectAt(uv-dx,historical,hasFlow)),
+                            max(protectAt(uv+dy,historical,hasFlow),protectAt(uv-dy,historical,hasFlow)));
+        layer=max(layer,neighbors*.80);
+        // Strong stationary correspondence should keep sharp HUD pixels at source position;
+        // moving foreground retains local optical-flow extrapolation.
+        if(hasFlow){
+            float same=diff(base.rgb,previousFrame.SampleLevel(samp,uv,0).rgb);
+            float still=(1-smoothstep(.025,.09,same))*(1-smoothstep(.0008,.004,length(v)));
+            o.color=lerp(o.color,base,saturate(layer*still));
+        }
+        o.mask=max(o.mask,smoothstep(.20,.65,layer));
     }
-    if(hasFlow){
-        screen=flowPixel(uv+horizon*v,v,base);
-        if(hasCamera)world=flowPixel(q,v,world);else world=screen;
-    }
-    return lerp(base,lerp(world,screen,layer),mask);
+    return o;
 }
 )HLSL";
         ComPtr<ID3DBlob> vsBlob,psBlob,errs;
@@ -425,10 +446,12 @@ float4 PS(V i):SV_Target{
         Check(dev11->CreatePixelShader(psBlob->GetBufferPointer(),psBlob->GetBufferSize(),nullptr,&ps),"PixelShader");
         static const char* realShader=R"HLSL(
 Texture2D<float4> src:register(t0);
+Texture2D<float4> unwarped:register(t1);
+Texture2D<float> protection:register(t2);
 SamplerState s:register(s0);
 struct V{float4 pos:SV_Position;float2 uv:TEXCOORD0;};
 V VS(uint id:SV_VertexID){V v;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);v.pos=float4(p,0,1);v.uv=float2((p.x+1)*.5,1-(p.y+1)*.5);return v;}
-float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
+float4 PS(V v):SV_Target{float a=protection.SampleLevel(s,v.uv,0);return lerp(src.SampleLevel(s,v.uv,0),unwarped.SampleLevel(s,v.uv,0),a);}
 )HLSL";
         vsBlob.Reset();psBlob.Reset();errs.Reset();
         Check(D3DCompile(realShader,strlen(realShader),"FG real",nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vsBlob,&errs),"Compile real VS");
@@ -482,7 +505,10 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     static_assert(sizeof(Params)==128);
     void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
               float horizon,int grid,ID3D11Fence* motionReadFence,UINT64 motionReadValue,
-              const LateMouse::Set& camera){
+              const LateMouse::Set& camera,LateMouse& mouse,LONGLONG prevStamp,LONGLONG curStamp,double ticksPerMs,double lead){
+        const bool enableWarp=g_lateInput.load(std::memory_order_relaxed);
+        const auto pose=enableWarp?mouse.sourcePose(prevStamp,curStamp,rawFlow?horizon:0.,ticksPerMs):LateMouse::Pose{};
+        const bool useWarp=enableWarp&&pose.valid;
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
@@ -492,13 +518,13 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
               float(grid),rawFlow?1.f:0.f,
               float(g_centerRadiusPx.load(std::memory_order_relaxed)),
               float(g_centerFeatherPx.load(std::memory_order_relaxed)),
-              float(screenW),float(screenH),.75f*float(srcW)/float(srcH),.75f,1.f,0.f,{},{}};
+              float(screenW),float(screenH),.75f*float(srcW)/float(srcH),.75f,current!=previous?1.f:0.f,0.f,{},{}};
         for(unsigned j=0;j<3;++j){p.candidates[j][0]=camera[j].actual.x;p.candidates[j][1]=camera[j].actual.y;p.candidates[j][2]=camera[j].historical.x;p.candidates[j][3]=camera[j].historical.y;p.validCamera[j]=camera[j].valid?1.f:0.f;}
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
-        ID3D11RenderTargetView* target=rtv.Get();
-        ctx11->OMSetRenderTargets(1,&target,nullptr);
+        ID3D11RenderTargetView* targets[2]{useWarp?warp.inputRTV.Get():rtv.Get(),warp.maskRTV.Get()};
+        ctx11->OMSetRenderTargets(useWarp?2:1,targets,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
@@ -513,21 +539,23 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->VSSetShaderResources(0,3,nullViews);
         // Retire the motion SRV after its final shader read, before Present submits the batch.
         if(motionReadFence)Check(fenceContext->Signal(motionReadFence,motionReadValue),"Signal motion shader read completion");
-        Present();
-    }
-    void PresentReal(UINT current,int /*grid*/){
-        D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
-        ctx11->RSSetViewports(1,&vp);
-        ID3D11RenderTargetView* target=rtv.Get();
-        ctx11->OMSetRenderTargets(1,&target,nullptr);
-        ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx11->VSSetShader(realVS.Get(),nullptr,0);
-        ctx11->PSSetShader(realPS.Get(),nullptr,0);
-        ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
-        ctx11->PSSetShaderResources(0,1,frameSRV[current].GetAddressOf());
-        ctx11->Draw(3,0);
-        ID3D11ShaderResourceView* empty=nullptr;
-        ctx11->PSSetShaderResources(0,1,&empty);
+        if(useWarp){
+            warp.evaluate(pose,[&](const LateMouse::Pose& src){
+                LARGE_INTEGER q{};QueryPerformanceCounter(&q);
+                return mouse.targetDelta(src,q.QuadPart,ticksPerMs,lead);
+            });
+            // NGX has cleared context state. Composite protected pixels in the final draw,
+            // even if the experimental NGX NoWarpMask parameter is ignored.
+            ctx11->RSSetViewports(1,&vp);
+            ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+            ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx11->VSSetShader(realVS.Get(),nullptr,0);ctx11->PSSetShader(realPS.Get(),nullptr,0);
+            ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
+            ID3D11ShaderResourceView* outputs[3]{warp.outputSRV.Get(),warp.colorSRV.Get(),warp.maskSRV.Get()};
+            ctx11->PSSetShaderResources(0,3,outputs);
+            ctx11->Draw(3,0);
+            ctx11->PSSetShaderResources(0,3,nullViews);
+        }
         Present();
     }
     void Present(){
@@ -732,7 +760,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         LateMouse mouse(game.pid);
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(L"Running - WGC Predict3 Pro");
+        Status(L"Running - WGC NGX Predict3");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -815,8 +843,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 dynamicDeadline+=((submitted-dynamicDeadline)/dynamicPeriod+1)*dynamicPeriod;
         };
         auto cameraSample=[&](double h){
-            if(!g_lateInput.load(std::memory_order_relaxed)||previous<0||pair<=0||warmup>0||g_fgMode.load()==1)return LateMouse::Set{};
-            const double lead=std::clamp(500.0/double(monitorHz)+.35,0.0,3.0);
+            if(!g_lateInput.load(std::memory_order_relaxed)||previous<0||pair<=0||warmup>0)return LateMouse::Set{};
+            const double lead=3.;
             return mouse.sample(previousSource,priorSource,now(),h,double(freq.QuadPart)/1000.,lead);
         };
         auto grabLatest=[&]{
@@ -885,9 +913,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(!grabbed||WaitForSingleObject(dx.capture.event.get(),0)==WAIT_OBJECT_0)grabLatest();
                 realSubmitted=lastSubmitted=now();
                 auto realCamera=cameraSample(0.);
-                if(previous>=0&&std::any_of(realCamera.begin(),realCamera.end(),[](const auto& c){return c.valid;}))
-                    dx.Draw(UINT(current),UINT(previous),nullptr,0.f,ofGrid,nullptr,0,realCamera);
-                else dx.PresentReal(UINT(current),ofGrid);
+                dx.Draw(UINT(current),UINT(previous>=0?previous:current),nullptr,0.f,ofGrid,nullptr,0,realCamera,mouse,previousSource,priorSource,double(freq.QuadPart)/1000.,3.);
                 slotHeld=false;
                 overlay.SetVisible(true);realPending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
@@ -960,7 +986,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             auto* motion=motionReady?flow.MotionFor(captureSerial,current,previous):nullptr;
             const UINT64 readFence=motionReady?flow.ReserveShaderRead():0;
-            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,motionReady?flow.flowFence.Get():nullptr,readFence,camera);
+            dx.Draw(UINT(current),UINT(previous),motion,motionReady?fraction:0.f,ofGrid,motionReady?flow.flowFence.Get():nullptr,readFence,camera,mouse,previousSource,priorSource,double(freq.QuadPart)/1000.,3.);
             slotHeld=false;lastSubmitted=submitTime;++nextPrediction;
             if(dynamicPeriod)advanceDynamicDeadline(submitTime);
         }
@@ -1130,7 +1156,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             218,247,100,27,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDynamicTarget)),nullptr,nullptr);
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
-        HWND lateCheck=CreateWindowW(L"BUTTON",L"Late input + Auto HUD / weapon",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+        HWND lateCheck=CreateWindowW(L"BUTTON",L"NGX Frame Warp + Predict3 + Auto HUD",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
             36,278,490,27,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
         StyleControl(lateCheck);CheckDlgButton(hwnd,121,BST_CHECKED);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,

@@ -58,6 +58,8 @@ class LateMouse {
         stop=ready=nullptr;
     }
 public:
+    struct Pose {float yaw{},pitch{};double x{},y{};bool valid{};};
+    static constexpr double rad=-.022*1.5*3.14159265358979323846/180.;
     using Set=std::array<fglate::Correction,3>;
     explicit LateMouse(DWORD pid):gamePid(pid){
         ready=CreateEventW(nullptr,TRUE,FALSE,nullptr);stop=CreateEventW(nullptr,TRUE,FALSE,nullptr);
@@ -67,6 +69,26 @@ public:
     }
     ~LateMouse(){close();}
     void reset(int64_t t){std::lock_guard<std::mutex> guard(mutex);history.reset(t);}
+    Pose sourcePose(int64_t prev,int64_t cur,double horizon,double ticksPerMs){
+        std::unique_lock<std::mutex> guard(mutex,std::try_to_lock);
+        if(!guard.owns_lock())return {};
+        const int64_t offset=static_cast<int64_t>(5.*ticksPerMs);
+        fglate::Counts c{},p{};
+        if(!history.at(cur-offset,c))return {};
+        if(horizon>0&&history.at(prev-offset,p)){c.x+=horizon*(c.x-p.x);c.y+=horizon*(c.y-p.y);}
+        return {float(std::remainder(c.x*rad,6.283185307179586)),float(std::remainder(c.y*rad,6.283185307179586)),c.x,c.y,true};
+    }
+    fglate::Angles targetDelta(const Pose& pose,int64_t latest,double ticksPerMs,double lead){
+        if(!pose.valid)return {};
+        std::unique_lock<std::mutex> guard(mutex,std::try_to_lock);
+        if(!guard.owns_lock())return {};
+        fglate::Counts c{};
+        if(!history.at(latest,c))return {};
+        auto p=history.predict(latest,ticksPerMs,lead);
+        const double x=(c.x+p.x-pose.x)*rad,y=(c.y+p.y-pose.y)*rad;
+        const double scale=std::max(1.,std::hypot(x,y)/.06981317007977318);
+        return {float(x/scale),float(y/scale)};
+    }
     Set sample(int64_t prev,int64_t cur,int64_t latest,double horizon,double ticksPerMs,double lead){
         std::unique_lock<std::mutex> guard(mutex,std::try_to_lock);
         if(!guard.owns_lock())return {};

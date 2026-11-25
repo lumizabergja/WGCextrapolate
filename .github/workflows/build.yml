@@ -1,8 +1,8 @@
-name: FG WGC 320 Predict3 Pro
+name: FG WGC 320 NGX Predict3
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-earlyflow-predict3-pro']
+    branches: ['fg-wgc-320-earlyflow-ngx-predict3']
 permissions:
   contents: read
 jobs:
@@ -40,7 +40,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Pixel shader compilation failed' }
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-EarlyFlow-Predict3-Pro-Windows-x64
+          name: FG-WGC-320-EarlyFlow-NGX-Predict3-Windows-x64
           path: |
             bin/FG.exe
             README.md
