@@ -97,6 +97,21 @@ void RefreshGames(){
     if(!g_games.empty())SendMessageW(g_targets,CB_SETCURSEL,0,0);
 }
 
+thread_local bool monitorDirty=true;
+thread_local HWND monitoredWindow{};
+void CALLBACK OnWindowLocation(HWINEVENTHOOK,DWORD,HWND window,LONG object,LONG child,DWORD,DWORD){
+    if(window==monitoredWindow&&object==OBJID_WINDOW&&child==CHILDID_SELF)monitorDirty=true;
+}
+struct LocationWatch {
+    HWINEVENTHOOK hook{};
+    explicit LocationWatch(const Game& game){
+        monitoredWindow=game.window;
+        hook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,
+            OnWindowLocation,game.pid,0,WINEVENT_OUTOFCONTEXT);
+    }
+    ~LocationWatch(){if(hook)UnhookWinEvent(hook);monitoredWindow=nullptr;}
+};
+
 struct OverlayWindow {
     HWND hwnd{};
     UINT width{},height{};
@@ -104,9 +119,9 @@ struct OverlayWindow {
     bool visible{};
     // Track mode changes when an exclusive 4:3 game regains focus.
     // The HWND must occupy the current logical monitor (not the old desktop mode).
-    bool SyncToMonitor(HWND target) {
+    bool SyncToMonitor(HMONITOR monitor) {
         MONITORINFO mi{sizeof(mi)};
-        if(!GetMonitorInfoW(MonitorFromWindow(target,MONITOR_DEFAULTTONEAREST),&mi))
+        if(!GetMonitorInfoW(monitor,&mi))
             throw Error("GetMonitorInfo during mode switch failed",GetLastError());
         const RECT r=mi.rcMonitor;
         const UINT w=UINT(r.right-r.left),h=UINT(r.bottom-r.top);
@@ -330,6 +345,8 @@ float4 PS(V i):SV_Target {
     float2 uv=i.uv;
     float4 base=currentFrame.SampleLevel(samp,uv,0);
     [branch] if(horizon<=0.00001 || i.scene>0.9)return base;
+    float mask=centerMask(uv);
+    [branch] if(mask==0.0)return base;
     float2 v=flow(uv),q=uv+horizon*v;
     if(any(q<0)||any(q>1))return base;
     float2 mv=flow(q),old=q+mv;
@@ -338,7 +355,7 @@ float4 PS(V i):SV_Target {
     float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
     float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
     float confidence=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
-    return lerp(base,next,saturate(confidence*centerMask(uv)));
+    return lerp(base,next,saturate(confidence*mask));
 }
 )HLSL";
         ComPtr<ID3DBlob> vsBlob,psBlob,errs;
@@ -369,7 +386,6 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     }
     bool Grab(HWND game,int slot,UINT timeout,LARGE_INTEGER& timestamp){
         if(!IsWindow(game))return false;
-        if(MonitorFromWindow(game,MONITOR_DEFAULTTONEAREST)!=desktop.Monitor)throw DisplayChanged{};
         if(slot<0||leases[slot])return false;
         const auto frame=capture.Latest(timeout);
         if(!frame)return false;
@@ -690,6 +706,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         const int originalPriority=GetThreadPriority(GetCurrentThread());
         struct PriorityRestore {int prior;~PriorityRestore(){if(prior!=THREAD_PRIORITY_ERROR_RETURN)SetThreadPriority(GetCurrentThread(),prior);}} priority{originalPriority};
         SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        LocationWatch locationWatch(game);
+        LONGLONG nextMonitorCheck=0;
+        winrt::handle capacityEvent{CreateEventW(nullptr,FALSE,FALSE,nullptr)};
+        if(!capacityEvent)throw Error("Create capture capacity event",GetLastError());
+        UINT64 armedGraphics=0,armedFlow=0;
         bool slotHeld=false;
         auto waitActivity=[&](LONGLONG deadline,bool needSlot,HANDLE flowCompletion=nullptr){
             dx.SubmitRetirement();
@@ -698,11 +719,31 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             LARGE_INTEGER due{};
             due.QuadPart=-std::max<LONGLONG>(1,static_cast<LONGLONG>(double(remaining)*10000000.0/double(freq.QuadPart)));
             if(!SetWaitableTimer(timer.handle,&due,0,nullptr,nullptr,FALSE))throw Error("Set prediction timer",GetLastError());
-            HANDLE handles[4]{dx.capture.event.get(),timer.handle};
+            HANDLE handles[5]{dx.capture.event.get(),timer.handle};
             DWORD count=2;
             const bool watchSlot=needSlot&&!slotHeld;
             if(watchSlot)handles[count++]=dx.frameReady;
             if(flowCompletion)handles[count++]=flowCompletion;
+            if(dx.FreeSlot()<0){
+                int oldest=-1;
+                for(int i=0;i<kNumCapture;++i)
+                    if(dx.retiring[i]&&(oldest<0||dx.retiring[i]<dx.retiring[oldest]))oldest=i;
+                if(oldest>=0){
+                    const UINT64 graphics=dx.retiring[oldest],motion=flow.inputUse[oldest];
+                    if(dx.Completed()<graphics){
+                        if(armedGraphics!=graphics){
+                            Check(dx.retirementFence->SetEventOnCompletion(graphics,capacityEvent.get()),"Arm capture retirement");
+                            armedGraphics=graphics;
+                        }
+                    }else if(flow.Completed()<motion){
+                        if(armedFlow!=motion){
+                            Check(flow.flowFence->SetEventOnCompletion(motion,capacityEvent.get()),"Arm capture motion retirement");
+                            armedFlow=motion;
+                        }
+                    }else return;
+                    handles[count++]=capacityEvent.get();
+                }
+            }
             const DWORD r=MsgWaitForMultipleObjectsEx(count,handles,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
             if(watchSlot&&r==WAIT_OBJECT_0+2)slotHeld=true;
             if(r==WAIT_FAILED)throw Error("WGC scheduler wait",GetLastError());
@@ -720,7 +761,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double interval=16.667,pair=0.0,slotMs=3.125;
         int current=-1,previous=-1;
         uint64_t captureSerial=0,lastFlowSerial=0;
-        bool flowReady=false,realPending=false,flowPending=false,wasFocused=false;
+        bool flowReady=false,realPending=false,wasFocused=false;
         unsigned nextPrediction=1,maxPredictions=0;
         int measurements=0,warmup=0;
         auto advanceDynamicDeadline=[&](LONGLONG submitted){
@@ -743,7 +784,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 }
             }
             priorSource=stamp.QuadPart;
-            realPending=true;flowReady=false;flowPending=false;maxPredictions=0;nextPrediction=1;
+            realPending=true;flowReady=false;maxPredictions=0;nextPrediction=1;
             if(warmup>0)--warmup;
             return true;
         };
@@ -758,10 +799,15 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             HWND foreground=GetForegroundWindow();
             if(foreground)GetWindowThreadProcessId(foreground,&foregroundPid);
             const bool focused=!IsIconic(game.window)&&foregroundPid==game.pid;
-            if(focused && overlay.SyncToMonitor(game.window))throw DisplayChanged{};
+            if(focused&&(!wasFocused||monitorDirty||now()>=nextMonitorCheck)){
+                monitorDirty=false;
+                nextMonitorCheck=now()+ticks(250);
+                HMONITOR monitor=MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST);
+                if(monitor!=dx.desktop.Monitor||overlay.SyncToMonitor(monitor))throw DisplayChanged{};
+            }
             flow.Reap();
             if(!focused){
-                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;flowPending=false;
+                overlay.SetVisible(false);wasFocused=false;flowReady=false;realPending=false;
                 dx.RetireExcept(-1,-1);
                 // Release queued WGC frames while unfocused so resume starts fresh.
                 if(auto dropped=dx.capture.Latest(0))dropped.Close();
@@ -771,7 +817,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=0;interval=16.667;pair=0;
-                flowReady=false;realPending=false;flowPending=false;maxPredictions=0;nextPrediction=1;
+                flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
                 realSubmitted=lastSubmitted=0;
                 dynamicPeriod=dynamicDeadline=0;
             }
@@ -781,7 +827,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             // becomes available while we were waiting on the timer.
             const bool grabbed=grabLatest();
             if(realPending){
-                if(!acquireSlot()){waitActivity(now()+ticks(dx.FreeSlot()<0?.25:8.0),true);continue;}
+                if(!acquireSlot()){waitActivity(now()+ticks(8.0),true);continue;}
                 // If the mailbox was already read this iteration, only drain it
                 // again when WGC reports more work. Submit a pending real once
                 // the slot is available, even if captures keep arriving.
@@ -812,13 +858,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(mode==0&&interval<=1.05*slotMs)maxPredictions=0;
                 nextPrediction=1;
                 const LONGLONG expiry=arrival+ticks(interval*1.10);
-                flowPending=maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
-                    now()+ticks(slotMs*.70)<expiry;
-                continue;
-            }
-            if(flowPending){
-                flowPending=false;
-                if(now()+ticks(slotMs*.35)<arrival+ticks(interval*1.10)){
+                if(maxPredictions>0&&previous>=0&&pair>0&&warmup==0&&
+                   now()+ticks(slotMs*.70)<expiry&&!grabLatest()){
                     const bool continuous=lastFlowSerial!=0&&lastFlowSerial+1==captureSerial;
                     flowReady=flow.Calculate(current,previous,continuous,captureSerial);
                     if(flowReady)lastFlowSerial=captureSerial;
@@ -826,7 +867,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 continue;
             }
             if(!flowReady||nextPrediction>maxPredictions){
-                waitActivity(now()+ticks(dx.FreeSlot()<0?.25:8.0),false);continue;
+                waitActivity(now()+ticks(8.0),false);continue;
             }
             const LONGLONG t=now();
             const LONGLONG expiry=std::min(arrival+ticks(interval*1.10),
@@ -1000,6 +1041,7 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
+    if(msg==WM_DISPLAYCHANGE)monitorDirty=true;
     if(msg==WM_INPUT){
         RAWINPUT input{};UINT bytes=sizeof(input);
         if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))==sizeof(input) &&
