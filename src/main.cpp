@@ -27,14 +27,16 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <commctrl.h>
-#include <nvOpticalFlowD3D11.h>
+#include <cuda_runtime.h>
+#include <cuda_d3d11_interop.h>
+#include "dp4a_kernel.h"
 #include "warp_presenter.h"
 #include "wgc_capture.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
 constexpr int kNumCapture = 4; // at most two active, two retiring
-constexpr int kOpticalFlowGrid = 4; // This app has a fixed NvOFA FAST 4x4 path.
+constexpr int kOpticalFlowGrid = 8; // CUDA DP4a backward motion grid.
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
@@ -81,7 +83,6 @@ std::runtime_error Error(const std::string& what,HRESULT hr=0) {
     return std::runtime_error(b);
 }
 void Check(HRESULT hr,const char* what) {if(FAILED(hr)) throw Error(what,hr);}
-void NvCheck(NV_OF_STATUS s,const char* what) {if(s!=NV_OF_SUCCESS)throw Error(what,static_cast<HRESULT>(s));}
 struct DisplayChanged {};
 std::wstring Wide(const std::string& s) {int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,nullptr,0);if(n<1)return L"Error";std::wstring w(size_t(n),L'\0');MultiByteToWideChar(CP_UTF8,0,s.c_str(),-1,w.data(),n);w.pop_back();return w;}
 BOOL CALLBACK FindWindows(HWND h,LPARAM) {
@@ -183,7 +184,7 @@ struct DxDevices {
     WgcCapture capture;
     DXGI_OUTPUT_DESC desktop{};
     ~DxDevices(){
-        // Flow11 has already retired GPU work and unregistered OFA resources.
+        // Flow11 has already retired GPU work and unregistered CUDA resources.
         capture.StopSession();
         for(int i=0;i<kNumCapture;++i)ReleaseLease(i);
         if(retireEvent)CloseHandle(retireEvent);
@@ -206,7 +207,7 @@ struct DxDevices {
         Check(fenceContext->Signal(retirementFence.Get(),value),"Signal WGC retirement fence");
         for(int i=0;i<kNumCapture;++i)
             if(leases[i]&&!retiring[i]&&i!=current&&i!=previous)retiring[i]=value;
-        // Let the next real Present or OFA submission flush this batch.
+        // Let the next real Present or CUDA submission flush this batch.
         retirementNeedsSubmit=true;
     }
     void SubmitRetirement(){if(retirementNeedsSubmit){ctx11->Flush();retirementNeedsSubmit=false;}}
@@ -291,23 +292,23 @@ struct DxDevices {
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
         static const char* shader=R"HLSL(
 Texture2D<float4> currentFrame:register(t0);
-Texture2D<int2> rawFlow:register(t1);
+Buffer<int2> rawFlow:register(t1);
 Texture2D<float4> previousFrame:register(t2);
 SamplerState samp:register(s0);
 cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float _padding1;float centerRadiusPx;float centerFeatherPx;float2 outputSize;};
 struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;};
 // Use native block centers, including partial cells on odd-sized captures.
 float2 flow(float2 uv){
-    uint fw,fh;rawFlow.GetDimensions(fw,fh);
+    uint fw=(uint)gridExtent.x,fh=(uint)gridExtent.y;
     float2 pos=uv/(motionInv*gridSize*gridExtent)*float2(fw,fh)-0.5;
     int2 base=int2(floor(pos));float2 f=frac(pos);
     int2 edge=int2(int(fw)-1,int(fh)-1);
     int2 a=clamp(base,int2(0,0),edge),b=clamp(base+int2(1,0),int2(0,0),edge);
     int2 c=clamp(base+int2(0,1),int2(0,0),edge),d=clamp(base+int2(1,1),int2(0,0),edge);
-    float2 v00=float2(rawFlow.Load(int3(a,0)))*(1.0/32.0);
-    float2 v10=float2(rawFlow.Load(int3(b,0)))*(1.0/32.0);
-    float2 v01=float2(rawFlow.Load(int3(c,0)))*(1.0/32.0);
-    float2 v11=float2(rawFlow.Load(int3(d,0)))*(1.0/32.0);
+    float2 v00=float2(rawFlow[a.y*fw+a.x])*(1.0/32.0);
+    float2 v10=float2(rawFlow[b.y*fw+b.x])*(1.0/32.0);
+    float2 v01=float2(rawFlow[c.y*fw+c.x])*(1.0/32.0);
+    float2 v11=float2(rawFlow[d.y*fw+d.x])*(1.0/32.0);
     return lerp(lerp(v00,v10,f.x),lerp(v01,v11,f.x),f.y)*motionInv;
 }
 float cutSample(float2 uv){float2 q=uv+flow(uv);if(any(q<0)||any(q>1))return 0;return dot(abs(currentFrame.SampleLevel(samp,uv,0).rgb-previousFrame.SampleLevel(samp,q,0).rgb),float3(.333333,.333333,.333333));}
@@ -474,154 +475,7 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     }
 };
 
-struct Flow11 {
-    DxDevices* owner{};
-    HMODULE library{};
-    NV_OF_D3D11_API_FUNCTION_LIST funcs{};
-    NvOFHandle handle{};
-    NvOFGPUBufferHandle frames[kNumCapture]{};
-    struct MotionSlot{
-        NvOFGPUBufferHandle output{};
-        ComPtr<ID3D11Texture2D> texture;
-        ComPtr<ID3D11ShaderResourceView> srv;
-        winrt::handle completionEvent;
-        UINT64 submitted{},lastRead{},completionArmed{};
-        uint64_t pairSerial{};
-        int current{-1},previous{-1};
-    };
-#ifndef FG_OFA_SLOT_COUNT
-#define FG_OFA_SLOT_COUNT 2
-#endif
-    static_assert(FG_OFA_SLOT_COUNT == 1 || FG_OFA_SLOT_COUNT == 2);
-    MotionSlot slots[FG_OFA_SLOT_COUNT];
-    ComPtr<ID3D11Fence> flowFence;
-    UINT64 fenceSerial{},inputUse[kNumCapture]{};
-    int active{-1};
-    void Init(DxDevices& d,int grid){
-        owner=&d;
-        ComPtr<ID3D11Device5> fenceDevice;
-        Check(d.dev11.As(&fenceDevice),"Query NvOFA completion fence device");
-        Check(fenceDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&flowFence)),"Create NvOFA completion fence");
-        library=LoadLibraryW(L"nvofapi64.dll");if(!library)throw Error("nvofapi64.dll missing");
-        auto entry=(decltype(&NvOFAPICreateInstanceD3D11))GetProcAddress(library,"NvOFAPICreateInstanceD3D11");
-        if(!entry)throw Error("NvOFAPICreateInstanceD3D11 missing");
-        NvCheck(entry(NV_OF_API_VERSION,&funcs),"NVOFA D3D11 API initialization");
-        if(!funcs.nvCreateOpticalFlowD3D11||!funcs.nvOFInit||!funcs.nvOFExecute||
-            !funcs.nvOFRegisterResourceD3D11||!funcs.nvOFUnregisterResourceD3D11)
-            throw Error("NVOFA DX11 function list incomplete");
-        NvCheck(funcs.nvCreateOpticalFlowD3D11(d.dev11.Get(),d.ctx11.Get(),&handle),"NVOFA Create D3D11");
-        NV_OF_INIT_PARAMS init{};init.width=d.srcW;init.height=d.srcH;
-        init.outGridSize=grid==1?NV_OF_OUTPUT_VECTOR_GRID_SIZE_1:
-            grid==2?NV_OF_OUTPUT_VECTOR_GRID_SIZE_2:NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
-        init.mode=NV_OF_MODE_OPTICALFLOW;init.perfLevel=NV_OF_PERF_LEVEL_FAST;
-        init.enableOutputCost=NV_OF_FALSE;
-        init.enableExternalHints=NV_OF_FALSE;init.inputBufferFormat=NV_OF_BUFFER_FORMAT_ABGR8;
-        NvCheck(funcs.nvOFInit(handle,&init),"NVOFA init (selected grid FAST, ABGR8)");
-        // Sharing is only valid if OFA accepts this exact D3D11 texture format.
-        // The history texture is registered once and sampled directly.
-        UINT count=0;
-        NvCheck(funcs.nvOFGetSurfaceFormatCountD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,&count),"NVOFA query input format count");
-        if(!count||count>32)throw Error("NVOFA input formats unavailable");
-        std::vector<DXGI_FORMAT> formats(count);
-        NvCheck(funcs.nvOFGetSurfaceFormatD3D11(handle,NV_OF_BUFFER_USAGE_INPUT,NV_OF_MODE_OPTICALFLOW,formats.data()),"NVOFA query input formats");
-        if(std::find(formats.begin(),formats.end(),DXGI_FORMAT_B8G8R8A8_UNORM)==formats.end())
-            throw Error("NVOFA cannot accept BGRA capture history");
-        const UINT fw=(d.srcW+UINT(grid)-1)/UINT(grid),fh=(d.srcH+UINT(grid)-1)/UINT(grid);
-        D3D11_TEXTURE2D_DESC desc{};desc.Width=fw;desc.Height=fh;desc.MipLevels=1;desc.ArraySize=1;
-        desc.Format=DXGI_FORMAT_R16G16_SINT;desc.SampleDesc.Count=1;
-        desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        for(auto& slot:slots){
-            slot.completionEvent.attach(CreateEventW(nullptr,FALSE,FALSE,nullptr));
-            if(!slot.completionEvent)throw Error("Create NvOFA completion event",GetLastError());
-            Check(d.dev11->CreateTexture2D(&desc,nullptr,&slot.texture),"Create independent NvOFA output texture");
-            NvCheck(funcs.nvOFRegisterResourceD3D11(handle,slot.texture.Get(),&slot.output),"NVOFA register motion output");
-            Check(d.dev11->CreateShaderResourceView(slot.texture.Get(),nullptr,&slot.srv),"NvOFA motion SRV");
-        }
-    }
-    void Reap(){
-        const UINT64 done=owner->Completed(),flowDone=Completed();
-        for(int i=0;i<kNumCapture;++i){
-            if(!owner->retiring[i]||owner->retiring[i]>done||inputUse[i]>flowDone)continue;
-            if(frames[i]){
-                NvCheck(funcs.nvOFUnregisterResourceD3D11(frames[i]),"Unregister retired WGC surface");
-                frames[i]=nullptr;
-            }
-            inputUse[i]=0;
-            owner->ReleaseLease(i);
-        }
-    }
-    void Register(int slot){
-        if(frames[slot])return;
-        if(!owner->leases[slot]||!owner->history[slot])throw Error("Missing WGC lease");
-        // Register only a live lease; never cache a WGC texture after check-in.
-        NvCheck(funcs.nvOFRegisterResourceD3D11(handle,owner->history[slot].Get(),&frames[slot]),
-            "Zero-copy rejected: NvOFA direct WGC registration");
-    }
-    UINT64 Completed() const {
-        const UINT64 complete=flowFence->GetCompletedValue();
-        if(complete==UINT64_MAX)throw Error("NvOFA device removed",owner->dev11->GetDeviceRemovedReason());
-        return complete;
-    }
-    bool Matches(uint64_t pairSerial,int current,int previous)const{
-        return active>=0&&slots[active].pairSerial==pairSerial&&slots[active].current==current&&slots[active].previous==previous;
-    }
-    bool Ready(uint64_t pairSerial,int current,int previous)const{
-        return Matches(pairSerial,current,previous)&&Completed()>=slots[active].submitted;
-    }
-    HANDLE ArmCompletionEvent(){
-        auto& slot=slots[active];
-        if(slot.completionArmed!=slot.submitted){
-            Check(flowFence->SetEventOnCompletion(slot.submitted,slot.completionEvent.get()),
-                "Arm NvOFA completion event");
-            slot.completionArmed=slot.submitted;
-        }
-        return slot.completionEvent.get();
-    }
-    ID3D11ShaderResourceView* MotionFor(uint64_t pairSerial,int current,int previous)const{
-        if(!Ready(pairSerial,current,previous))throw Error("NvOFA motion pair is not ready");
-        return slots[active].srv.Get();
-    }
-    UINT64 ReserveShaderRead(){
-        if(active<0)throw Error("NvOFA active motion missing");
-        return slots[active].lastRead=++fenceSerial;
-    }
-    bool Calculate(int current,int previous,bool continuous,uint64_t pairSerial){
-        active=-1;
-        const UINT64 complete=Completed();
-        int chosen=-1;
-        for(int i=0;i<FG_OFA_SLOT_COUNT;++i){
-            // Never overwrite pending OFA work OR a motion texture still read by graphics.
-            if(slots[i].submitted<=complete&&slots[i].lastRead<=complete){chosen=i;break;}
-        }
-        if(chosen<0)return false; // Drop prediction when all motion outputs are busy.
-        auto& slot=slots[chosen];
-        Register(current);Register(previous);
-        NV_OF_EXECUTE_INPUT_PARAMS in{};
-        in.inputFrame=frames[current];in.referenceFrame=frames[previous];
-        in.disableTemporalHints=continuous?NV_OF_FALSE:NV_OF_TRUE;
-        NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=slot.output;
-        NvCheck(funcs.nvOFExecute(handle,&in,&out),"NvOFA D3D11 Execute");
-        const UINT64 value=++fenceSerial;
-        Check(owner->fenceContext->Signal(flowFence.Get(),value),"Signal flow completion");
-        slot.submitted=value;slot.lastRead=0;slot.pairSerial=pairSerial;
-        slot.current=current;slot.previous=previous;
-        inputUse[current]=inputUse[previous]=value;
-        active=chosen;
-        // Same immediate context and temporal history. Driver may serialize execution;
-        // no CPU-side completion gate for the second submission.
-        owner->ctx11->Flush();owner->retirementNeedsSubmit=false;
-        return true;
-    }
-    ~Flow11(){
-        if(owner)owner->DrainForShutdown();
-        if(handle){
-            for(auto &f:frames)if(f&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(f);
-            for(auto& slot:slots)if(slot.output&&funcs.nvOFUnregisterResourceD3D11)funcs.nvOFUnregisterResourceD3D11(slot.output);
-            if(funcs.nvOFDestroy)funcs.nvOFDestroy(handle);
-        }
-        if(library)FreeLibrary(library);
-    }
-};
+#include "dp4a_flow.h"
 
 // A user may Alt+Tab or minimize; neither is an exit. Check the original
 // HWND/PID identity and, when permitted, the process termination signal.
@@ -641,7 +495,7 @@ struct TrackedGame {
 };
 enum class SessionOutcome { Stop, Recreate };
 
-// One session owns ALL WGC capture, D3D11, and NvOFA resources. Returning from
+// One session owns ALL WGC capture, D3D11, and CUDA DP4a resources. Returning from
 // this function destroys them in reverse lifetime order before another attempt.
 SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
     try {
@@ -670,7 +524,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(dx.warp.initialized?L"Running - WGC direct + Native DX11 NGX Frame Warp":L"Running - WGC direct surfaces");
+        Status(dx.warp.initialized?L"Running - WGC + CUDA DP4a + NGX Warp":L"Running - WGC + CUDA DP4a");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -879,7 +733,7 @@ void Engine(Game game){
             break;
         }
         // Allow transient display-mode/topology changes to settle before
-        // building a NEW D3D11 device, shared textures and NvOFA state.
+        // building a NEW D3D11 device, shared textures and CUDA DP4a state.
         for(unsigned i=0;i<10&&!g_userStopRequested.load()&&!tracked.Exited();++i)
             Sleep(10);
     }
