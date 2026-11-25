@@ -4,15 +4,16 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-wgc-320-dx11-native-ngx-dual-ofa
-    - fg-wgc-320-latency
+    - fg-wgc-320-cuda-dp4a
+install:
+  - ps: .\Install-CUDA.ps1
 build_script:
   - cmd: |
+      set "CUDA_PATH=%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
       for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
       if not defined VSROOT exit /b 1
       call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
       if errorlevel 1 exit /b 1
-      echo Windows SDK: %WindowsSDKVersion%
       call Build.cmd
       if errorlevel 1 exit /b 1
       if not exist bin\FG.exe exit /b 1
@@ -21,9 +22,9 @@ build_script:
       New-Item -ItemType Directory -Force artifacts | Out-Null
       $files = @('bin/FG.exe','README.md')
       if (Test-Path 'bin/FrameWarpRuntime') { $files += 'bin/FrameWarpRuntime' }
-      Compress-Archive -Path $files -DestinationPath 'artifacts/FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64.zip' -Force
-      Get-Item 'artifacts/FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64.zip'
+      Compress-Archive -Path $files -DestinationPath 'artifacts/FG-WGC-320-CUDA-DP4a-Windows-x64.zip' -Force
+      Get-Item 'artifacts/FG-WGC-320-CUDA-DP4a-Windows-x64.zip'
 test: off
 artifacts:
-  - path: artifacts/FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64.zip
-    name: FG-WGC-320-DX11-NativeNGX-DualOFA-Windows-x64
+  - path: artifacts/FG-WGC-320-CUDA-DP4a-Windows-x64.zip
+    name: FG-WGC-320-CUDA-DP4a-Windows-x64
