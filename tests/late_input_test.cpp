@@ -44,5 +44,9 @@ int main(){
     q.push(3001,100,0);assert(q.predict(3001,1000).x==0.);
     q.reset(0);q.push(1000,10,0);q.push(2000,10,0);q.push(3000,8,0);
     assert(q.predict(3000,1000).x>0.&&q.predict(3000,1000).x<30.);
+    q.reset(0);q.push(1000,10,0);q.push(2000,11,0);q.push(3000,12,0);
+    assert(q.predict(3000,1000,3).x>q.predict(3000,1000,1).x);
+    auto history=q.correction(0,2000,3000,.5,1000,1.);
+    assert(history.valid&&history.historical.x>0.);
     std::cout<<"PASS: timestamp lookup, steady motion, stop, idle, fresh input, reversal, flick clamp, history overflow, reset\n";
 }

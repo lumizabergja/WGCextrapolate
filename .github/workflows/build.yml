@@ -1,8 +1,8 @@
-name: FG WGC 320 Predict3
+name: FG WGC 320 Predict3 Pro
 on:
   workflow_dispatch:
   push:
-    branches: ['fg-wgc-320-earlyflow-predict3']
+    branches: ['fg-wgc-320-earlyflow-predict3-pro']
 permissions:
   contents: read
 jobs:
@@ -25,9 +25,22 @@ jobs:
           call Build.cmd
           if errorlevel 1 exit /b 1
           if not exist bin\FG.exe exit /b 1
+      - name: Validate embedded HLSL
+        shell: pwsh
+        run: |
+          $src = Get-Content src/main.cpp -Raw
+          $shader = [regex]::Match($src, 'static const char\* shader=R"HLSL\(([\s\S]*?)\)HLSL";')
+          if (!$shader.Success) { throw 'Embedded HLSL not found' }
+          Set-Content -Path fg-check.hlsl -Value $shader.Groups[1].Value -Encoding ascii
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction Stop | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$fxc) { throw 'Windows SDK fxc.exe not found' }
+          & $fxc.FullName /nologo /T vs_5_0 /E VS /Fo fg-vs.cso fg-check.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Vertex shader compilation failed' }
+          & $fxc.FullName /nologo /T ps_5_0 /E PS /Fo fg-ps.cso fg-check.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Pixel shader compilation failed' }
       - uses: actions/upload-artifact@v4
         with:
-          name: FG-WGC-320-EarlyFlow-Predict3-Windows-x64
+          name: FG-WGC-320-EarlyFlow-Predict3-Pro-Windows-x64
           path: |
             bin/FG.exe
             README.md

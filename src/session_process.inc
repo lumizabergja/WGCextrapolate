@@ -1,3 +1,4 @@
+struct SessionHandle { HANDLE value{}; ~SessionHandle(){if(value)CloseHandle(value);} };
 // Only the worker process loads the capture and presentation drivers.
 struct MappingView {
     SessionState* data{};
@@ -14,16 +15,16 @@ void RunIsolated(Game game){
     try {
         auto pid=GetCurrentProcessId();
         auto name=L"Local\\FGSession-"+std::to_wstring(pid);
-        fgwarp::Handle mapping{CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,sizeof(SessionState),name.c_str())};
+        SessionHandle mapping{CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,sizeof(SessionState),name.c_str())};
         if(!mapping.value || GetLastError()==ERROR_ALREADY_EXISTS)throw Error("Create session mapping",GetLastError());
         MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
         if(!v.data)throw Error("Map session settings",GetLastError());
-        auto& s=*v.data;s.game=game.window;s.pid=game.pid;s.warp=fgwarp::requested.load();CopySettings(s);
+        auto& s=*v.data;s.game=game.window;s.pid=game.pid;CopySettings(s);
         wchar_t file[32768]{};if(!GetModuleFileNameW(nullptr,file,32768))throw Error("Find FG executable",GetLastError());
         auto cmd=L"\""+std::wstring(file)+L"\" --fg-session "+std::to_wstring(pid);
         STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION child{};
         if(!CreateProcessW(file,cmd.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&child))throw Error("Start capture process",GetLastError());
-        CloseHandle(child.hThread);fgwarp::Handle proc{child.hProcess};
+        CloseHandle(child.hThread);SessionHandle proc{child.hProcess};
         ULONGLONG stopping=0;
         while(WaitForSingleObject(proc.value,15)==WAIT_TIMEOUT){
             CopySettings(s);
@@ -45,12 +46,12 @@ void RunIsolated(Game game){
 int RunChild(DWORD parent){
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
     auto name=L"Local\\FGSession-"+std::to_wstring(parent);
-    fgwarp::Handle mapping{OpenFileMappingW(FILE_MAP_ALL_ACCESS,FALSE,name.c_str())};
-    fgwarp::Handle owner{OpenProcess(SYNCHRONIZE,FALSE,parent)};
+    SessionHandle mapping{OpenFileMappingW(FILE_MAP_ALL_ACCESS,FALSE,name.c_str())};
+    SessionHandle owner{OpenProcess(SYNCHRONIZE,FALSE,parent)};
     if(!mapping.value||!owner.value)return ERROR_INVALID_HANDLE;
     MappingView v{static_cast<SessionState*>(MapViewOfFile(mapping.value,FILE_MAP_ALL_ACCESS,0,0,sizeof(SessionState)))};
     if(!v.data)return ERROR_INVALID_DATA;
-    session=v.data;fgwarp::stageCallback=[](const wchar_t* stage){lstrcpynW(session->stage,stage,96);};fgwarp::requested.store(session->warp!=0);
+    session=v.data;
     std::atomic<bool> finished{false};
     std::thread monitor([&]{
         while(!finished.load()){

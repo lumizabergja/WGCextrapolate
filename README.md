@@ -1,15 +1,13 @@
-# FG WGC 320 Native DX11 NGX Frame Warp (experimental)
-Actual FG app, not probe. Same native DX11 WGC direct leases, NvOFA FAST 4x4 cost off, UI, 320 default, scheduler and center mask as shared-zero-copy. Warp OFF draws directly into the original native DX11 swapchain. Warp ON keeps the same capture and extrapolation; generated frames are presented directly (existing real-only late correction policy). Real frames render into one RGBA input, register and evaluate the native DX11 NGX Latewarp feature (15), then draw the separate NGX output to the swapchain. HUD-less input references the same read-only color resource; no extra HUD-less copy, no D3D12 bridge or Streamline. The additional output draw and two NGX calls may cost latency. The R8 NoWarpMask uses live radius/feather settings; zero/zero is off. No automatic fallback. Original FrameWarpRuntime/nvngx_latewarp.dll must be supplied beside FG.exe. Built with public NGX SDK (/MD, requires VC runtime). Native DX11 feature and evaluation compatibility are experimental; the app uses community Latewarp parameter names and synthetic depth/motion, not game-engine data. No assertion of equivalent latency or verified feather response. If feature creation or evaluation fails the existing isolated worker reports the error and stops.
+# FG EarlyFlow Predict3 Pro
 
-## Dual-buffer NvOFA experimental variant
-Both modes use two pre-registered independent motion outputs, one DX11 NvOFA context, monotonic GPU fences for completion and shader-read retirement, and exact capture-pair identity checks. A second execution can be submitted while the first completion fence is outstanding; if both slots are busy, drop prediction rather than wait or expand the queue. Capture leases cannot retire until both graphics and OFA use complete. Real frames are submitted before new flow work, as in the parent. Same 4x4 FAST, cost off, shader, UI, 320 Hz target, queue limit, and NGX behavior. Actual hardware execution overlap and latency are not guaranteed; DX11 driver may serialize or block. No additional capture copy, no new thread, no change to current polling/flush policy. Test against parent branch.
+External WGC / D3D11 presenter, no injection. Reflex 2/NGX removed from executable and build dependencies. Late input and automatic screen-space layer protection default on. Existing manual center radius/feather remain optional.
 
-The scheduler checks for a new capture after acquiring DXGI presentation capacity. It keeps the slot for the fresh capture and drops predictions that outlive the final scheduled slot. Both Warp modes share this scheduler. Warp On uses only the center radius and feather mask. Its NGX UI input is fully transparent.
+- Dedicated Raw Input message thread; nonblocking render snapshot.
+- Camera reprojection for real and generated frames, except Off mode.
+- Camera-only fallback when matching NvOFA flow is not ready; no extra GPU pass or frame queue. Shared D3D11 driver scheduling can still serialize GPU work.
+- Prediction budget based on half a display refresh plus 0.35 ms, capped at 3 ms; not a measured scanout phase.
+- Per-draw sparse image alignment selection among estimated 2, 5 and 8 ms capture/input offsets; no game input timestamp available.
+- Bounded acceleration during coherent speed increases; existing reversal/staleness guards retained.
+- Per-pixel HUD/weapon heuristic uses screen-space correspondence and flow disagreement with estimated camera motion. Moving foreground uses its own flow where reliable, not a fixed region. With unreliable/missing flow, newest source pixels may be reused. No semantic masks/depth; flicker reduction is not guaranteed.
 
-For a one-slot comparison build, set `FG_OFA_SLOT_COUNT=1` before running `Build.cmd`. The default is two. Compare capture-to-display latency and on-time generated frames on the same Windows machine with the same game cap and warp settings. GPU timings for the NGX passes and final draw require a Windows GPU trace.
-
-
-## Input-aware EarlyFlow variant
-See [INPUT-AWARE.md](INPUT-AWARE.md) for build steps, assumptions, testing and limitations.
-
-Predict3: adaptive 0–3 ms visual mouse prediction, enabled with Late mouse input (FG). See INPUT-AWARE.md for limitations.
+Use 800 DPI, 1.5 sensitivity, 1000 Hz; Dynamic 320. Keep center radius and feather at zero to test automatic protection. Disable Late input + Auto HUD / weapon for comparison. Prediction does not change firing or simulation latency. Windows compilation and on-device image quality must be verified. Build.cmd requires MSVC x64 and recent Windows SDK; no NGX download.

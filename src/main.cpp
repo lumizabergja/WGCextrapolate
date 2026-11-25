@@ -28,7 +28,9 @@
 #include <uxtheme.h>
 #include <commctrl.h>
 #include <nvOpticalFlowD3D11.h>
-#include "warp_presenter.h"
+#include <d3d11_4.h>
+#include <climits>
+#include "late_mouse.h"
 #include "wgc_capture.h"
 #include "late_input.h"
 
@@ -60,8 +62,7 @@ constexpr UINT_PTR kLauncherLifecycleTimer = 0xF615;
 std::atomic<int> g_fgMode{0};
 std::atomic<int> g_targetHz{320};
 std::atomic<bool> g_lateInput{true};
-thread_local fglate::History mouseHistory;
-thread_local DWORD inputGamePid=0;
+
 // Center-only protection; zero radius and zero feather disable protection.
 std::atomic<unsigned> g_centerRadiusPx{0},g_centerFeatherPx{0};
 std::thread g_worker;
@@ -71,7 +72,7 @@ struct Game {HWND window;DWORD pid;std::wstring name;};
 std::vector<Game> g_games;
 
 struct SessionState{
-    HWND game;DWORD pid;LONG warp;volatile LONG stop,mode,target,radius,feather,lateInput;
+    HWND game;DWORD pid;volatile LONG stop,mode,target,radius,feather,lateInput;
     wchar_t error[512],stage[96];
 };
 SessionState* session{};
@@ -172,7 +173,6 @@ struct OverlayWindow {
 };
 
 struct DxDevices {
-    fgwarp::Presenter warp;
     ComPtr<ID3D11Device> dev11;
     ComPtr<ID3D11DeviceContext> ctx11;
     ComPtr<IDXGISwapChain1> swap;
@@ -304,7 +304,6 @@ struct DxDevices {
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
         Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
-        if(fgwarp::requested.load())warp.open(dev11.Get(),ctx11.Get(),screenW,screenH,srcW,srcH);
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
@@ -313,8 +312,8 @@ Texture2D<float4> currentFrame:register(t0);
 Texture2D<int2> rawFlow:register(t1);
 Texture2D<float4> previousFrame:register(t2);
 SamplerState samp:register(s0);
-cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float _padding1;float centerRadiusPx;float centerFeatherPx;float2 outputSize;float2 cameraActual;float2 cameraResidual;float2 cameraTan;float cameraActive;float cameraPad;};
-struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;};
+cbuffer Settings:register(b0){float horizon;float2 motionInv;float maxMotion;float2 gridExtent;float gridSize;float flowActive;float centerRadiusPx;float centerFeatherPx;float2 outputSize;float2 cameraTan;float previousActive;float pad;float4 candidates[3];float4 validCamera;};
+struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;nointerpolation float scene:TEXCOORD1;nointerpolation float4 cam:TEXCOORD2;nointerpolation float valid:TEXCOORD3;};
 // Use native block centers, including partial cells on odd-sized captures.
 float2 flow(float2 uv){
     uint fw,fh;rawFlow.GetDimensions(fw,fh);
@@ -330,54 +329,91 @@ float2 flow(float2 uv){
     return lerp(lerp(v00,v10,f.x),lerp(v01,v11,f.x),f.y)*motionInv;
 }
 float cutSample(float2 uv){float2 q=uv+flow(uv);if(any(q<0)||any(q>1))return 0;return dot(abs(currentFrame.SampleLevel(samp,uv,0).rgb-previousFrame.SampleLevel(samp,q,0).rgb),float3(.333333,.333333,.333333));}
+float2 cameraUV(float2 uv,float2 a){
+    float2 ray=(uv-.5)*2*cameraTan;
+    float z=max(.25,1-dot(ray,a));
+    return .5+(ray+a)/(2*cameraTan*z);
+}
+float diff(float3 a,float3 b){return dot(abs(a-b),float3(.333333,.333333,.333333));}
+float fade(float2 uv){return smoothstep(0,.025,min(min(uv.x,uv.y),min(1-uv.x,1-uv.y)));}
+float2 bounded(float2 a){return a/max(1.,length(a)/.06981317);}
+float matchAt(float2 uv,float2 h){
+    float2 q=cameraUV(uv,h);
+    if(any(q<0)||any(q>1))return .25;
+    return min(.25,diff(currentFrame.SampleLevel(samp,uv,0).rgb,previousFrame.SampleLevel(samp,q,0).rgb));
+}
+float score(float2 h){
+    return (matchAt(float2(.19,.23),h)+matchAt(float2(.5,.19),h)+matchAt(float2(.81,.23),h)+matchAt(float2(.22,.52),h)+matchAt(float2(.78,.52),h)+matchAt(float2(.13,.72),h)+matchAt(float2(.87,.72),h))/7.;
+}
 V VS(uint id:SV_VertexID){
     V o;float2 p=float2(id==2?3.0:-1.0,id==1?3.0:-1.0);
-    o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);o.scene=0;
-    [branch] if(horizon>0.00001){float e=cutSample(float2(.2,.3))+cutSample(float2(.8,.3))+cutSample(float2(.5,.5))+cutSample(float2(.2,.7))+cutSample(float2(.8,.7));o.scene=smoothstep(.19,.32,e*.2);}
+    o.p=float4(p,0,1);o.uv=float2((p.x+1)*0.5,1-(p.y+1)*0.5);o.scene=0;o.cam=0;o.valid=0;
+    [branch] if(flowActive>.5&&horizon>0.00001){float e=cutSample(float2(.2,.3))+cutSample(float2(.8,.3))+cutSample(float2(.5,.5))+cutSample(float2(.2,.7))+cutSample(float2(.8,.7));o.scene=smoothstep(.19,.32,e*.2);}
+    if(previousActive>.5&&any(validCamera.xyz>.5)){
+        float best=1e6;
+        [unroll] for(int j=0;j<3;++j){if(validCamera[j]>.5){
+            float error=score(candidates[j].zw)+(j==0?0.:.012);
+            if(error<best){best=error;o.cam=candidates[j];o.valid=1;}
+        }}
+        if(best>.21)o.valid=0;
+    }
     return o;
 }
 float centerMask(float2 uv){
-    // The center mask affects only predicted pixels, never real captured frames.
+    // Optional center protection for any camera-corrected frame.
     // 0px radius + 0px feather is a full bypass (no center protection).
     if(centerRadiusPx<=0.0 && centerFeatherPx<=0.0)return 1.0;
     float distancePx=length((uv-float2(.5,.5))*outputSize);
     if(centerFeatherPx<=0.0)return distancePx>centerRadiusPx?1.0:0.0;
     return smoothstep(centerRadiusPx,centerRadiusPx+centerFeatherPx,distancePx);
 }
-// Inverse rotational camera mapping, in source-camera UV coordinates.
-// First-order rotation is bounded to four degrees on CPU.
-float2 cameraUV(float2 uv,float2 a){
-    float2 ray=(uv-.5)*2*cameraTan;
-    float z=max(.25,1-dot(ray,a));
-    return .5+(ray+a)/(2*cameraTan*z);
-}
-float4 PS(V i):SV_Target {
-    // NVIDIA's stretched scanout is already scaled into native game-size textures.
-    float2 uv=i.uv;
-    float4 base=currentFrame.SampleLevel(samp,uv,0);
-    [branch] if(horizon<=0.00001 || i.scene>0.9)return base;
-    float mask=centerMask(uv);
-    [branch] if(mask==0.0)return base;
-    float2 v=flow(uv),q=uv+horizon*v;
-    float4 fallback=base;
-    [branch] if(cameraActive>0.5){
-        // Actual input can still move the camera when object-flow confidence is low.
-        float2 inputUV=cameraUV(uv,cameraActual);
-        float edge=min(min(inputUV.x,inputUV.y),min(1-inputUV.x,1-inputUV.y));
-        float fade=smoothstep(0,.025,edge);
-        if(edge>0)fallback=lerp(base,currentFrame.SampleLevel(samp,inputUV,0),mask*fade);
-        // Remove the historical camera extrapolation already in NvOFA, then
-        // replace it with fresh measured input (estimated source input time).
-        q=cameraUV(q,cameraResidual);
+float screenLayer(float2 uv,float3 c,float2 historical,float2 v,bool hasFlow){
+    float2 q=cameraUV(uv,historical);
+    float same=diff(c,previousFrame.SampleLevel(samp,uv,0).rgb);
+    float world=diff(c,previousFrame.SampleLevel(samp,q,0).rgb);
+    float activity=smoothstep(.0007,.004,length(q-uv));
+    float stable=smoothstep(.018,.095,world-same)*(1-smoothstep(.035,.13,same))*activity;
+    if(hasFlow){
+        float fit=diff(c,previousFrame.SampleLevel(samp,uv+v,0).rgb);
+        float independent=smoothstep(.0015,.008,length(v-(q-uv)));
+        stable=max(stable,independent*smoothstep(.018,.10,world-fit)*(1-smoothstep(.05,.19,fit))*activity);
     }
+    return saturate(stable);
+}
+float4 flowPixel(float2 q,float2 v,float4 fallback){
     if(any(q<0)||any(q>1))return fallback;
     float2 mv=flow(q),old=q+mv;
     if(any(old<0)||any(old>1)||length(mv)>maxMotion)return fallback;
     float4 next=currentFrame.SampleLevel(samp,q,0);
-    float3 prev=previousFrame.SampleLevel(samp,old,0).rgb;
-    float residual=dot(abs(next.rgb-prev),float3(.333333,.333333,.333333));
-    float confidence=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
-    return lerp(fallback,next,saturate(confidence*mask));
+    float residual=diff(next.rgb,previousFrame.SampleLevel(samp,old,0).rgb);
+    float conf=(1-smoothstep(.045,.20,residual))*(1-smoothstep(.003,.025,length(mv-v)));
+    return lerp(fallback,next,conf*fade(q));
+}
+float4 PS(V i):SV_Target{
+    float2 uv=i.uv;
+    float4 base=currentFrame.SampleLevel(samp,uv,0);
+    if(i.scene>.9)return base;
+    bool hasFlow=flowActive>.5&&horizon>0.00001;
+    bool hasCamera=i.valid>.5;
+    if(!hasFlow&&!hasCamera)return base;
+    float mask=centerMask(uv);if(mask==0)return base;
+    float2 v=0;if(hasFlow)v=flow(uv);
+    float2 q=uv+horizon*v;
+    float4 screen=base,world=base;
+    float layer=0;
+    if(hasCamera){
+        float2 inputUV=cameraUV(uv,bounded(i.cam.xy));
+        float4 src=currentFrame.SampleLevel(samp,inputUV,0);
+        world=lerp(base,src,fade(inputUV));
+        layer=screenLayer(uv,base.rgb,i.cam.zw,v,hasFlow);
+        if(fade(inputUV)>0){float2 vv=0;if(hasFlow)vv=flow(inputUV);layer=max(layer,.8*screenLayer(inputUV,src.rgb,i.cam.zw,vv,hasFlow));}
+        if(hasFlow)q=cameraUV(q,bounded(i.cam.xy-horizon*i.cam.zw));
+    }
+    if(hasFlow){
+        screen=flowPixel(uv+horizon*v,v,base);
+        if(hasCamera)world=flowPixel(q,v,world);else world=screen;
+    }
+    return lerp(base,lerp(world,screen,layer),mask);
 }
 )HLSL";
         ComPtr<ID3DBlob> vsBlob,psBlob,errs;
@@ -435,34 +471,33 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         lastCaptureStamp=timestamp;
         return true;
     }
-    // 80-byte constant buffer: motion, center protection and camera correction.
+    // 128-byte constant buffer: flow, center protection, input calibration candidates.
     struct Params{
         float horizon, invW, invH, maxMotion;
-        float flowW, flowH, grid, padding1;
+        float flowW, flowH, grid, flowActive;
         float centerRadiusPx,centerFeatherPx,outputW,outputH;
-        float actualX,actualY,residualX,residualY;
-        float tanX,tanY,cameraActive,cameraPad;
+        float tanX,tanY,previousActive,pad;
+        float candidates[3][4];float validCamera[4];
     };
-    static_assert(sizeof(Params)==80);
+    static_assert(sizeof(Params)==128);
     void Draw(UINT current,UINT previous,ID3D11ShaderResourceView* rawFlow,
               float horizon,int grid,ID3D11Fence* motionReadFence,UINT64 motionReadValue,
-              const fglate::Correction& camera){
+              const LateMouse::Set& camera){
         ID3D11ShaderResourceView* views[3]{frameSRV[current].Get(),rawFlow,frameSRV[previous].Get()};
         // Optical flow and extrapolation use the captured client resolution;
         // presentation covers the full monitor, with no selectable letterboxing.
-        const Params p{horizon,1.0f/float(srcW),1.0f/float(srcH),0.12f,
+        Params p{horizon,1.0f/float(srcW),1.0f/float(srcH),0.12f,
               float((srcW+UINT(grid)-1)/UINT(grid)),
               float((srcH+UINT(grid)-1)/UINT(grid)),
-              float(grid),0.0f,
+              float(grid),rawFlow?1.f:0.f,
               float(g_centerRadiusPx.load(std::memory_order_relaxed)),
               float(g_centerFeatherPx.load(std::memory_order_relaxed)),
-              float(screenW),float(screenH),camera.actual.x,camera.actual.y,
-              camera.residual.x,camera.residual.y,.75f*float(srcW)/float(srcH),.75f,
-              camera.valid?1.f:0.f,0.f};
+              float(screenW),float(screenH),.75f*float(srcW)/float(srcH),.75f,1.f,0.f,{},{}};
+        for(unsigned j=0;j<3;++j){p.candidates[j][0]=camera[j].actual.x;p.candidates[j][1]=camera[j].actual.y;p.candidates[j][2]=camera[j].historical.x;p.candidates[j][3]=camera[j].historical.y;p.validCamera[j]=camera[j].valid?1.f:0.f;}
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
-        ID3D11RenderTargetView* target=(warp.initialized&&horizon==0.f)?warp.inputRTV.Get():rtv.Get();
+        ID3D11RenderTargetView* target=rtv.Get();
         ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(ps.Get(),nullptr,0);
@@ -477,13 +512,13 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->PSSetShaderResources(0,3,nullViews);
         ctx11->VSSetShaderResources(0,3,nullViews);
         // Retire the motion SRV after its final shader read, before Present submits the batch.
-        Check(fenceContext->Signal(motionReadFence,motionReadValue),"Signal motion shader read completion");
-        Present(horizon==0.f,UINT(p.centerRadiusPx),UINT(p.centerFeatherPx));
+        if(motionReadFence)Check(fenceContext->Signal(motionReadFence,motionReadValue),"Signal motion shader read completion");
+        Present();
     }
     void PresentReal(UINT current,int /*grid*/){
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
-        ID3D11RenderTargetView* target=warp.initialized?warp.inputRTV.Get():rtv.Get();
+        ID3D11RenderTargetView* target=rtv.Get();
         ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(realVS.Get(),nullptr,0);
@@ -493,25 +528,12 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->Draw(3,0);
         ID3D11ShaderResourceView* empty=nullptr;
         ctx11->PSSetShaderResources(0,1,&empty);
-        Present(true,g_centerRadiusPx.load(std::memory_order_relaxed),g_centerFeatherPx.load(std::memory_order_relaxed));
+        Present();
     }
-    void Present(bool real,UINT radius,UINT feather){
+    void Present(){
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized&&real){
-            warp.evaluate(radius,feather);
-            // Native DX11 final output draw; no color copy or cross-API fence.
-            D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
-            ctx11->RSSetViewports(1,&vp);
-            ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
-            ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx11->VSSetShader(realVS.Get(),nullptr,0);ctx11->PSSetShader(realPS.Get(),nullptr,0);
-            ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
-            ctx11->PSSetShaderResources(0,1,warp.outputSRV.GetAddressOf());
-            ctx11->Draw(3,0);
-            ID3D11ShaderResourceView* empty=nullptr;ctx11->PSSetShaderResources(0,1,&empty);
-        }
         Check(swap->Present(0,flags),"DX11 low-latency Present");
         retirementNeedsSubmit=false;
     }
@@ -707,14 +729,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(sourceW<16||sourceH<16||sourceW>8192||sourceH>8192)
             throw Error("Invalid game native capture resolution");
         if(session)lstrcpynW(session->stage,L"Strict zero-copy WGC initialization",96);
-        inputGamePid=game.pid;
-        {
-            RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
-            if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register mouse input",GetLastError());
-        }
+        LateMouse mouse(game.pid);
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(dx.warp.initialized?L"Running - WGC direct + Native DX11 NGX Frame Warp":L"Running - WGC direct surfaces");
+        Status(L"Running - WGC Predict3 Pro");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
@@ -796,12 +814,16 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(dynamicDeadline<=submitted)
                 dynamicDeadline+=((submitted-dynamicDeadline)/dynamicPeriod+1)*dynamicPeriod;
         };
+        auto cameraSample=[&](double h){
+            if(!g_lateInput.load(std::memory_order_relaxed)||previous<0||pair<=0||warmup>0||g_fgMode.load()==1)return LateMouse::Set{};
+            const double lead=std::clamp(500.0/double(monitorHz)+.35,0.0,3.0);
+            return mouse.sample(previousSource,priorSource,now(),h,double(freq.QuadPart)/1000.,lead);
+        };
         auto grabLatest=[&]{
             const int next=dx.FreeSlot();
             LARGE_INTEGER stamp{};
             if(next<0||!dx.Grab(game.window,next,0,stamp))return false;
             arrival=now();++captureSerial;
-            if(dx.warp.initialized)dx.warp.sourcePose();
             previous=current;current=next;pair=0.0;
             dx.RetireExcept(current,previous);
             if(priorSource>0&&stamp.QuadPart>priorSource){
@@ -845,7 +867,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused){
                 wasFocused=true;warmup=2;measurements=0;current=-1;previous=-1;
                 captureSerial=lastFlowSerial=0;priorSource=previousSource=0;interval=16.667;pair=0;
-                mouseHistory.reset(now());
+                mouse.reset(now());
                 flowReady=false;realPending=false;maxPredictions=0;nextPrediction=1;
                 realSubmitted=lastSubmitted=0;
                 dynamicPeriod=dynamicDeadline=0;
@@ -862,7 +884,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // the slot is available, even if captures keep arriving.
                 if(!grabbed||WaitForSingleObject(dx.capture.event.get(),0)==WAIT_OBJECT_0)grabLatest();
                 realSubmitted=lastSubmitted=now();
-                dx.PresentReal(UINT(current),ofGrid);slotHeld=false;
+                auto realCamera=cameraSample(0.);
+                if(previous>=0&&std::any_of(realCamera.begin(),realCamera.end(),[](const auto& c){return c.valid;}))
+                    dx.Draw(UINT(current),UINT(previous),nullptr,0.f,ofGrid,nullptr,0,realCamera);
+                else dx.PresentReal(UINT(current),ofGrid);
+                slotHeld=false;
                 overlay.SetVisible(true);realPending=false;
                 const int mode=std::clamp(g_fgMode.load(std::memory_order_relaxed),0,6);
                 const int configured=g_targetHz.load(std::memory_order_relaxed);
@@ -895,21 +921,22 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 }
                 continue;
             }
-            if(!flowReady||nextPrediction>maxPredictions){
+            if((!flowReady&&(!g_lateInput.load()||previous<0||pair<=0||warmup>0))||nextPrediction>maxPredictions){
                 waitActivity(now()+ticks(8.0),false);continue;
             }
             const LONGLONG t=now();
             const LONGLONG expiry=std::min(arrival+ticks(interval*1.10),
                                            realSubmitted+ticks(slotMs*(maxPredictions+1)));
-            if(t>=expiry){flowReady=false;continue;}
+            if(t>=expiry){flowReady=false;nextPrediction=maxPredictions+1;continue;}
             const LONGLONG scheduled=dynamicPeriod?dynamicDeadline:realSubmitted+ticks(slotMs*nextPrediction);
             const LONGLONG due=std::max(scheduled,lastSubmitted+ticks(slotMs*.85));
-            if(due>=expiry){flowReady=false;continue;}
+            if(due>=expiry){flowReady=false;nextPrediction=maxPredictions+1;continue;}
             if(t<due){waitActivity(due,false);continue;}
             // At a prediction deadline, never block the CPU on optical flow.
-            if(!flow.Matches(captureSerial,current,previous)){flowReady=false;continue;}
-            if(!flow.Ready(captureSerial,current,previous)){
-                waitActivity(expiry,false,flow.ArmCompletionEvent());
+            const bool motionReady=flowReady&&flow.Ready(captureSerial,current,previous);
+            if(!motionReady&&!g_lateInput.load()){
+                if(flowReady&&flow.Matches(captureSerial,current,previous))waitActivity(expiry,false,flow.ArmCompletionEvent());
+                else {flowReady=false;nextPrediction=maxPredictions+1;}
                 continue;
             }
             if(!acquireSlot()){waitActivity(expiry,true);continue;}
@@ -918,28 +945,22 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(grabLatest())continue;
             // Submit at most one prediction per opportunity and skip missed ticks.
             const LONGLONG submitTime=now();
-            if(submitTime>=expiry){flowReady=false;continue;}
+            if(submitTime>=expiry){flowReady=false;nextPrediction=maxPredictions+1;continue;}
             const double elapsed=ms(submitTime-realSubmitted);
             if(!dynamicPeriod){
                 const unsigned dueIndex=unsigned(std::max(1.0,std::floor(elapsed/slotMs)));
-                if(dueIndex>maxPredictions){flowReady=false;continue;}
+                if(dueIndex>maxPredictions){flowReady=false;nextPrediction=maxPredictions+1;continue;}
                 nextPrediction=std::max(nextPrediction,dueIndex);
             }
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
-            auto* motion=flow.MotionFor(captureSerial,current,previous);
-            fglate::Correction camera{};
-            if(g_lateInput.load(std::memory_order_relaxed)&&!dx.warp.initialized){
-                // Process only pending mouse input, as late as possible before Draw.
-                MSG inputMsg{};
-                for(unsigned i=0;i<64&&PeekMessageW(&inputMsg,overlay.hwnd,WM_INPUT,WM_INPUT,PM_REMOVE);++i)
-                    DispatchMessageW(&inputMsg);
-                // WGC timestamps are not game input sample timestamps. Start with
-                // a conservative 5ms estimated source input-to-capture offset.
-                const auto offset=ticks(5.0);
-                camera=mouseHistory.correction(previousSource-offset,priorSource-offset,now(),fraction,double(freq.QuadPart)/1000.0);
+            auto camera=cameraSample(fraction);
+            if(!motionReady&&!std::any_of(camera.begin(),camera.end(),[](const auto& c){return c.valid;})){
+                ++nextPrediction;if(dynamicPeriod)advanceDynamicDeadline(submitTime);
+                continue;
             }
-            const UINT64 readFence=flow.ReserveShaderRead();
-            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,flow.flowFence.Get(),readFence,camera);
+            auto* motion=motionReady?flow.MotionFor(captureSerial,current,previous):nullptr;
+            const UINT64 readFence=motionReady?flow.ReserveShaderRead():0;
+            dx.Draw(UINT(current),UINT(previous),motion,fraction,ofGrid,motionReady?flow.flowFence.Get():nullptr,readFence,camera);
             slotHeld=false;lastSubmitted=submitTime;++nextPrediction;
             if(dynamicPeriod)advanceDynamicDeadline(submitTime);
         }
@@ -1082,19 +1103,6 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     if(msg==WM_DISPLAYCHANGE)monitorDirty=true;
-    if(msg==WM_INPUT){
-        RAWINPUT input{};UINT bytes=sizeof(input);
-        if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&input,&bytes,sizeof(RAWINPUTHEADER))==sizeof(input) &&
-           input.header.dwType==RIM_TYPEMOUSE && !(input.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE)){
-            DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
-            if(pid&&pid==inputGamePid&&(input.data.mouse.lLastX||input.data.mouse.lLastY)){
-                LARGE_INTEGER q{};QueryPerformanceCounter(&q);
-                mouseHistory.push(q.QuadPart,input.data.mouse.lLastX,input.data.mouse.lLastY);
-                fgwarp::mouseX.fetch_add(input.data.mouse.lLastX);fgwarp::mouseY.fetch_add(input.data.mouse.lLastY);
-            }
-        }
-        return DefWindowProcW(hwnd,msg,wp,lp);
-    }
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -1122,11 +1130,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             218,247,100,27,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDynamicTarget)),nullptr,nullptr);
         StyleControl(g_dynamicTarget);
         SendMessageW(g_dynamicTarget,EM_SETLIMITTEXT,4,0);
-        HWND warpCheck=CreateWindowW(L"BUTTON",L"Frame Warp",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
-            36,278,240,27,hwnd,reinterpret_cast<HMENU>(120),nullptr,nullptr);
-        StyleControl(warpCheck);SetWindowTextW(warpCheck,L"Reflex 2 Frame Warp (optional)");
-        HWND lateCheck=CreateWindowW(L"BUTTON",L"Late mouse input (FG)",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
-            282,278,244,27,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
+        HWND lateCheck=CreateWindowW(L"BUTTON",L"Late input + Auto HUD / weapon",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX,
+            36,278,490,27,hwnd,reinterpret_cast<HMENU>(121),nullptr,nullptr);
         StyleControl(lateCheck);CheckDlgButton(hwnd,121,BST_CHECKED);
         g_start=CreateWindowW(L"BUTTON",L"Start",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
             36,331,233,42,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStart)),nullptr,nullptr);
@@ -1182,7 +1187,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
            !IsWindowEnabled(g_start)){
             // Engine owns GPU teardown; only the GUI joins after completion.
             if(g_worker.joinable())g_worker.join();
-            EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);
+            EnableWindow(g_start,TRUE);
             EnableWindow(g_stop,FALSE);
             if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         }
@@ -1195,15 +1200,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
-        case 120:
-            fgwarp::requested.store(IsDlgButtonChecked(hwnd,120)==BST_CHECKED);
-            if(fgwarp::requested.load()){CheckDlgButton(hwnd,121,BST_UNCHECKED);g_lateInput.store(false);}
-            break;
         case 121:
             g_lateInput.store(IsDlgButtonChecked(hwnd,121)==BST_CHECKED);
-            if(g_lateInput.load()&&fgwarp::requested.load()){
-                CheckDlgButton(hwnd,121,BST_UNCHECKED);g_lateInput.store(false);
-            }
             break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
@@ -1258,7 +1256,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             g_userStopRequested.store(false,std::memory_order_release);
             g_lastGameExited.store(false,std::memory_order_release);
             g_engineFinished.store(false,std::memory_order_release);
-            g_running.store(true);EnableWindow(GetDlgItem(hwnd,120),FALSE);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
+            g_running.store(true);EnableWindow(g_start,FALSE);EnableWindow(g_stop,TRUE);
             g_worker=std::thread([game]{RunIsolated(game);});
             // Start gives focus back to the selected game. The presenter never activates.
             SetForegroundWindow(game.window);
@@ -1282,7 +1280,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         // outer Engine() completion is allowed to unlock another Start.
         if(!g_engineFinished.load(std::memory_order_acquire))return 0;
         if(g_worker.joinable())g_worker.join();
-        EnableWindow(GetDlgItem(hwnd,120),TRUE);EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
+        EnableWindow(g_start,TRUE);EnableWindow(g_stop,FALSE);
         if(g_lastGameExited.exchange(false,std::memory_order_acq_rel))RefreshGames();
         return 0;
     case WM_DESTROY:
