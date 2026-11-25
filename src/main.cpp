@@ -279,13 +279,13 @@ struct DxDevices {
         }
         sc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
             (allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-        if(fgwarp::requested.load())warp.open(matchingAdapter.Get(),dev11.Get(),ctx11.Get(),output,sc,w,h,swap.GetAddressOf(),backBuffer.GetAddressOf());
-        else Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
+        Check(f2->CreateSwapChainForHwnd(dev11.Get(),output,&sc,nullptr,nullptr,&swap),"CreateSwapChainForHwnd zero-copy");
         Check(swap.As(&lowLatencySwap),"Query IDXGISwapChain2");
         Check(lowLatencySwap->SetMaximumFrameLatency(1),"Set swapchain max latency 1 (DXGI minimum)");
         frameReady=lowLatencySwap->GetFrameLatencyWaitableObject();
         if(!frameReady)throw Error("Swapchain frame latency waitable object unavailable");
-        if(!warp.initialized)Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+        Check(swap->GetBuffer(0,IID_PPV_ARGS(&backBuffer)),"GetBuffer");
+        if(fgwarp::requested.load())warp.open(dev11.Get(),ctx11.Get(),screenW,screenH,srcW,srcH);
         Check(dev11->CreateRenderTargetView(backBuffer.Get(),nullptr,&rtv),"CreateRenderTargetView");
         // Fullscreen triangle: PS renders input or extrapolated source directly into the swapchain RTV.
         // Port of the uploaded FG-Fast-Crosshair extrapolator.h HLSL; see PROVENANCE.md.
@@ -419,7 +419,8 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,&p,0,0);
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
-        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+        ID3D11RenderTargetView* target=(warp.initialized&&horizon==0.f)?warp.inputRTV.Get():rtv.Get();
+        ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
@@ -437,7 +438,8 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
     void PresentReal(UINT current,int /*grid*/){
         D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&vp);
-        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+        ID3D11RenderTargetView* target=warp.initialized?warp.inputRTV.Get():rtv.Get();
+        ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(realVS.Get(),nullptr,0);
         ctx11->PSSetShader(realPS.Get(),nullptr,0);
@@ -452,7 +454,19 @@ float4 PS(V v):SV_Target{return src.SampleLevel(s,v.uv,0);}
         // Present with sync=0; request tearing only when supported and enabled
         // on the swapchain.  This leaves actual Independent Flip up to Windows.
         const UINT flags=allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        if(warp.initialized){warp.present(flags,srcW,srcH,real,radius,feather);retirementNeedsSubmit=false;return;}
+        if(warp.initialized&&real){
+            warp.evaluate(radius,feather);
+            // Native DX11 final output draw; no color copy or cross-API fence.
+            D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};
+            ctx11->RSSetViewports(1,&vp);
+            ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+            ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx11->VSSetShader(realVS.Get(),nullptr,0);ctx11->PSSetShader(realPS.Get(),nullptr,0);
+            ctx11->PSSetSamplers(0,1,sampler.GetAddressOf());
+            ctx11->PSSetShaderResources(0,1,warp.outputSRV.GetAddressOf());
+            ctx11->Draw(3,0);
+            ID3D11ShaderResourceView* empty=nullptr;ctx11->PSSetShaderResources(0,1,&empty);
+        }
         Check(swap->Present(0,flags),"DX11 low-latency Present");
         retirementNeedsSubmit=false;
     }
@@ -600,7 +614,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         }
         DxDevices dx;dx.Init(overlay.hwnd,item,sourceW,sourceH,overlay.width,overlay.height);
         if(session)lstrcpynW(session->stage,L"GPU capture and presentation",96);
-        Status(dx.warp.initialized?L"Running - WGC direct + Frame Warp":L"Running - WGC direct surfaces");
+        Status(dx.warp.initialized?L"Running - WGC direct + Native DX11 NGX Frame Warp":L"Running - WGC direct surfaces");
 
         constexpr int ofGrid=kOpticalFlowGrid;
         Flow11 flow;flow.Init(dx,ofGrid);
