@@ -371,9 +371,10 @@ float centerMask(float2 uv){
 }
 float screenLayer(float2 uv,float3 c,float2 historical,float2 v,bool hasFlow){
     float2 q=cameraUV(uv,historical);
+    float activity=smoothstep(.0007,.004,length(q-uv));
+    [branch] if(activity==0)return 0;
     float same=diff(c,previousFrame.SampleLevel(samp,uv,0).rgb);
     float world=diff(c,previousFrame.SampleLevel(samp,q,0).rgb);
-    float activity=smoothstep(.0007,.004,length(q-uv));
     float stable=smoothstep(.018,.095,world-same)*(1-smoothstep(.035,.13,same))*activity;
     if(hasFlow){
         float fit=diff(c,previousFrame.SampleLevel(samp,uv+v,0).rgb);
@@ -418,13 +419,16 @@ Rendered PS(V i){
     // Camera transforms below are correspondence tests ONLY; no late pixel reprojection.
     if(i.valid>.5&&i.scene<=.9){
         float2 historical=i.cam.zw;
-        float layer=protectAt(uv,historical,hasFlow);
+        float layer=screenLayer(uv,base.rgb,historical,v,hasFlow);
         // Include the predicted source location, and expand a few pixels around boundaries.
-        if(hasFlow&&fade(q)>0)layer=max(layer,protectAt(q,historical,true));
+        if(hasFlow&&any(q!=uv)&&fade(q)>0)layer=max(layer,protectAt(q,historical,true));
         float2 dx=float2(2.0*motionInv.x,0),dy=float2(0,2.0*motionInv.y);
+        // Neighbor weights cannot exceed .80. Skip taps once they cannot affect the result.
+        [branch] if(layer<.80){
         float neighbors=max(max(protectAt(uv+dx,historical,hasFlow),protectAt(uv-dx,historical,hasFlow)),
                             max(protectAt(uv+dy,historical,hasFlow),protectAt(uv-dy,historical,hasFlow)));
         layer=max(layer,neighbors*.80);
+        }
         // Strong stationary correspondence should keep sharp HUD pixels at source position;
         // moving foreground retains local optical-flow extrapolation.
         if(hasFlow){
@@ -979,10 +983,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             const float fraction=float(std::clamp(elapsed/pair,0.0,1.0));
             auto camera=cameraSample(fraction);
-            if(!motionReady&&!std::any_of(camera.begin(),camera.end(),[](const auto& c){return c.valid;})){
-                ++nextPrediction;if(dynamicPeriod)advanceDynamicDeadline(submitTime);
-                continue;
-            }
+            // A mouse report can arrive after the mask sample. Keep the slot so NGX
+            // can latch that report even when optical flow is still in flight.
             auto* motion=motionReady?flow.MotionFor(captureSerial,current,previous):nullptr;
             const UINT64 readFence=motionReady?flow.ReserveShaderRead():0;
             dx.Draw(UINT(current),UINT(previous),motion,motionReady?fraction:0.f,ofGrid,motionReady?flow.flowFence.Get():nullptr,readFence,camera,mouse,previousSource,priorSource,double(freq.QuadPart)/1000.,3.);
