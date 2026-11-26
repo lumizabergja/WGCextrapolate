@@ -1,0 +1,50 @@
+name: FG V15 v16 CUDA Zero Copy Blackwell
+on:
+  push:
+    branches: [fg-v15-v16-cuda-zero-copy]
+    paths: ['zero-copy/**', '.github/workflows/fg-zero-copy.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.ref == 'refs/heads/fg-v15-v16-cuda-zero-copy'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check source
+        id: source
+        shell: pwsh
+        run: |
+          "present=$(Test-Path 'zero-copy/Build.cmd')" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+      - name: Install CUDA 12.8.1
+        if: steps.source.outputs.present == 'True'
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76
+        with:
+          cuda: '12.8.1'
+          method: 'network'
+          sub-packages: '["nvcc","cudart","thrust","visual_studio_integration"]'
+      - name: Compile Blackwell zero-copy executable
+        if: steps.source.outputs.present == 'True'
+        working-directory: zero-copy
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+          if not defined VSROOT exit /b 1
+          call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          nvcc --version
+          call Build.cmd --zero-copy-blackwell
+          if errorlevel 1 exit /b 1
+          if not exist bin\FG-ZeroCopy-Blackwell-Experimental.exe exit /b 1
+      - name: Upload Windows artifact
+        if: steps.source.outputs.present == 'True'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-V15-v16-CUDA-ZeroCopy-Blackwell-Windows-x64
+          path: |
+            zero-copy/bin/FG-ZeroCopy-Blackwell-Experimental.exe
+            zero-copy/README.md
+            zero-copy/TEST-RESULTS.txt
+          if-no-files-found: error
