@@ -1,38 +1,41 @@
-version: 1.0.{build}
+version: '1.0.{build}'
 image: Visual Studio 2022
 platform: x64
 configuration: Release
+branches:
+  only:
+    - fg-v15-v16-cuda-zero-copy
 clone_depth: 1
-
-# All build files live in this PUBLIC repository. No private dependencies.
 install:
   - ps: |
       $ErrorActionPreference = 'Stop'
-      python --version
-      python reconstruct.py
-      if ($LASTEXITCODE -ne 0) { throw 'Optimized WGC source verification/reconstruction failed' }
-      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File Download-Headers.ps1
-      if ($LASTEXITCODE -ne 0) { throw 'Optical flow SDK interface header download failed' }
-
+      $bytes = [Convert]::FromBase64String((Get-Content -Raw 'zero-copy-source.b64'))
+      $zip = Join-Path $pwd 'zero-copy-source.zip'
+      [IO.File]::WriteAllBytes($zip, $bytes)
+      $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($hash -ne '49ea61cc12c77df7e5218cd14483481bd343519a7453975062f6529bba9c3ab5') { throw "Source SHA256 mismatch: $hash" }
+      Expand-Archive -LiteralPath $zip -DestinationPath 'zero-copy' -Force
+      if (!(Test-Path 'zero-copy/Build.cmd')) { throw 'Build script missing' }
+      .\Install-ZeroCopy-CUDA.ps1
 build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
+      $env:CUDA_PATH = Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit\CUDA\v12.8'
       $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-      if (!(Test-Path $vswhere)) { throw 'Visual Studio installer locator missing' }
       $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-      if (!$vs) { throw 'MSVC x64 tools missing from Windows build image' }
+      if (!$vs) { throw 'MSVC missing' }
       $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
-      if (!(Test-Path $vcvars)) { throw 'vcvars64.bat missing' }
-      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build-And-Pack.cmd > build.log 2>&1')
-      $exit = $LASTEXITCODE
-      if (Test-Path build.log) { Get-Content build.log }
-      if ($exit -ne 0) { throw "Windows C++ compilation/package failed ($exit). See build.log." }
-      if (!(Test-Path 'artifacts\FG-WGC-D3D11-LowLatency-Windows-x64.zip')) { throw 'Expected ZIP artifact missing' }
-
-artifacts:
-  - path: artifacts\FG-WGC-D3D11-LowLatency-Windows-x64.zip
-    name: FG-WGC-D3D11-LowLatency-Windows-x64
-  - path: build.log
-    name: MSVC build.log
-
+      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call zero-copy\Build.cmd --zero-copy-blackwell > build-zero-copy.log 2>&1')
+      $status = $LASTEXITCODE
+      if (Test-Path build-zero-copy.log) { Get-Content build-zero-copy.log }
+      if ($status -ne 0) { throw "Compilation failed: $status" }
+      $exe = 'zero-copy/bin/FG-ZeroCopy-Blackwell-Experimental.exe'
+      if (!(Test-Path $exe)) { throw 'Executable missing' }
+      New-Item -ItemType Directory -Force artifacts | Out-Null
+      Compress-Archive -Path $exe,'zero-copy/README.md','zero-copy/TEST-RESULTS.txt' -DestinationPath 'artifacts/FG-ZeroCopy-Blackwell-Windows-x64.zip' -Force
 test: off
+artifacts:
+  - path: artifacts\FG-ZeroCopy-Blackwell-Windows-x64.zip
+    name: FG-ZeroCopy-Blackwell-Windows-x64
+  - path: build-zero-copy.log
+    name: Build log
