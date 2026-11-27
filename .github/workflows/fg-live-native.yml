@@ -1,0 +1,35 @@
+name: FG live native NGX Windows build
+on:
+  push:
+    branches: [fg-v15-cuda-vulkan-native-latewarp]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct and install SDKs
+        shell: powershell
+        run: .\ci-setup.ps1
+      - name: Compile live native integration and CPU tests
+        shell: powershell
+        run: .\ci-native-build.ps1
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-native-build-log
+          path: build.log
+          if-no-files-found: warn
+      - name: Upload Windows executable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-Live-Native-NGX-Windows-x64
+          path: artifacts/FG-Live-Native-NGX-Windows-x64.zip
+          if-no-files-found: error

@@ -1,0 +1,18 @@
+version: '1.0.{build}'
+image: Visual Studio 2022
+platform: x64
+configuration: Release
+branches:
+  only:
+    - fg-v15-cuda-vulkan-native-latewarp
+clone_depth: 1
+install:
+  - ps: .\ci-setup.ps1
+build_script:
+  - ps: .\ci-native-build.ps1
+test: off
+artifacts:
+  - path: artifacts\FG-Live-Native-NGX-Windows-x64.zip
+    name: FG-Live-Native-NGX-Windows-x64
+  - path: build.log
+    name: Build log
