@@ -1,4 +1,7 @@
 #include "pixel_types.h"
+#ifdef __CUDACC__
+#include <cuda_fp16.h>
+#endif
 #include "freeze_regions.h"
 __device__ __forceinline__ bool fixedFreeze(float2 uv,unsigned flags){
     const float x=uv.x*1650.f,y=uv.y*927.f;
@@ -219,5 +222,50 @@ extern "C" __global__ void renderFused(SourcePair pair,OutputImage target,Output
     float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
     reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);
     reinterpret_cast<float4*>(guidance.pixels)[idx]={fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y,0.f};
+}
+
+// Explicit pitched linear planes copied into mapped D3D11 CUDA arrays.
+// No imported NvFBC alias, persistent CUDA surface, or CPU staging.
+__device__ __forceinline__ void writeDirect(OutputImage color,OutputImage depth,unsigned long long motion,unsigned cp,unsigned dp,unsigned mp,unsigned x,unsigned y,Color c,float z,float mx,float my){
+    unsigned p=pack(c);unsigned rgba=(p&0xff00ff00u)|((p&255u)<<16)|((p>>16)&255u);
+    reinterpret_cast<unsigned*>(color.pixels+y*static_cast<unsigned long long>(cp))[x]=rgba;
+    reinterpret_cast<float*>(depth.pixels+y*static_cast<unsigned long long>(dp))[x]=z;
+    reinterpret_cast<__half2*>(motion+y*static_cast<unsigned long long>(mp))[x]=__floats2half2_rn(mx,my);
+}
+extern "C" __global__ void renderDirect(SourcePair pair,OutputImage target,OutputImage guidance,unsigned long long motionPlane,unsigned colorPitch,unsigned depthPitch,unsigned motionPitch,float horizon,float radius,float feather,
+                                      const unsigned* cut,const float* raw,const float* range,float interval,unsigned previousDepth,unsigned flags){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    unsigned idx=y*target.width+x;
+    (void)idx;
+    float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
+    bool native=pair.width==target.width&&pair.height==target.height;
+    Color base=native?unpack(reinterpret_cast<const unsigned*>(pair.current)[y*pair.currentPitch+x]):sampleColor(pair,pair.current,pair.currentPitch,uv);
+    if(fixedFreeze(uv,flags)){
+        writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,.999f,0.f,0.f);return;
+    }
+    float d=readDepth(raw,uv);float2 motion={0,0};
+    if(previousDepth&&cut&&*cut){writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,.999f,0.f,0.f);return;}
+    if(cut&&!*cut&&pair.flow&&pair.flowPitch){
+        float2 v=flowAt(pair,uv),q={uv.x+horizon*v.x,uv.y+horizon*v.y};
+        if(!outside(q)){
+            float2 mv=flowAt(pair,q),old={q.x+mv.x,q.y+mv.y};
+            float mag=magnitude(mv.x,mv.y);
+            if(!outside(old)&&mag<=.12f){
+                Color next=sampleColor(pair,pair.current,pair.currentPitch,q);
+                Color prev=sampleColor(pair,pair.previous,pair.previousPitch,old);
+                float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*(1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
+                float weight=confidence*protection(uv,target,radius,feather);
+                if(horizon>.00001f)base=mixColor(base,next,weight);
+                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
+                if(!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
+            }
+        }
+    }
+    float lo=range[0],hi=range[1];
+    float disparity=(isfinite(d)&&hi-lo>1.e-6f)?fminf(1.f,fmaxf(0.f,(d-lo)/(hi-lo))):0.f;
+    float inv=.02f+1.98f*disparity;
+    float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
+    writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y);
 }
 #endif

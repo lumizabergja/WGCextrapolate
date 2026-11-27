@@ -37,7 +37,10 @@ class CudaPipeline {
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{},directKernel{};
+    CUgraphicsResource directResources[3]{};
+    CUdeviceptr directPlanes[3]{};size_t directPitches[3]{};
+    bool directAttempted{},directReady{},directMapped{};
     std::array<FrameState,kNumCapture> states{};
     std::array<OutputBuffer,2> outputs{};
     unsigned outputIndex{};
@@ -129,7 +132,13 @@ class CudaPipeline {
         }
         return images;
     }
+    void FreeDirect() noexcept {
+        if(directMapped){cu.unmap(3,directResources,displayStream);directMapped=false;}
+        for(unsigned i=0;i<3;++i){if(directResources[i])cu.unregisterD3D(directResources[i]);if(directPlanes[i])cu.freeMemory(directPlanes[i]);directResources[i]=nullptr;directPlanes[i]=0;directPitches[i]=0;}
+        directReady=false;
+    }
     void freeOutputs() noexcept {
+        FreeDirect();directAttempted=false;
         for (auto& out:outputs) {
             if (out.mapped) cu.unmap(1,&out.interop,displayStream);
             if (out.interop) cu.unregisterD3D(out.interop);
@@ -172,6 +181,7 @@ public:
         cu.check(cu.getFunction(&sceneKernel,module,"sceneGate"),"Load CUDA scene-cut kernel");
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
         cu.check(cu.getFunction(&fusedKernel,module,"renderFused"),"Load fused color/depth/motion kernel");
+        cu.check(cu.getFunction(&directKernel,module,"renderDirect"),"Load direct texture staging kernel");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -202,7 +212,7 @@ public:
         PollDepth();return ai&&(ai->Ready(current,capture.frames[current].sequence)||(flowReady&&previous>=0&&ai->Ready(previous,capture.frames[previous].sequence)));
     }
     void PrepareDepth(int current,int previous,bool flowReady,bool urgent){
-        if(!ai){if(urgent)return;ai=std::make_unique<AiDepth>(cu);ai->Open(module);}
+        if(!ai){if(urgent)return;ai=std::make_unique<AiDepth>(cu,capture.context);ai->Open(module);}
         ai->Poll();if(urgent)return;
         // Skip only a contiguous source whose previous exact depth is ready
         // and whose backward flow is already published. Never chain stale depth.
@@ -274,11 +284,69 @@ public:
         cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow for this frame pair");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
+    bool PrepareDirect(DxDevices& dx){
+        if(directAttempted)return directReady;
+        directAttempted=true;
+        wchar_t opt[4]{};if(GetEnvironmentVariableW(L"FG_DIRECT_TEXTURE",opt,4)==1&&opt[0]==L'0')return false;
+        dx.EnsureWarp();
+        ID3D11Resource* textures[]={dx.warp->color.Get(),dx.warp->depth.Get(),dx.warp->motion.Get()};
+        for(unsigned i=0;i<3;++i){
+            CUresult r=cu.registerD3D(&directResources[i],textures[i],CU_GRAPHICS_REGISTER_FLAGS_NONE);
+            if(r!=CUDA_SUCCESS){FreeDirect();return false;}
+            r=cu.allocatePitch(&directPlanes[i],&directPitches[i],size_t(dx.screenW)*4,dx.screenH,4);
+            if(r!=CUDA_SUCCESS||directPitches[i]>UINT_MAX){FreeDirect();return false;}
+        }
+        directReady=true;return true;
+    }
+    bool DrawDirect(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady,unsigned flags){
+        if(!PrepareDirect(dx))return false;
+        // Register and map only owned NGX input textures, not capture surfaces.
+        CUresult mapped=cu.map(3,directResources,displayStream);
+        if(mapped!=CUDA_SUCCESS){
+            if(mapped==CUDA_ERROR_INVALID_HANDLE||mapped==CUDA_ERROR_INVALID_VALUE||mapped==CUDA_ERROR_NOT_SUPPORTED){FreeDirect();return false;}
+            cu.check(mapped,"Map direct NGX textures");
+        }
+        directMapped=true;
+        CUarray arrays[3]{};
+        for(unsigned i=0;i<3;++i){
+            CUDA_ARRAY_DESCRIPTOR desc{};
+            if(cu.mappedArray(&arrays[i],directResources[i],0,0)!=CUDA_SUCCESS||
+               cu.arrayDesc(&desc,arrays[i])!=CUDA_SUCCESS||
+               desc.Width!=dx.screenW||desc.Height!=dx.screenH||
+               (i==0&&(desc.Format!=CU_AD_FORMAT_UNSIGNED_INT8||desc.NumChannels!=4))||
+               (i==1&&(desc.Format!=CU_AD_FORMAT_FLOAT||desc.NumChannels!=1))||
+               (i==2&&(desc.Format!=CU_AD_FORMAT_HALF||desc.NumChannels!=2))){
+                cu.check(cu.unmap(3,directResources,displayStream),"Unmap unsupported direct textures");
+                directMapped=false;FreeDirect();return false;
+            }
+        }
+        const bool needFlow=horizon>0||flowReady;
+        auto& state=states[current];SourcePair images=pair(current,previous,needFlow);CUdeviceptr cut=needFlow?state.sceneCut:0;
+        if(needFlow)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order direct output after optical flow");
+        OutputImage target{directPlanes[0],dx.screenW,dx.screenH},guidance{directPlanes[1],dx.screenW,dx.screenH};
+        unsigned cp=unsigned(directPitches[0]),dp=unsigned(directPitches[1]),mp=unsigned(directPitches[2]);
+        unsigned previousDepth=ai->Ready(current,capture.frames[current].sequence)?0u:1u;
+        const int depthSlot=previousDepth?previous:current;
+        CUdeviceptr raw=ai->Raw(depthSlot),range=ai->Range(depthSlot),motion=directPlanes[2];
+        float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
+        void* args[]={&images,&target,&guidance,&motion,&cp,&dp,&mp,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
+        cu.launch(directKernel,displayStream,target.width,target.height,args);
+        for(unsigned i=0;i<3;++i){
+            CUDA_MEMCPY2D copy{};copy.srcMemoryType=CU_MEMORYTYPE_DEVICE;copy.srcDevice=directPlanes[i];copy.srcPitch=directPitches[i];
+            copy.dstMemoryType=CU_MEMORYTYPE_ARRAY;copy.dstArray=arrays[i];copy.WidthInBytes=size_t(target.width)*4;copy.Height=target.height;
+            cu.check(cu.copy2D(&copy,displayStream),"GPU copy to NGX input texture");
+        }
+        cu.diagnosticSync(displayStream,"Diagnostic: direct NGX input");
+        cu.check(cu.unmap(3,directResources,displayStream),"Hand NGX input textures to D3D11");directMapped=false;
+        dx.Present(nullptr,nullptr,flags,true);return true;
+    }
     void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady) {
         dx.reflex.Begin();
         auto& out=outputs[outputIndex];
         auto& state=states[current];
         const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
+        unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
+        if(depthReady&&DrawDirect(dx,current,previous,horizon,radius,feather,flowReady,flags))return;
         if(depthReady&&!out.depthInterop){
             const uint64_t elements=uint64_t(dx.screenW)*dx.screenH;
             if(elements>UINT_MAX/16)throw Error("Guidance output too large");
@@ -298,7 +366,6 @@ public:
         cu.check(cu.mappedPointer(&pixels,&bytes,out.interop),"Get CUDA output pointer");
         if(!pixels||bytes<uint64_t(dx.screenW)*dx.screenH*4)throw Error("Mapped CUDA output is too small");
         OutputImage target{pixels,dx.screenW,dx.screenH};
-        unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
         if(depthReady){
             CUdeviceptr d{};size_t size=0;
             cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");

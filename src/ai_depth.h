@@ -8,6 +8,17 @@ class AiDepth {
         void log(Severity,const char*) noexcept override {}
     } logger;
     const CudaDriver& cu;
+    CUcontext context{};
+    std::thread worker;
+    std::mutex workLock;
+    std::condition_variable workWake;
+    bool stopping{},queued{},submitted{};
+    std::exception_ptr failure;
+    struct Job {int index{};uint64_t sequence{};CUevent captured{};CUdeviceptr pixels{};UINT width{},height{},pitch{};};
+    Job job;
+    CUdeviceptr fixedOutput{};
+    CUgraphExec graphExec{};
+    bool graphAttempted{};
     HMODULE dll{};
     std::unique_ptr<nvinfer1::IRuntime> runtime;
     std::unique_ptr<nvinfer1::ICudaEngine> engine;
@@ -28,7 +39,7 @@ class AiDepth {
         int i=0;for(int n:expected)if(d.d[i++]!=n)return false;return true;
     }
 public:
-    explicit AiDepth(const CudaDriver& driver):cu(driver){}
+    explicit AiDepth(const CudaDriver& driver,CUcontext ctx):cu(driver),context(ctx){}
     void Open(CUmodule module){
         if(opened)return;
         wchar_t path[32768]{};if(!GetModuleFileNameW(nullptr,path,32768))throw Error("Find FG executable");
@@ -72,6 +83,7 @@ public:
         cu.check(cu.createPriorityStream(&stream,CU_STREAM_NON_BLOCKING,least),"Create low priority AI depth stream");
         done=cu.event();
         cu.check(cu.allocate(&input,3ull*W*H*sizeof(float)),"Allocate RGB tensor");
+        cu.check(cu.allocate(&fixedOutput,uint64_t(W)*H*sizeof(float)),"Allocate fixed graph output");
         cu.check(cu.allocate(&temporalRange,2*sizeof(float)),"Allocate temporal calibration");
         for(auto& s:slots){
             cu.check(cu.allocate(&s.raw,uint64_t(W)*H*sizeof(float)),"Allocate depth tensor");
@@ -80,39 +92,83 @@ public:
         cu.check(cu.getFunction(&prep,module,"prepareDepthRGB"),"Load depth preprocessing");
         cu.check(cu.getFunction(&rangeKernel,module,"depthRange"),"Load depth calibration");
         opened=true;
+        worker=std::thread([this]{Run();});
     }
     void Poll(){
-        if(active>=0&&cu.complete(done)){slots[active].sequence=pending;active=-1;}
+        bool published=false;
+        {std::lock_guard<std::mutex> g(workLock);if(failure)std::rethrow_exception(failure);published=submitted;}
+        if(active>=0&&published&&cu.complete(done)){
+            slots[active].sequence=pending;active=-1;
+            std::lock_guard<std::mutex> g(workLock);submitted=false;
+        }
     }
-    // At most one in-flight inference. No queued backlog, no CPU wait for output.
-    // enqueueV3 is called on the render thread and GPU execution is asynchronous;
-    // first use/deserialization can block, and TensorRT may incur host overhead.
+    // One outstanding job; render-thread slot ownership persists until
+    // worker submission AND the GPU completion event have both completed.
     void Submit(int index,const CaptureFrame& frame){
         Poll();
         if(active>=0||slots[index].sequence==frame.sequence)return;
-        auto& s=slots[index];s.sequence=0;
-        cu.check(cu.waitEvent(stream,frame.captured,0),"AI wait for capture");
-        CUdeviceptr pixels=frame.pixels;
-        UINT sw=frame.width,sh=frame.height,pitch=frame.pitchPixels;
+        slots[index].sequence=0;active=index;pending=frame.sequence;
+        {std::lock_guard<std::mutex> g(workLock);job={index,frame.sequence,frame.captured,frame.pixels,frame.width,frame.height,frame.pitchPixels};queued=true;submitted=false;}
+        workWake.notify_one();
+    }
+private:
+    void Infer(const Job& j){
+        cu.check(cu.waitEvent(stream,j.captured,0),"AI wait for capture");
+        CUdeviceptr pixels=j.pixels;UINT sw=j.width,sh=j.height,pitch=j.pitch;
         void* args[]={&pixels,&pitch,&sw,&sh,&input};
         cu.launch(prep,stream,W,H,args);
-        if(!execution->setTensorAddress("image",reinterpret_cast<void*>(input))||
-           !execution->setTensorAddress("depth",reinterpret_cast<void*>(s.raw))||
-           !execution->enqueueV3(reinterpret_cast<cudaStream_t>(stream)))
-            throw Error("TensorRT depth enqueue failed");
-        unsigned contiguous=lastRangeSequence&&frame.sequence==lastRangeSequence+1?1u:0u;
+        if(!graphAttempted){
+            graphAttempted=true;
+            if(!execution->setTensorAddress("image",reinterpret_cast<void*>(input))||
+               !execution->setTensorAddress("depth",reinterpret_cast<void*>(fixedOutput))||
+               !execution->enqueueV3(reinterpret_cast<cudaStream_t>(stream)))
+                throw Error("TensorRT depth warmup failed");
+            // Warm up fixed tensor addresses before capturing. Only the AI
+            // worker waits; the display thread is never blocked by this wait.
+            cu.check(cu.syncStream(stream),"Finish AI warmup");
+            wchar_t opt[4]{};const bool disabled=GetEnvironmentVariableW(L"FG_AI_GRAPH",opt,4)==1&&opt[0]==L'0';
+            if(!disabled&&cu.beginCapture(stream,CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)==CUDA_SUCCESS){
+                bool ok=execution->enqueueV3(reinterpret_cast<cudaStream_t>(stream));
+                CUgraph graph{};CUresult end=cu.endCapture(stream,&graph);
+                if(ok&&end==CUDA_SUCCESS&&graph){
+                    CUgraphExec candidate{};
+                    if(cu.graphInstantiate(&candidate,graph,0)==CUDA_SUCCESS)graphExec=candidate;
+                }
+                if(graph)cu.graphDestroy(graph);
+            }
+            // Warmup already produced this frame's result.
+        }else if(graphExec){
+            cu.check(cu.graphLaunch(graphExec,stream),"Replay TensorRT CUDA graph");
+        }else if(!execution->enqueueV3(reinterpret_cast<cudaStream_t>(stream)))throw Error("TensorRT depth enqueue failed");
+        auto& s=slots[j.index];
+        cu.check(cu.copyDevice(s.raw,fixedOutput,uint64_t(W)*H*sizeof(float),stream),"Publish fixed graph depth");
+        unsigned contiguous=lastRangeSequence&&j.sequence==lastRangeSequence+1?1u:0u;
         void* rangeArgs[]={&s.raw,&s.range,&temporalRange,&contiguous};
-        lastRangeSequence=frame.sequence;
+        lastRangeSequence=j.sequence;
         cu.check(cu.launchKernel(rangeKernel,1,1,1,1,1,1,0,stream,rangeArgs,nullptr),"Depth range kernel");
         cu.check(cu.recordEvent(done,stream),"Publish AI depth completion");
-        active=index;pending=frame.sequence;
     }
+    void Run() noexcept {
+        try{
+            SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+            CudaThreadContext binding(cu,context);
+            for(;;){
+                Job j;
+                {std::unique_lock<std::mutex> g(workLock);workWake.wait(g,[this]{return stopping||queued;});if(stopping)return;j=job;queued=false;}
+                Infer(j);
+                {std::lock_guard<std::mutex> g(workLock);submitted=true;}
+            }
+        }catch(...){std::lock_guard<std::mutex> g(workLock);failure=std::current_exception();}
+    }
+public:
     bool UsesSlot(int index)const{return active==index;}
     bool Ready(int index,uint64_t sequence)const{return opened&&slots[index].sequence==sequence&&sequence!=0;}
     CUdeviceptr Raw(int index)const{return slots[index].raw;}
     CUdeviceptr Range(int index)const{return slots[index].range;}
     ~AiDepth(){
+        {std::lock_guard<std::mutex> g(workLock);stopping=true;}workWake.notify_one();if(worker.joinable())worker.join();
         if(stream)cu.syncStream(stream);
+        if(graphExec)cu.graphExecDestroy(graphExec);if(fixedOutput)cu.freeMemory(fixedOutput);
         execution.reset();engine.reset();runtime.reset();
         for(auto& s:slots){if(s.raw)cu.freeMemory(s.raw);if(s.range)cu.freeMemory(s.range);}
         if(temporalRange)cu.freeMemory(temporalRange);if(input)cu.freeMemory(input);if(done)cu.destroyEvent(done);if(stream)cu.destroyStream(stream);

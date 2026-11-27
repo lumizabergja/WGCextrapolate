@@ -336,13 +336,13 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
         ctx11->PSSetShaderResources(texture?1:0,1,&none);
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
     }
-    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage,unsigned freezeFlags){
-        if(g_warpEnabled.load(std::memory_order_relaxed)&&depthImage){
-            if(!warp){
-                warp=std::make_unique<fgwarp::Presenter>();
-                warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);
-            }
-            gpuTiming.Begin();
+    void EnsureWarp(){
+        if(!warp){warp=std::make_unique<fgwarp::Presenter>();warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);}
+    }
+    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage,unsigned freezeFlags,bool direct=false){
+        if(direct||(g_warpEnabled.load(std::memory_order_relaxed)&&depthImage)){
+            EnsureWarp();gpuTiming.Begin();
+            if(!direct){
             D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};ctx11->RSSetViewports(1,&vp);
             ID3D11RenderTargetView* guidance[]={warp->inputRTV.Get(),warp->depthRTV.Get(),warp->motionRTV.Get()};
             ctx11->OMSetRenderTargets(3,guidance,nullptr);
@@ -350,6 +350,7 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
             ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
             ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(0,1,&image);ctx11->PSSetShaderResources(2,1,&depthImage);
             ctx11->Draw(3,0);ctx11->ClearState();
+            }
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
                            warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,periodMs,monitorPeriodMs,allowTearing,scanout,gpuTiming);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
