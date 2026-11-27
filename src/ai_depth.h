@@ -14,7 +14,8 @@ class AiDepth {
     std::unique_ptr<nvinfer1::IExecutionContext> execution;
     CUstream stream{};
     CUevent done{};
-    CUdeviceptr input{};
+    CUdeviceptr input{},temporalRange{};
+    uint64_t lastRangeSequence{};
     struct Slot {CUdeviceptr raw{},range{};uint64_t sequence{};};
     std::array<Slot,kNumCapture> slots{};
     int active=-1;
@@ -71,6 +72,7 @@ public:
         cu.check(cu.createPriorityStream(&stream,CU_STREAM_NON_BLOCKING,least),"Create low priority AI depth stream");
         done=cu.event();
         cu.check(cu.allocate(&input,3ull*W*H*sizeof(float)),"Allocate RGB tensor");
+        cu.check(cu.allocate(&temporalRange,2*sizeof(float)),"Allocate temporal calibration");
         for(auto& s:slots){
             cu.check(cu.allocate(&s.raw,uint64_t(W)*H*sizeof(float)),"Allocate depth tensor");
             cu.check(cu.allocate(&s.range,2*sizeof(float)),"Allocate depth calibration");
@@ -98,7 +100,9 @@ public:
            !execution->setTensorAddress("depth",reinterpret_cast<void*>(s.raw))||
            !execution->enqueueV3(reinterpret_cast<cudaStream_t>(stream)))
             throw Error("TensorRT depth enqueue failed");
-        void* rangeArgs[]={&s.raw,&s.range};
+        unsigned contiguous=lastRangeSequence&&frame.sequence==lastRangeSequence+1?1u:0u;
+        void* rangeArgs[]={&s.raw,&s.range,&temporalRange,&contiguous};
+        lastRangeSequence=frame.sequence;
         cu.check(cu.launchKernel(rangeKernel,1,1,1,1,1,1,0,stream,rangeArgs,nullptr),"Depth range kernel");
         cu.check(cu.recordEvent(done,stream),"Publish AI depth completion");
         active=index;pending=frame.sequence;
@@ -111,7 +115,7 @@ public:
         if(stream)cu.syncStream(stream);
         execution.reset();engine.reset();runtime.reset();
         for(auto& s:slots){if(s.raw)cu.freeMemory(s.raw);if(s.range)cu.freeMemory(s.range);}
-        if(input)cu.freeMemory(input);if(done)cu.destroyEvent(done);if(stream)cu.destroyStream(stream);
+        if(temporalRange)cu.freeMemory(temporalRange);if(input)cu.freeMemory(input);if(done)cu.destroyEvent(done);if(stream)cu.destroyStream(stream);
         if(dll)FreeLibrary(dll);
     }
 };

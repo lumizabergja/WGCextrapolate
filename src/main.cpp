@@ -44,6 +44,8 @@
 #include <fstream>
 #include <initializer_list>
 #include <NvInferRuntime.h>
+#include <nvapi.h>
+#include "reflex_presenter.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -177,9 +179,18 @@ struct DxDevices {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps,warpPS,depthPS;
     std::unique_ptr<fgwarp::Presenter> warp;
+    FgReflex reflex;
+    uint64_t lastGuidanceSequence{};
+    double lastGuidanceHorizon{};
+    float MotionInterval(uint64_t sequence,double horizon)const{
+        if(!lastGuidanceSequence)return 0.f;
+        if(sequence==lastGuidanceSequence)return float(std::clamp(horizon-lastGuidanceHorizon,0.,2.));
+        if(sequence==lastGuidanceSequence+1)return float(std::clamp(1.+horizon-lastGuidanceHorizon,0.,2.));
+        return 0.f;
+    }
     uint64_t warpSequence{}; int64_t warpPrevious{},warpCurrent{};
     double warpHorizon{},ticksPerMs{};UINT warpSrcW{},warpSrcH{};
-    void ResetWarpHistory(){if(warp)warp->resetHistory();}
+    void ResetWarpHistory(){lastGuidanceSequence=0;lastGuidanceHorizon=0;if(warp)warp->resetHistory();}
     void DrainWarp(){if(!warp)return;ctx11->ClearState();D3D11_QUERY_DESC q{D3D11_QUERY_EVENT,0};ComPtr<ID3D11Query> event;Check(dev11->CreateQuery(&q,&event),"NGX shutdown query");ctx11->End(event.Get());ctx11->Flush();HRESULT r;while((r=ctx11->GetData(event.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH))==S_FALSE)Sleep(1);Check(r,"NGX drain");warp.reset();}
     ComPtr<ID3D11Buffer> constants;
     UINT screenW{},screenH{},swapFlags{};
@@ -238,7 +249,7 @@ struct DxDevices {
         static const char* shader=R"HLSL(
 Buffer<float4> pixels : register(t0);
 Texture2D<float4> warped : register(t1);
-Buffer<float> aiDepth : register(t2);
+Buffer<float4> aiDepth : register(t2);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
@@ -247,7 +258,8 @@ float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
 }
 float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(int2(position.xy),0));}
-float DepthPS(float4 position:SV_Position):SV_Target {return aiDepth.Load(uint(position.y)*stride+uint(position.x));}
+struct Guidance {float depth:SV_Target0;float2 motion:SV_Target1;};
+Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(position.y)*stride+uint(position.x));Guidance g;g.depth=p.x;g.motion=p.yz;return g;}
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",
@@ -306,7 +318,8 @@ float DepthPS(float4 position:SV_Position):SV_Target {return aiDepth.Load(uint(p
             }
             DrawTo(image,warp->inputRTV.Get(),false);
             D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};ctx11->RSSetViewports(1,&vp);
-            ctx11->OMSetRenderTargets(1,warp->depthRTV.GetAddressOf(),nullptr);
+            ID3D11RenderTargetView* guidance[]={warp->depthRTV.Get(),warp->motionRTV.Get()};
+            ctx11->OMSetRenderTargets(2,guidance,nullptr);
             ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
             ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(2,1,&depthImage);
@@ -314,13 +327,16 @@ float DepthPS(float4 position:SV_Position):SV_Target {return aiDepth.Load(uint(p
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),g_hudEnabled.load(),g_gunEnabled.load(),
                            warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
+            lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
         }else{
             // Depth may not be ready for the newest real image. Never wait or
             // destroy/recreate NGX on a temporary miss.
-            if(warp)warp->resetHistory();
+            ResetWarpHistory();
             DrawTo(image,rtv.Get(),false);
         }
-        Check(swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0),"DXGI low-latency Present");
+        reflex.Marker(RENDERSUBMIT_END);reflex.Marker(PRESENT_START);
+        const HRESULT presented=swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0);
+        reflex.Marker(PRESENT_END);Check(presented,"DXGI low-latency Present");
     }
 
 };
@@ -605,6 +621,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     flow.Request(current,previous,sequence);
                 }
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
+                const bool cameraReady=g_warpEnabled.load(std::memory_order_relaxed)&&extrapolate&&gpu.DepthReady(current,previous,flowReady);
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);
                 if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65){
@@ -618,7 +635,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // frame takes the next display slot (up to 20% early), not an
                 // additional slot that would crowd out extrapolated frames.
                 const bool doPresent=extrapolate
-                    ? (realFramePending || flowReady) && displayClock.due(clockNow,realFramePending)
+                    ? (realFramePending || flowReady || cameraReady) && displayClock.due(clockNow,realFramePending)
                     : realFramePending;
                 if(doPresent){
                     // Queue target 0: if a previous Present still occupies the
@@ -658,7 +675,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     dx.warpHorizon=prediction;dx.warpSrcW=capture.frames[current].width;dx.warpSrcH=capture.frames[current].height;
                     gpu.Draw(dx,current,previous>=0?previous:current,prediction,
                              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
-                             float(g_centerFeatherPx.load(std::memory_order_relaxed)));
+                             float(g_centerFeatherPx.load(std::memory_order_relaxed)),flowReady);
                     displaySlotReserved=false;
                     realFramePending=false;
                     displayClock.submitted(submitTime);

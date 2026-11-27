@@ -40,14 +40,14 @@ struct Presenter {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11Texture2D> color,output,depth,motion,ui,mask,history;
-    ComPtr<ID3D11ShaderResourceView> colorSRV,historySRV;
+    ComPtr<ID3D11ShaderResourceView> colorSRV,historySRV,depthSRV,motionSRV;
     ComPtr<ID3D11RenderTargetView> maskRTV;
     ComPtr<ID3D11VertexShader> maskVS;
     ComPtr<ID3D11PixelShader> maskPS;
     ComPtr<ID3D11Buffer> maskConstants;
     bool historyValid=false; uint64_t historySequence=0;
     int64_t historyTime=0;
-    ComPtr<ID3D11RenderTargetView> inputRTV,depthRTV;
+    ComPtr<ID3D11RenderTargetView> inputRTV,depthRTV,motionRTV;
     ComPtr<ID3D11ShaderResourceView> outputSRV;
     NVSDK_NGX_Parameter* params{};
     NVSDK_NGX_Handle* feature{};
@@ -84,7 +84,10 @@ struct Presenter {
         std::vector<float> depths(zeros.size(),.999f);
         depth=tex(DXGI_FORMAT_R32_FLOAT,sr|D3D11_BIND_RENDER_TARGET,depths.data(),w*4);
         check(device->CreateRenderTargetView(depth.Get(),nullptr,&depthRTV),"AI depth RTV");
-        motion=tex(DXGI_FORMAT_R16G16_FLOAT,sr,zeros.data(),w*4);
+        motion=tex(DXGI_FORMAT_R16G16_FLOAT,sr|D3D11_BIND_RENDER_TARGET,zeros.data(),w*4);
+        check(device->CreateRenderTargetView(motion.Get(),nullptr,&motionRTV),"AI motion RTV");
+        check(device->CreateShaderResourceView(depth.Get(),nullptr,&depthSRV),"Depth mask SRV");
+        check(device->CreateShaderResourceView(motion.Get(),nullptr,&motionSRV),"Motion mask SRV");
         ui=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr,zeros.data(),w*4);
         mask=tex(DXGI_FORMAT_R8_UNORM,sr|D3D11_BIND_RENDER_TARGET);
         history=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr);
@@ -113,6 +116,8 @@ struct Presenter {
         static const char* shader=R"HLSL(
 Texture2D<float4> currentImage : register(t0);
 Texture2D<float4> previousImage : register(t1);
+Texture2D<float> sceneDepth : register(t2);
+Texture2D<float2> sceneMotion : register(t3);
 cbuffer Config : register(b0) {
     float2 size; float2 shift;
     float hud; float gun; float radius; float feather;
@@ -149,7 +154,12 @@ float PS(float4 pos:SV_Position):SV_Target {
     // is protected without independent-motion evidence at the pixel.
     float prior=smoothstep(.48,.77,uv.y)*smoothstep(.08,.25,abs(uv.x-.5)+.10);
     float weaponMotion=smoothstep(.055,.22,sceneError)*smoothstep(.015,.12,edge+screenError*.5);
-    float weaponMask=gun*move*prior*max(stable*.8,weaponMotion);
+    // A near-depth prior plus independent motion strengthens the existing
+    // conservative foreground mask. Not a trained semantic classifier.
+    float nearEvidence=1-smoothstep(.90,.985,sceneDepth.Load(int3(int2(p),0)));
+    float2 mv=sceneMotion.Load(int3(int2(p),0));
+    float independent=smoothstep(1.0,8.0,min(length(mv-shift),length(mv+shift)));
+    float weaponMask=gun*move*prior*max(stable*.8,weaponMotion)*(.45+.55*max(nearEvidence,independent));
     float d=length(p-size*.5);
     float center=(radius+feather>0)?(1-smoothstep(radius,max(radius+.001,radius+feather),d)):0;
     return saturate(max(center,max(hudMask,weaponMask)));
@@ -185,8 +195,8 @@ float PS(float4 pos:SV_Position):SV_Target {
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(maskVS.Get(),nullptr,0);ctx->PSSetShader(maskPS.Get(),nullptr,0);
         ctx->PSSetConstantBuffers(0,1,maskConstants.GetAddressOf());
-        ID3D11ShaderResourceView* views[]={colorSRV.Get(),historyValid?historySRV.Get():colorSRV.Get()};
-        ctx->PSSetShaderResources(0,2,views);ctx->Draw(3,0);
+        ID3D11ShaderResourceView* views[]={colorSRV.Get(),historyValid?historySRV.Get():colorSRV.Get(),depthSRV.Get(),motionSRV.Get()};
+        ctx->PSSetShaderResources(0,4,views);ctx->Draw(3,0);
         ctx->ClearState();
         if(historySequence!=sequence){
             ctx->CopyResource(history.Get(),color.Get());historyValid=true;historySequence=sequence;historyTime=sourceTime;
@@ -199,8 +209,8 @@ float PS(float4 pos:SV_Position):SV_Target {
         updateMask(radius,feather,hud,gun,sequence,sourceTime);
         // Every submitted image is a new NGX source, including CUDA-generated
         // images. A second evaluation applies the late pose to that source.
-        // Relative AI depth has been drawn into depthRTV; motion vectors are
-        // still zero until their NGX conventions can be validated.
+        // Relative depth and backward pixel-space motion have been drawn
+        // into the guidance textures. Conventions follow NVIDIA's sample.
         fglate::Counts prev{},cur{};
         const bool sampled=inputHistory.at(sourceTime,cur);
         const bool havePair=sampled && previousTime<sourceTime && inputHistory.at(previousTime,prev);
@@ -209,7 +219,9 @@ float PS(float4 pos:SV_Position):SV_Target {
         constexpr double rad=-.022*1.5*3.14159265358979323846/180.;
         // Local relative pose: reset source to identity for each new NGX input.
         // Subtract the camera motion already estimated by extrapolation.
-        source=camera(0,0);target=source;
+        const double sourceYaw=sampled?(cur.x+hx)*rad:0.;
+        const double sourcePitch=sampled?std::clamp((cur.y+hy)*rad,-1.55334,1.55334):0.;
+        source=camera(float(std::remainder(sourceYaw,6.283185307179586)),float(sourcePitch));target=source;
         params->Set("Latewarp.IsRenderedFrame",1u);params->Set("Latewarp.FrameID",++frameID);
         ngx(NVSDK_NGX_D3D11_EvaluateFeature(ctx.Get(),feature,params,nullptr),"Native NGX DX11 register image");
         ctx->ClearState();
@@ -220,7 +232,7 @@ float PS(float4 pos:SV_Position):SV_Target {
             double dx=(latest.x-cur.x+future.x-hx)*rad,dy=(latest.y-cur.y+future.y-hy)*rad;
             const double limit=4.*3.14159265358979323846/180.;
             const double scale=std::max(1.,std::hypot(dx,dy)/limit);
-            target=camera(float(dx/scale),float(dy/scale));
+            target=camera(float(std::remainder(sourceYaw+dx/scale,6.283185307179586)),float(std::clamp(sourcePitch+dy/scale,-1.55334,1.55334)));
         }
         params->Set("Latewarp.IsRenderedFrame",0u);params->Set("Latewarp.FrameID",++frameID);
         ngx(NVSDK_NGX_D3D11_EvaluateFeature(ctx.Get(),feature,params,nullptr),"Native NGX DX11 warp evaluation");

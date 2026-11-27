@@ -198,6 +198,9 @@ public:
         freeOutputs();
     }
     void PollDepth(){if(ai)ai->Poll();}
+    bool DepthReady(int current,int previous,bool flowReady){
+        PollDepth();return ai&&(ai->Ready(current,capture.frames[current].sequence)||(flowReady&&previous>=0&&ai->Ready(previous,capture.frames[previous].sequence)));
+    }
     void PrepareDepth(int current){
         if(!ai){ai=std::make_unique<AiDepth>(cu);ai->Open(module);}
         ai->Submit(current,capture.frames[current]);
@@ -267,7 +270,8 @@ public:
         cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow for this frame pair");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
-    void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather) {
+    void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady) {
+        dx.reflex.Begin(dx.dev11.Get(),g_warpEnabled.load(std::memory_order_relaxed));
         auto& out=outputs[outputIndex];
         auto& state=states[current];
         SourcePair images=pair(current,previous,horizon>0);
@@ -285,20 +289,26 @@ public:
         void* args[]={&images,&target,&horizon,&radius,&feather,&cut};
         cu.launch(renderKernel,displayStream,target.width,target.height,args);
         PollDepth();
-        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&ai&&ai->Ready(current,capture.frames[current].sequence);
+        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
         if(depthReady){
             if(!out.depthInterop){
-                D3D11_BUFFER_DESC d{};d.ByteWidth=target.width*target.height*4;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                D3D11_BUFFER_DESC d{};if(uint64_t(target.width)*target.height>UINT_MAX/16)throw Error("Guidance output too large");d.ByteWidth=target.width*target.height*16;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
                 Check(dx.dev11->CreateBuffer(&d,nullptr,&out.depthPixels),"AI depth output buffer");
-                D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=target.width*target.height;
+                D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=target.width*target.height;
                 Check(dx.dev11->CreateShaderResourceView(out.depthPixels.Get(),&v,&out.depthView),"AI depth output view");
                 cu.check(cu.registerD3D(&out.depthInterop,out.depthPixels.Get(),CU_GRAPHICS_REGISTER_FLAGS_NONE),"Register AI depth output");
             }
             cu.check(cu.map(1,&out.depthInterop,displayStream),"Map AI depth output");out.depthMapped=true;
             CUdeviceptr d{};size_t size=0;cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
-            if(!d||size<uint64_t(target.width)*target.height*4)throw Error("AI depth output too small");
-            OutputImage depthTarget{d,target.width,target.height};CUdeviceptr raw=ai->Raw(current),range=ai->Range(current);
-            void* depthArgs[]={&images,&depthTarget,&horizon,&radius,&feather,&cut,&raw,&range};
+            if(!d||size<uint64_t(target.width)*target.height*16)throw Error("AI depth output too small");
+            OutputImage depthTarget{d,target.width,target.height};
+            unsigned previousDepth=ai->Ready(current,capture.frames[current].sequence)?0u:1u;
+            int depthSlot=previousDepth?previous:current;
+            CUdeviceptr raw=ai->Raw(depthSlot),range=ai->Range(depthSlot);
+            SourcePair guidance=pair(current,previous,flowReady);CUdeviceptr guidanceCut=flowReady?state.sceneCut:0;
+            if(flowReady)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order guidance after optical flow");
+            float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
+            void* depthArgs[]={&guidance,&depthTarget,&horizon,&radius,&feather,&guidanceCut,&raw,&range,&interval,&previousDepth};
             cu.launch(depthKernel,displayStream,target.width,target.height,depthArgs);
             cu.check(cu.unmap(1,&out.depthInterop,displayStream),"Hand AI depth to D3D11");out.depthMapped=false;
         }
