@@ -182,6 +182,8 @@ struct DxDevices {
     ComPtr<ID3D11PixelShader> ps,warpPS,depthPS;
     std::unique_ptr<fgwarp::Presenter> warp;
     FgReflex reflex;
+    fgwarp::InputWorker* input{};
+    double periodMs=3.125;
     uint64_t lastGuidanceSequence{};
     double lastGuidanceHorizon{};
     float MotionInterval(uint64_t sequence,double horizon)const{
@@ -337,7 +339,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
             ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(2,1,&depthImage);
             ctx11->Draw(3,0);ctx11->ClearState();
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
-                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs);
+                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,periodMs);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
             lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
         }else{
@@ -422,10 +424,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(tracked.Exited())return SessionOutcome::Stop;
         // CUDA/DX11 shared resources are created on this single render thread.
         OverlayWindow overlay;overlay.Init(game.window);
-        RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
-        if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register raw mouse input",GetLastError());
-        struct RawRegistration {~RawRegistration(){fgwarp::acceptInput=false;RAWINPUTDEVICE r{1,2,RIDEV_REMOVE,nullptr};RegisterRawInputDevices(&r,1,sizeof(r));}} rawRegistration;
-        fgwarp::acceptInput=false;fgwarp::resetInput();
+        fgwarp::InputWorker input(game.pid);
         MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);
         UINT monitorHz=320;
         if(GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)){
@@ -433,7 +432,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>=30)
                 monitorHz=dm.dmDisplayFrequency;
         }
-        DxDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height);
+        DxDevices dx; dx.input=&input;dx.Init(overlay.hwnd,overlay.width,overlay.height);
         CudaDriver cuda;
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
@@ -558,7 +557,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
-                if(wasFocused){fgwarp::acceptInput=false;fgwarp::resetInput();dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
+                if(wasFocused){input.Focus(false);dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -568,7 +567,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
-                fgwarp::resetInput();fgwarp::acceptInput=true;dx.ResetWarpHistory();
+                input.Focus(true);dx.ResetWarpHistory();
                 previousPoseTime=currentPoseTime=0;
                 resumeWarmup=2;
                 displayClock.reset();
@@ -626,8 +625,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
                 const bool useFlow=pairEligible && extrapolate;
                 const auto sequence=capture.frames[current].sequence;
-                if(g_warpEnabled.load(std::memory_order_relaxed))gpu.PrepareDepth(current);
-                else gpu.PollDepth();
+                gpu.PollDepth();
                 if(useFlow){
                     gpu.PreparePair(current,previous);
                     flow.Request(current,previous,sequence);
@@ -649,6 +647,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool doPresent=extrapolate
                     ? (realFramePending || flowReady || cameraReady) && displayClock.due(clockNow,realFramePending)
                     : realFramePending;
+                if(g_warpEnabled.load(std::memory_order_relaxed))gpu.PrepareDepth(current,previous,flowReady,doPresent);
                 if(doPresent){
                     // Queue target 0: if a previous Present still occupies the
                     // only allowed DXGI frame slot, keep the newest real source
@@ -676,10 +675,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                         std::lock_guard<std::mutex> lock(mailbox.mutex);
                         if(mailbox.ready>=0)continue;
                     }
+                    dx.periodMs=step*1000.;
+                    dx.reflex.Prepare(dx.dev11.Get(),g_reflexEnabled.load(std::memory_order_relaxed),realFramePending,dx.periodMs);
+                    // If Reflex waited and a newer frame arrived, keep the reserved slot.
+                    {std::lock_guard<std::mutex> lock(mailbox.mutex);if(mailbox.ready>=0)continue;}
                     // The waitable object may have delayed this submission.
                     // Re-sample QPC after acquiring the slot, not before waiting.
                     QueryPerformanceCounter(&now);
-                    const double submitTime=double(now.QuadPart)/double(freq.QuadPart);
                     const double age=double(now.QuadPart-last.QuadPart)/double(freq.QuadPart);
                     const float prediction=(realFramePending||!flowReady)?0.f:
                         float(std::clamp(age/pairPeriod,0.0,1.25));
@@ -690,7 +692,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                              float(g_centerFeatherPx.load(std::memory_order_relaxed)),flowReady);
                     displaySlotReserved=false;
                     realFramePending=false;
-                    displayClock.submitted(submitTime);
+                    LARGE_INTEGER finished{};QueryPerformanceCounter(&finished);
+                    displayClock.submitted(double(finished.QuadPart)/double(freq.QuadPart));
                 }else SwitchToThread();
             } else {
                 // No current frame: block on capture publication instead of
@@ -844,7 +847,6 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
-    if(msg==WM_INPUT){fgwarp::rawInput(lp);return DefWindowProcW(hwnd,msg,wp,lp);}
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -943,7 +945,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 case ReflexState::InitFailed:label=L"Reflex: NVAPI initialization failed";break;
                 case ReflexState::SleepRejected:label=L"Reflex: mode accepted, sleep rejected";break;
                 case ReflexState::MarkersRejected:label=L"Reflex: mode/sleep accepted, markers rejected";break;
-                case ReflexState::ActiveNoSleep:label=L"Reflex: mode accepted, sleep disabled (test)";break;
+                case ReflexState::ActiveNoSleep:label=L"Reflex + Boost: accepted / adaptive sleep bypass";break;
                 default:break;
                 }
                 SetWindowTextW(g_reflexStatus,label);

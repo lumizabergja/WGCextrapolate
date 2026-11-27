@@ -181,46 +181,43 @@ __device__ __forceinline__ float readDepth(const float* d,float2 uv){
 }
 // Follow the original extrapolator's coordinates and confidence blend so
 // synthesized depth approximates the synthesized color. Depth is relative.
-extern "C" __global__ void renderAiDepth(SourcePair pair,OutputImage target,float horizon,float radius,float feather,
-                                          const unsigned* cut,const float* raw,const float* range,float interval,unsigned previousDepth,unsigned flags){
+// One motion lookup / confidence blend for color and depth/motion.
+// Fixed-freeze regions use the exact real-frame color and neutral guidance.
+extern "C" __global__ void renderFused(SourcePair pair,OutputImage target,OutputImage guidance,float horizon,float radius,float feather,
+                                      const unsigned* cut,const float* raw,const float* range,float interval,unsigned previousDepth,unsigned flags){
     unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
     if(x>=target.width||y>=target.height)return;
+    unsigned idx=y*target.width+x;
     float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
-    float d=readDepth(raw,uv);float2 motion={0,0};
+    bool native=pair.width==target.width&&pair.height==target.height;
+    Color base=native?unpack(reinterpret_cast<const unsigned*>(pair.current)[y*pair.currentPitch+x]):sampleColor(pair,pair.current,pair.currentPitch,uv);
     if(fixedFreeze(uv,flags)){
-        reinterpret_cast<float4*>(target.pixels)[y*target.width+x]={.999f,0.f,0.f,0.f};return;
+        reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);
+        reinterpret_cast<float4*>(guidance.pixels)[idx]={.999f,0,0,0};return;
     }
+    float d=readDepth(raw,uv);float2 motion={0,0};
+    if(previousDepth&&cut&&*cut){reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);reinterpret_cast<float4*>(guidance.pixels)[idx]={.999f,0,0,0};return;}
     if(cut&&!*cut&&pair.flow&&pair.flowPitch){
-        float2 v0=flowAt(pair,uv);float2 q0={uv.x+horizon*v0.x,uv.y+horizon*v0.y};
-        if(!outside(q0)){
-            float2 mv=flowAt(pair,q0);float2 old0={q0.x+mv.x,q0.y+mv.y};
-            if(!outside(old0)&&magnitude(mv.x,mv.y)<.12f){
-                float conf=(1.f-smooth(.045f,.20f,residual(sampleColor(pair,pair.current,pair.currentPitch,q0),sampleColor(pair,pair.previous,pair.previousPitch,old0))))*(1.f-smooth(.003f,.025f,magnitude(mv.x-v0.x,mv.y-v0.y)));
-                float weight=conf*protection(uv,target,radius,feather);
-                motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};
-                if(previousDepth)d=mixValue(d,readDepth(raw,old0),weight);
-            }
-        }
-    }
-    if(!previousDepth&&horizon>.00001f&&cut&&!*cut&&pair.flow&&pair.flowPitch){
         float2 v=flowAt(pair,uv),q={uv.x+horizon*v.x,uv.y+horizon*v.y};
         if(!outside(q)){
             float2 mv=flowAt(pair,q),old={q.x+mv.x,q.y+mv.y};
-            if(!outside(old)&&magnitude(mv.x,mv.y)<=.12f){
+            float mag=magnitude(mv.x,mv.y);
+            if(!outside(old)&&mag<=.12f){
                 Color next=sampleColor(pair,pair.current,pair.currentPitch,q);
                 Color prev=sampleColor(pair,pair.previous,pair.previousPitch,old);
-                float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*
-                    (1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
-                d=mixValue(d,readDepth(raw,q),confidence*protection(uv,target,radius,feather));
+                float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*(1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
+                float weight=confidence*protection(uv,target,radius,feather);
+                if(horizon>.00001f)base=mixColor(base,next,weight);
+                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
+                if(!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
             }
         }
     }
     float lo=range[0],hi=range[1];
     float disparity=(isfinite(d)&&hi-lo>1.e-6f)?fminf(1.f,fmaxf(0.f,(d-lo)/(hi-lo))):0.f;
-    // Relative disparity to arbitrary scene scale (0.5..50 m), then
-    // conventional D3D perspective depth matching the NGX projection.
     float inv=.02f+1.98f*disparity;
     float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
-    reinterpret_cast<float4*>(target.pixels)[y*target.width+x]={fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y,0.f};
+    reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);
+    reinterpret_cast<float4*>(guidance.pixels)[idx]={fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y,0.f};
 }
 #endif

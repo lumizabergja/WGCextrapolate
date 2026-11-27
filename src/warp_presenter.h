@@ -3,6 +3,7 @@
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include "late_input.h"
+#include "raw_input_worker.h"
 #include "freeze_regions.h"
 #include <wrl/client.h>
 #include <nvsdk_ngx.h>
@@ -22,17 +23,6 @@ using Microsoft::WRL::ComPtr;
 inline std::atomic<bool> requested{false};
 inline void (*stageCallback)(const wchar_t*){};
 inline void stage(const wchar_t* message) noexcept {if(stageCallback)stageCallback(message);}
-inline thread_local fglate::History inputHistory;
-inline thread_local bool acceptInput=false;
-inline int64_t stamp(){LARGE_INTEGER t{};QueryPerformanceCounter(&t);return t.QuadPart;}
-inline void resetInput(){inputHistory.reset(stamp());}
-inline void rawInput(LPARAM lp){
-    RAWINPUT data{};UINT n=sizeof(data);
-    if(GetRawInputData(reinterpret_cast<HRAWINPUT>(lp),RID_INPUT,&data,&n,sizeof(RAWINPUTHEADER))==UINT(-1))return;
-    if(acceptInput && data.header.dwType==RIM_TYPEMOUSE && !(data.data.mouse.usFlags&MOUSE_MOVE_ABSOLUTE))
-        inputHistory.push(stamp(),data.data.mouse.lLastX,data.data.mouse.lLastY);
-}
-inline void drainInput(){MSG msg{};for(unsigned i=0;i<128&&PeekMessageW(&msg,nullptr,WM_INPUT,WM_INPUT,PM_REMOVE);++i)DispatchMessageW(&msg);}
 struct Handle {HANDLE value{};~Handle(){if(value)CloseHandle(value);}};
 inline void check(HRESULT r,const char* name){if(FAILED(r)){char s[160];std::snprintf(s,sizeof(s),"%s (0x%08X)",name,unsigned(r));throw std::runtime_error(s);}}
 inline void ngx(NVSDK_NGX_Result r,const char* name){if(!NVSDK_NGX_SUCCEED(r)){char s[160];std::snprintf(s,sizeof(s),"%s (NGX 0x%08X)",name,unsigned(r));throw std::runtime_error(s);}}
@@ -53,6 +43,7 @@ struct Presenter {
     NVSDK_NGX_Handle* feature{};
     UINT w{},h{},radiusCache{UINT_MAX},featherCache{UINT_MAX},frameID{};
     float aspect{},yaw{},pitch{};
+    double lateSubmitMs=.6;
     std::array<float,16> source{},target{},projection{};
     static constexpr double radiansPerCount=-.022*1.5*3.141592653589793/180.;
     static float angle(long long n){return float(std::remainder(n*radiansPerCount,6.283185307179586));}
@@ -154,7 +145,7 @@ float PS(float4 pos:SV_Position):SV_Target {
         radiusCache=radius;featherCache=feather;lastHud=hud;lastGun=gun;maskValid=true;
     }
     bool lastHud{},lastGun{};
-    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs){
+    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs,InputWorker& input,double periodMs){
         ctx->ClearState();
         updateMask(radius,feather,hud,gun);
         (void)sequence;
@@ -163,8 +154,8 @@ float PS(float4 pos:SV_Position):SV_Target {
         // Relative depth and backward pixel-space motion have been drawn
         // into the guidance textures. Conventions follow NVIDIA's sample.
         fglate::Counts prev{},cur{};
-        const bool sampled=inputHistory.at(sourceTime,cur);
-        const bool havePair=sampled && previousTime<sourceTime && inputHistory.at(previousTime,prev);
+        bool havePair=false;
+        const bool sampled=input.Pair(previousTime,sourceTime,prev,cur,havePair);
         const double hx=havePair?horizon*(cur.x-prev.x):0.;
         const double hy=havePair?horizon*(cur.y-prev.y):0.;
         constexpr double rad=-.022*1.5*3.14159265358979323846/180.;
@@ -176,10 +167,11 @@ float PS(float4 pos:SV_Position):SV_Target {
         params->Set("Latewarp.IsRenderedFrame",1u);params->Set("Latewarp.FrameID",++frameID);
         ngx(NVSDK_NGX_D3D11_EvaluateFeature(ctx.Get(),feature,params,nullptr),"Native NGX DX11 register image");
         ctx->ClearState();
-        drainInput();
-        const auto now=stamp();fglate::Counts latest{};
-        if(sampled && inputHistory.at(now,latest) && now>=sourceTime){
-            const auto future=inputHistory.predict(now,ticksPerMs,5.);
+        // Sample after registration, immediately before the second NGX call.
+        // Estimate host submission time, not actual GPU completion/scanout.
+        const auto now=stamp();fglate::Counts latest{},future{};
+        const double lead=std::clamp(lateSubmitMs+periodMs*.5,0.0,std::min(5.0,periodMs));
+        if(sampled && now>=sourceTime && input.Latest(now,ticksPerMs,lead,latest,future)){
             double dx=(latest.x-cur.x+future.x-hx)*rad,dy=(latest.y-cur.y+future.y-hy)*rad;
             const double limit=4.*3.14159265358979323846/180.;
             const double scale=std::max(1.,std::hypot(dx,dy)/limit);
@@ -188,6 +180,7 @@ float PS(float4 pos:SV_Position):SV_Target {
         params->Set("Latewarp.IsRenderedFrame",0u);params->Set("Latewarp.FrameID",++frameID);
         ngx(NVSDK_NGX_D3D11_EvaluateFeature(ctx.Get(),feature,params,nullptr),"Native NGX DX11 warp evaluation");
         ctx->ClearState();
+        if(ticksPerMs>0)lateSubmitMs=.9*lateSubmitMs+.1*std::clamp(double(stamp()-now)/ticksPerMs,0.,5.);
     }
     ~Presenter(){if(feature)NVSDK_NGX_D3D11_ReleaseFeature(feature);if(params)NVSDK_NGX_D3D11_DestroyParameters(params);if(sdkReady)NVSDK_NGX_D3D11_Shutdown1(device.Get());}
 };

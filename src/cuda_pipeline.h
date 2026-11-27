@@ -37,7 +37,7 @@ class CudaPipeline {
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{},depthKernel{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{};
     std::array<FrameState,kNumCapture> states{};
     std::array<OutputBuffer,2> outputs{};
     unsigned outputIndex{};
@@ -171,7 +171,7 @@ public:
         cu.check(cu.getFunction(&stageKernel,module,"stageFlowInput"),"Load NvOFA input kernel");
         cu.check(cu.getFunction(&sceneKernel,module,"sceneGate"),"Load CUDA scene-cut kernel");
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
-        cu.check(cu.getFunction(&depthKernel,module,"renderAiDepth"),"Load depth reprojection kernel");
+        cu.check(cu.getFunction(&fusedKernel,module,"renderFused"),"Load fused color/depth/motion kernel");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -201,8 +201,12 @@ public:
     bool DepthReady(int current,int previous,bool flowReady){
         PollDepth();return ai&&(ai->Ready(current,capture.frames[current].sequence)||(flowReady&&previous>=0&&ai->Ready(previous,capture.frames[previous].sequence)));
     }
-    void PrepareDepth(int current){
-        if(!ai){ai=std::make_unique<AiDepth>(cu);ai->Open(module);}
+    void PrepareDepth(int current,int previous,bool flowReady,bool urgent){
+        if(!ai){if(urgent)return;ai=std::make_unique<AiDepth>(cu);ai->Open(module);}
+        ai->Poll();if(urgent)return;
+        // Skip only a contiguous source whose previous exact depth is ready
+        // and whose backward flow is already published. Never chain stale depth.
+        if(flowReady&&previous>=0&&capture.frames[current].sequence==capture.frames[previous].sequence+1&&ai->Ready(previous,capture.frames[previous].sequence))return;
         ai->Submit(current,capture.frames[current]);
     }
     void NewFrame(int index,bool prepareLuma) {
@@ -271,53 +275,48 @@ public:
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
     void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady) {
-        dx.reflex.Begin(dx.dev11.Get(),g_reflexEnabled.load(std::memory_order_relaxed));
+        dx.reflex.Begin();
         auto& out=outputs[outputIndex];
         auto& state=states[current];
-        SourcePair images=pair(current,previous,horizon>0);
-        CUdeviceptr cut=horizon>0?state.sceneCut:0;
-        if (horizon>0)
-            cu.check(cu.waitEvent(displayStream,state.ready,0),"Order prediction after optical flow");
-        cu.check(cu.map(1,&out.interop,displayStream),"Map DXGI output for CUDA");
-        out.mapped=true;
-        CUdeviceptr pixels{};
-        size_t bytes=0;
+        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
+        if(depthReady&&!out.depthInterop){
+            const uint64_t elements=uint64_t(dx.screenW)*dx.screenH;
+            if(elements>UINT_MAX/16)throw Error("Guidance output too large");
+            D3D11_BUFFER_DESC d{};d.ByteWidth=UINT(elements*16);d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+            Check(dx.dev11->CreateBuffer(&d,nullptr,&out.depthPixels),"AI depth output buffer");
+            D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=UINT(elements);
+            Check(dx.dev11->CreateShaderResourceView(out.depthPixels.Get(),&v,&out.depthView),"AI depth output view");
+            cu.check(cu.registerD3D(&out.depthInterop,out.depthPixels.Get(),CU_GRAPHICS_REGISTER_FLAGS_NONE),"Register AI depth output");
+        }
+        const bool needFlow=horizon>0||(depthReady&&flowReady);
+        SourcePair images=pair(current,previous,needFlow);CUdeviceptr cut=needFlow?state.sceneCut:0;
+        if(needFlow)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order after optical flow");
+        CUgraphicsResource resources[]={out.interop,out.depthInterop};const unsigned resourceCount=depthReady?2u:1u;
+        cu.check(cu.map(resourceCount,resources,displayStream),"Map CUDA color/guidance together");
+        out.mapped=true;out.depthMapped=depthReady;
+        CUdeviceptr pixels{};size_t bytes=0;
         cu.check(cu.mappedPointer(&pixels,&bytes,out.interop),"Get CUDA output pointer");
-        if (!pixels || bytes<uint64_t(dx.screenW)*dx.screenH*4)
-            throw Error("Mapped CUDA output is too small");
+        if(!pixels||bytes<uint64_t(dx.screenW)*dx.screenH*4)throw Error("Mapped CUDA output is too small");
         OutputImage target{pixels,dx.screenW,dx.screenH};
         unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
-        void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&flags};
-        cu.launch(renderKernel,displayStream,target.width,target.height,args);
-        PollDepth();
-        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
         if(depthReady){
-            if(!out.depthInterop){
-                D3D11_BUFFER_DESC d{};if(uint64_t(target.width)*target.height>UINT_MAX/16)throw Error("Guidance output too large");d.ByteWidth=target.width*target.height*16;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-                Check(dx.dev11->CreateBuffer(&d,nullptr,&out.depthPixels),"AI depth output buffer");
-                D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=target.width*target.height;
-                Check(dx.dev11->CreateShaderResourceView(out.depthPixels.Get(),&v,&out.depthView),"AI depth output view");
-                cu.check(cu.registerD3D(&out.depthInterop,out.depthPixels.Get(),CU_GRAPHICS_REGISTER_FLAGS_NONE),"Register AI depth output");
-            }
-            cu.check(cu.map(1,&out.depthInterop,displayStream),"Map AI depth output");out.depthMapped=true;
-            CUdeviceptr d{};size_t size=0;cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
+            CUdeviceptr d{};size_t size=0;
+            cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
             if(!d||size<uint64_t(target.width)*target.height*16)throw Error("AI depth output too small");
-            OutputImage depthTarget{d,target.width,target.height};
+            OutputImage guidance{d,target.width,target.height};
             unsigned previousDepth=ai->Ready(current,capture.frames[current].sequence)?0u:1u;
-            int depthSlot=previousDepth?previous:current;
+            const int depthSlot=previousDepth?previous:current;
             CUdeviceptr raw=ai->Raw(depthSlot),range=ai->Range(depthSlot);
-            SourcePair guidance=pair(current,previous,flowReady);CUdeviceptr guidanceCut=flowReady?state.sceneCut:0;
-            if(flowReady)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order guidance after optical flow");
             float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
-            void* depthArgs[]={&guidance,&depthTarget,&horizon,&radius,&feather,&guidanceCut,&raw,&range,&interval,&previousDepth,&flags};
-            cu.launch(depthKernel,displayStream,target.width,target.height,depthArgs);
-            cu.check(cu.unmap(1,&out.depthInterop,displayStream),"Hand AI depth to D3D11");out.depthMapped=false;
+            void* args[]={&images,&target,&guidance,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
+            cu.launch(fusedKernel,displayStream,target.width,target.height,args);
+        }else{
+            void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&flags};
+            cu.launch(renderKernel,displayStream,target.width,target.height,args);
         }
-        cu.diagnosticSync(displayStream,horizon>0?"Diagnostic: extrapolation kernel":"Diagnostic: real-frame kernel");
-        // Unmap orders the next graphics use after the CUDA write. Present
-        // needs no CPU readback, intermediate texture copy, or cuCtxSynchronize.
-        cu.check(cu.unmap(1,&out.interop,displayStream),"Hand CUDA output to DXGI");
-        out.mapped=false;
+        cu.diagnosticSync(displayStream,"Diagnostic: fused presentation kernel");
+        cu.check(cu.unmap(resourceCount,resources,displayStream),"Hand color/guidance to D3D11 together");
+        out.mapped=false;out.depthMapped=false;
         dx.Present(out.view.Get(),depthReady?out.depthView.Get():nullptr,flags);
         outputIndex=(outputIndex+1)%outputs.size();
     }
