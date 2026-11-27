@@ -57,11 +57,13 @@ constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
     kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109,
-    kWarp = 110,kHud = 111,kGun = 112;
+    kWarp = 110,kHud = 111,kGun = 112,kReflex = 113;
 constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
-HWND g_refresh{},g_warp{},g_hud{},g_gun{};
+HWND g_refresh{},g_warp{},g_hud{},g_gun{},g_reflex{},g_reflexStatus{};
+std::atomic<bool> g_reflexEnabled{true};
+std::atomic<ReflexState> g_reflexState{ReflexState::Idle};
 std::atomic<bool> g_warpEnabled{true},g_hudEnabled{true},g_gunEnabled{true};
 HFONT g_font{},g_fontBold{},g_fontSmall{},g_fontHero{};
 HBRUSH g_bgBrush{},g_fieldBrush{},g_panelBrush{};
@@ -279,7 +281,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
         Check(dev11->CreateBuffer(&layout,nullptr,&constants),"Create DXGI image layout");
         SetStride();
     }
-    ~DxDevices() { try{DrainWarp();}catch(...){warp.reset();} if (frameReady) CloseHandle(frameReady); }
+    ~DxDevices() { reflex.Disable();g_reflexState.store(ReflexState::Idle);try{DrainWarp();}catch(...){warp.reset();} if (frameReady) CloseHandle(frameReady); }
     void SetStride() {
         const UINT data[4]={screenW,0,0,0};
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,data,0,0);
@@ -336,7 +338,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
         }
         reflex.Marker(RENDERSUBMIT_END);reflex.Marker(PRESENT_START);
         const HRESULT presented=swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0);
-        reflex.Marker(PRESENT_END);Check(presented,"DXGI low-latency Present");
+        reflex.Marker(PRESENT_END);g_reflexState.store(reflex.State(),std::memory_order_relaxed);Check(presented,"DXGI low-latency Present");
     }
 
 };
@@ -546,7 +548,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
-                if(wasFocused){fgwarp::acceptInput=false;fgwarp::resetInput();dx.ResetWarpHistory();}
+                if(wasFocused){fgwarp::acceptInput=false;fgwarp::resetInput();dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -786,7 +788,7 @@ void DrawUi(HWND hwnd,HDC dc){
     PaintRoundBox(dc,20,210,cr.right-20,306,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,316,cr.right-20,390,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,397,cr.right-20,476,kPanel,RGB(40,58,70));
-    PaintRoundBox(dc,20,483,cr.right-20,585,kPanel,RGB(40,58,70));
+    PaintRoundBox(dc,20,483,cr.right-20,645,kPanel,RGB(40,58,70));
     HICON icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(kIconId));
     if(icon)DrawIconEx(dc,24,18,icon,52,52,0,nullptr,DI_NORMAL);
     SetBkMode(dc,TRANSPARENT);
@@ -882,7 +884,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_warp=checkbox(L"AI depth + NVIDIA Frame Warp (0-5 ms)",36,493,480,kWarp);
         g_hud=checkbox(L"Automatic HUD protection",36,524,250,kHud);
         g_gun=checkbox(L"Automatic gun protection",285,524,250,kGun);
-        UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,552,490,20,true);
+        g_reflex=checkbox(L"NVIDIA Reflex + Boost",36,552,490,kReflex);
+        g_reflexStatus=UiLabel(hwnd,L"Reflex: ready (start FG to verify)",36,581,490,20,true);
+        UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,610,490,20,true);
         // The timer is a fallback for a missed/late worker completion message.
         // It never enables Start while NvFBC is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
@@ -917,6 +921,24 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         DrawUi(hwnd,dc);EndPaint(hwnd,&ps);return 0;
     }
     case WM_TIMER:
+        if(wp==kLauncherLifecycleTimer&&g_reflexStatus){
+            static int last=-1;
+            const auto state=g_reflexState.load(std::memory_order_relaxed);
+            if(last!=int(state)){
+                last=int(state);const wchar_t* label=L"Reflex: ready (start FG to verify)";
+                switch(state){
+                case ReflexState::Off:label=L"Reflex: off";break;
+                case ReflexState::Active:label=L"Reflex + Boost: NVAPI accepted / sleep OK";break;
+                case ReflexState::ModeRejected:label=L"Reflex: driver rejected sleep mode";break;
+                case ReflexState::InitFailed:label=L"Reflex: NVAPI initialization failed";break;
+                case ReflexState::SleepRejected:label=L"Reflex: mode accepted, sleep rejected";break;
+                case ReflexState::MarkersRejected:label=L"Reflex: mode/sleep accepted, markers rejected";break;
+                case ReflexState::ActiveNoSleep:label=L"Reflex: mode accepted, sleep disabled (test)";break;
+                default:break;
+                }
+                SetWindowTextW(g_reflexStatus,label);
+            }
+        }
         if(wp==kLauncherLifecycleTimer &&
            g_engineFinished.load(std::memory_order_acquire) &&
            !IsWindowEnabled(g_start)){
@@ -935,6 +957,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
+        case kReflex:if(HIWORD(wp)==BN_CLICKED){g_reflexEnabled.store(SendMessageW(g_reflex,BM_GETCHECK,0,0)==BST_CHECKED);if(!g_running.load())g_reflexState.store(g_reflexEnabled.load()?ReflexState::Idle:ReflexState::Off);}break;
         case kWarp:if(HIWORD(wp)==BN_CLICKED)g_warpEnabled.store(SendMessageW(g_warp,BM_GETCHECK,0,0)==BST_CHECKED);break;
         case kHud:if(HIWORD(wp)==BN_CLICKED)g_hudEnabled.store(SendMessageW(g_hud,BM_GETCHECK,0,0)==BST_CHECKED);break;
         case kGun:if(HIWORD(wp)==BN_CLICKED)g_gunEnabled.store(SendMessageW(g_gun,BM_GETCHECK,0,0)==BST_CHECKED);break;
@@ -1047,7 +1070,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     c.hbrBackground=CreateSolidBrush(kBackground);
     if(!RegisterClassW(&c))return 1;
     g_control=CreateWindowW(c.lpszClassName,L"FG",WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX&~WS_THICKFRAME,
-        CW_USEDEFAULT,CW_USEDEFAULT,570,650,nullptr,nullptr,instance,nullptr);
+        CW_USEDEFAULT,CW_USEDEFAULT,570,710,nullptr,nullptr,instance,nullptr);
     if(!g_control)return 2;
     RegisterHotKey(g_control,kEmergencyHotkey,MOD_CONTROL|MOD_SHIFT,VK_F12);
     HICON appIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));

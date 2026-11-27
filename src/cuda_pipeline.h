@@ -271,7 +271,7 @@ public:
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
     void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady) {
-        dx.reflex.Begin(dx.dev11.Get(),g_warpEnabled.load(std::memory_order_relaxed));
+        dx.reflex.Begin(dx.dev11.Get(),g_reflexEnabled.load(std::memory_order_relaxed));
         auto& out=outputs[outputIndex];
         auto& state=states[current];
         SourcePair images=pair(current,previous,horizon>0);
