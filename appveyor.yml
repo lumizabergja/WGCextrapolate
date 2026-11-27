@@ -4,27 +4,20 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-cuda-ai-reflex2-direct-gpu
+    - fg-nvpresent-probe
 clone_depth: 1
-install:
-  - ps: .\Install-ZeroCopy-CUDA.ps1
 build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
-      $env:CUDA_PATH = Join-Path $env:ProgramFiles 'NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+      & .\Fetch-NVAPI.ps1
       $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
       $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-      if (!$vs) { throw 'MSVC missing' }
       $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
-      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd --blackwell && call Test.cmd')
-      if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
-      if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
+      & cmd.exe /d /s /c ('call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /MT /EHsc /I nvapi-sdk probe\nvpresent_probe.cpp nvapi-sdk\nvapi64.lib /Fe:probe\FG-NvPresent-Probe.exe /link d3d11.lib dxgi.lib user32.lib gdi32.lib')
+      if ($LASTEXITCODE -ne 0) { throw "Probe compilation failed: $LASTEXITCODE" }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Direct-GPU-Update.zip' -Force
-      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Fetch-NVAPI.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1','Start-FG.ps1','Start-FG.cmd','Export-Portable-Model.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Direct-GPU-Source.zip' -Force
+      Compress-Archive -Path 'probe/FG-NvPresent-Probe.exe','probe/Run-Probe.ps1','probe/Run-Probe.cmd','probe/README.txt' -DestinationPath 'artifacts/FG-NvPresent-Probe-Windows-x64.zip' -Force
+      Compress-Archive -Path 'probe/nvpresent_probe.cpp','probe/Run-Probe.ps1','probe/Run-Probe.cmd','probe/README.txt','Fetch-NVAPI.ps1','appveyor.yml' -DestinationPath 'artifacts/FG-NvPresent-Probe-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-CUDA-AI-Reflex2-Direct-GPU-Source.zip
-    name: FG-CUDA-AI-Reflex2-Direct-GPU-Source
-  - path: artifacts\FG-CUDA-AI-Reflex2-Direct-GPU-Update.zip
-    name: FG-CUDA-AI-Reflex2-Direct-GPU-Update
+  - path: artifacts\*.zip
