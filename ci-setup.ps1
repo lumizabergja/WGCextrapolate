@@ -1,11 +1,10 @@
 $ErrorActionPreference = 'Stop'
 function Invoke-CheckedGit {
     param([Parameter(Mandatory=$true)][string]$Step, [Parameter(Mandatory=$true)][string[]]$GitArgs)
-    # Windows PowerShell 5.1 can promote normal native stderr into ErrorRecords.
-    # Scope Continue to Git only, and check the actual native exit status.
-    $ErrorActionPreference = 'Continue'
-    $PSNativeCommandUseErrorActionPreference = $false
-    & git.exe @GitArgs 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+    # Run Git through cmd so PowerShell never interprets Git stderr as ErrorRecords.
+    $quoted = @($GitArgs | ForEach-Object { '"' + $_ + '"' })
+    $command = 'git.exe ' + ($quoted -join ' ') + ' 2>&1'
+    & cmd.exe /d /c $command
     $code = $LASTEXITCODE
     if ($code -ne 0) { throw "$Step failed (git exit $code)" }
 }
