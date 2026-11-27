@@ -4,7 +4,7 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-cuda-adaptive-math-reflex2
+    - fg-cuda-reflex-boost-clean
 clone_depth: 1
 install:
   - ps: .\Install-ZeroCopy-CUDA.ps1
@@ -19,17 +19,9 @@ build_script:
       & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd --blackwell && call Test.cmd')
       if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
       if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
-      New-Item -ItemType Directory -Force artifacts,portable | Out-Null
-      Copy-Item 'bin/FG.exe','README.md','Start-FG.ps1','Start-FG.cmd' portable
-      & .\Export-Portable-Model.ps1
-      Compress-Archive -Path 'portable/*' -DestinationPath 'artifacts/FG-Adaptive-Math-Reflex2-Portable.zip' -Force
-      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-Adaptive-Math-Reflex2-Update.zip' -Force
-      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Fetch-NVAPI.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1','Start-FG.ps1','Start-FG.cmd','Export-Portable-Model.ps1' -DestinationPath 'artifacts/FG-Adaptive-Math-Reflex2-Source.zip' -Force
+      New-Item -ItemType Directory -Force artifacts | Out-Null
+      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-Reflex-Boost-Clean-Windows-x64.zip' -Force
+      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-NVAPI.ps1' -DestinationPath 'artifacts/FG-Reflex-Boost-Clean-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-Adaptive-Math-Reflex2-Portable.zip
-    name: FG-Adaptive-Math-Reflex2-Portable
-  - path: artifacts\FG-Adaptive-Math-Reflex2-Source.zip
-    name: FG-Adaptive-Math-Reflex2-Source
-  - path: artifacts\FG-Adaptive-Math-Reflex2-Update.zip
-    name: FG-Adaptive-Math-Reflex2-Update
+  - path: artifacts\*.zip

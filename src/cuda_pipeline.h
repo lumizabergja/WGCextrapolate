@@ -12,8 +12,7 @@ struct FlowBuffer {
 class CudaPipeline {
     struct FrameState {
         FlowBuffer input, vectors;
-        CUdeviceptr sceneCut{},probes{};
-        fgmath::Probe* hostProbes{};
+        CUdeviceptr sceneCut{};
         CUevent ready{},lastDisplayRead{},lumaReady{};
         CUtexObject texture{},flowTexture{};
         UINT textureWidth{},textureHeight{},texturePitch{};
@@ -24,29 +23,16 @@ class CudaPipeline {
         ComPtr<ID3D11ShaderResourceView> view;
         CUgraphicsResource interop{};
         bool mapped{};
-        ComPtr<ID3D11Buffer> depthPixels;
-        ComPtr<ID3D11ShaderResourceView> depthView;
-        CUgraphicsResource depthInterop{};
-        bool depthMapped{};
     };
     const CudaDriver& cu;
     const CaptureCuda& capture;
-    std::unique_ptr<AiDepth> ai;
-    bool aiUnavailable{},useFlat=true;
-    fgmath::Calibrator calibration;
-    uint64_t fittedSequence{};
-    fgmath::Fit latestFit{};
-    int64_t fitTime{};
     SystemLibrary flowLibrary{L"nvofapi64.dll"};
     NV_OF_CUDA_API_FUNCTION_LIST api{};
     NvOFHandle flow{};
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{},directKernel{},probeKernel{};
-    CUgraphicsResource directResources[3]{};
-    CUdeviceptr directPlanes[3]{};size_t directPitches[3]{};
-    bool directAttempted{},directReady{},directMapped{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{};
     std::array<FrameState,kNumCapture> states{};
     std::array<OutputBuffer,2> outputs{};
     unsigned outputIndex{};
@@ -104,8 +90,6 @@ class CudaPipeline {
             // texture view over an externally managed pitched resource.
             state.flowTexture=0;
             cu.check(cu.allocate(&state.sceneCut,sizeof(unsigned)),"Allocate CUDA scene flag");
-            cu.check(cu.allocate(&state.probes,sizeof(fgmath::Probe)*fgmath::count),"Allocate flow probes");
-            cu.check(cu.hostAlloc(reinterpret_cast<void**>(&state.hostProbes),sizeof(fgmath::Probe)*fgmath::count),"Allocate pinned flow probes");
         }
     }
     void stage(int index) {
@@ -140,18 +124,10 @@ class CudaPipeline {
         }
         return images;
     }
-    void FreeDirect() noexcept {
-        if(directMapped){cu.unmap(3,directResources,displayStream);directMapped=false;}
-        for(unsigned i=0;i<3;++i){if(directResources[i])cu.unregisterD3D(directResources[i]);if(directPlanes[i])cu.freeMemory(directPlanes[i]);directResources[i]=nullptr;directPlanes[i]=0;directPitches[i]=0;}
-        directReady=false;
-    }
     void freeOutputs() noexcept {
-        FreeDirect();directAttempted=false;
         for (auto& out:outputs) {
             if (out.mapped) cu.unmap(1,&out.interop,displayStream);
             if (out.interop) cu.unregisterD3D(out.interop);
-            if(out.depthMapped)cu.unmap(1,&out.depthInterop,displayStream);
-            if(out.depthInterop)cu.unregisterD3D(out.depthInterop);
             out={};
         }
     }
@@ -188,9 +164,6 @@ public:
         cu.check(cu.getFunction(&stageKernel,module,"stageFlowInput"),"Load NvOFA input kernel");
         cu.check(cu.getFunction(&sceneKernel,module,"sceneGate"),"Load CUDA scene-cut kernel");
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
-        cu.check(cu.getFunction(&fusedKernel,module,"renderFused"),"Load fused color/depth/motion kernel");
-        cu.check(cu.getFunction(&directKernel,module,"renderDirect"),"Load direct texture staging kernel");
-        cu.check(cu.getFunction(&probeKernel,module,"cameraProbes"),"Load camera fit probes");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -215,35 +188,6 @@ public:
     void ReleaseOutputs() {
         cu.check(cu.syncStream(displayStream),"Finish CUDA output before resize");
         freeOutputs();
-    }
-    void PollDepth(){if(ai)ai->Poll();}
-    void ResetCamera(){calibration.reset();latestFit={};fittedSequence=0;fitTime=0;useFlat=true;}
-    void UpdateCamera(DxDevices& dx,int current,bool flowReady,int64_t previousTime,int64_t currentTime){
-        if(flowReady&&fittedSequence!=capture.frames[current].sequence){
-            const auto& frame=capture.frames[current];
-            latestFit=fgmath::fit(states[current].hostProbes,double(frame.width)/frame.height);
-            fittedSequence=frame.sequence;fitTime=currentTime;
-            if(latestFit.rotation)calibration.observe(latestFit,dx.input->DelayedPairs(previousTime,currentTime,dx.ticksPerMs));
-        }
-        // Conservative translation hint; keyboard is read only while target is foreground.
-        bool moving=false;for(int key:std::array<int,6>{'W','A','S','D',VK_SPACE,VK_CONTROL})if(GetAsyncKeyState(key)&0x8000)moving=true;
-        const bool recent=fitTime&&currentTime-fitTime>=0&&double(currentTime-fitTime)/dx.ticksPerMs<75.;
-        useFlat=!moving&&recent&&latestFit.rotation;
-        dx.cameraDelayMs=calibration.trusted?calibration.delayMs:0.;
-        dx.cameraGain=calibration.trusted?calibration.gain:fgmath::nominal;
-    }
-    bool DepthReady(int current,int previous,bool flowReady){
-        PollDepth();return ai&&(ai->Ready(current,capture.frames[current].sequence)||(flowReady&&previous>=0&&ai->Ready(previous,capture.frames[previous].sequence)));
-    }
-    void PrepareDepth(int current,int previous,bool flowReady,bool urgent){
-        if(useFlat||aiUnavailable||urgent)return;
-        wchar_t disable[4]{};if(GetEnvironmentVariableW(L"FG_AI_DEPTH",disable,4)==1&&disable[0]==L'0'){aiUnavailable=true;return;}
-        if(!ai){try{ai=std::make_unique<AiDepth>(cu,capture.context);ai->Open(module);}catch(...){ai.reset();aiUnavailable=true;return;}}
-        ai->Poll();if(urgent)return;
-        // Skip only a contiguous source whose previous exact depth is ready
-        // and whose backward flow is already published. Never chain stale depth.
-        if(flowReady&&previous>=0&&capture.frames[current].sequence==capture.frames[previous].sequence+1&&ai->Ready(previous,capture.frames[previous].sequence))return;
-        ai->Submit(current,capture.frames[current]);
     }
     void NewFrame(int index,bool prepareLuma) {
         const auto& frame=capture.frames[index];
@@ -281,8 +225,7 @@ public:
         const auto& state=states[index];
         // A source slot cannot be overwritten until BOTH its display and
         // grayscale reads finish; the caller also checks active OFA ownership.
-        PollDepth();
-        return (!ai||!ai->UsesSlot(index)) && cu.complete(state.lastDisplayRead) && cu.complete(state.lumaReady);
+        return cu.complete(state.lastDisplayRead) && cu.complete(state.lumaReady);
     }
     void Calculate(int current, int previous) {
         const auto& frame=capture.frames[current];
@@ -307,114 +250,30 @@ public:
         void* args[]={&images,&state.sceneCut};
         cu.check(cu.launchKernel(sceneKernel,1,1,1,1,1,1,0,flowOutputStream,args,nullptr),"Evaluate V15 scene cut");
         cu.diagnosticSync(flowOutputStream,"Diagnostic: scene gate");
-        void* probeArgs[]={&images,&state.sceneCut,&state.probes};
-        cu.check(cu.launchKernel(probeKernel,1,1,1,64,1,1,0,flowOutputStream,probeArgs,nullptr),"Sample camera flow");
-        cu.check(cu.copyHost(state.hostProbes,state.probes,sizeof(fgmath::Probe)*fgmath::count,flowOutputStream),"Read small camera sample");
-        cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow and camera sample");
+        cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
-    bool PrepareDirect(DxDevices& dx){
-        if(directAttempted)return directReady;
-        directAttempted=true;
-        wchar_t opt[4]{};if(GetEnvironmentVariableW(L"FG_DIRECT_TEXTURE",opt,4)==1&&opt[0]==L'0')return false;
-        dx.EnsureWarp();
-        ID3D11Resource* textures[]={dx.warp->color.Get(),dx.warp->depth.Get(),dx.warp->motion.Get()};
-        for(unsigned i=0;i<3;++i){
-            CUresult r=cu.registerD3D(&directResources[i],textures[i],CU_GRAPHICS_REGISTER_FLAGS_NONE);
-            if(r!=CUDA_SUCCESS){FreeDirect();return false;}
-            r=cu.allocatePitch(&directPlanes[i],&directPitches[i],size_t(dx.screenW)*4,dx.screenH,4);
-            if(r!=CUDA_SUCCESS||directPitches[i]>UINT_MAX){FreeDirect();return false;}
-        }
-        directReady=true;return true;
-    }
-    bool DrawDirect(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady,unsigned flags,bool aiReady){
-        if(!PrepareDirect(dx))return false;
-        // Register and map only owned NGX input textures, not capture surfaces.
-        CUresult mapped=cu.map(3,directResources,displayStream);
-        if(mapped!=CUDA_SUCCESS){
-            if(mapped==CUDA_ERROR_INVALID_HANDLE||mapped==CUDA_ERROR_INVALID_VALUE||mapped==CUDA_ERROR_NOT_SUPPORTED){FreeDirect();return false;}
-            cu.check(mapped,"Map direct NGX textures");
-        }
-        directMapped=true;
-        CUarray arrays[3]{};
-        for(unsigned i=0;i<3;++i){
-            CUDA_ARRAY_DESCRIPTOR desc{};
-            if(cu.mappedArray(&arrays[i],directResources[i],0,0)!=CUDA_SUCCESS||
-               cu.arrayDesc(&desc,arrays[i])!=CUDA_SUCCESS||
-               desc.Width!=dx.screenW||desc.Height!=dx.screenH||
-               (i==0&&(desc.Format!=CU_AD_FORMAT_UNSIGNED_INT8||desc.NumChannels!=4))||
-               (i==1&&(desc.Format!=CU_AD_FORMAT_FLOAT||desc.NumChannels!=1))||
-               (i==2&&(desc.Format!=CU_AD_FORMAT_HALF||desc.NumChannels!=2))){
-                cu.check(cu.unmap(3,directResources,displayStream),"Unmap unsupported direct textures");
-                directMapped=false;FreeDirect();return false;
-            }
-        }
-        const bool needFlow=horizon>0||flowReady;
-        auto& state=states[current];SourcePair images=pair(current,previous,needFlow);CUdeviceptr cut=needFlow?state.sceneCut:0;
-        if(needFlow)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order direct output after optical flow");
-        OutputImage target{directPlanes[0],dx.screenW,dx.screenH},guidance{directPlanes[1],dx.screenW,dx.screenH};
-        unsigned cp=unsigned(directPitches[0]),dp=unsigned(directPitches[1]),mp=unsigned(directPitches[2]);
-        unsigned previousDepth=aiReady&&!ai->Ready(current,capture.frames[current].sequence)?1u:0u;
-        const int depthSlot=previousDepth?previous:current;
-        CUdeviceptr raw=aiReady?ai->Raw(depthSlot):0,range=aiReady?ai->Range(depthSlot):0,motion=directPlanes[2];
-        float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
-        void* args[]={&images,&target,&guidance,&motion,&cp,&dp,&mp,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
-        cu.launch(directKernel,displayStream,target.width,target.height,args);
-        for(unsigned i=0;i<3;++i){
-            CUDA_MEMCPY2D copy{};copy.srcMemoryType=CU_MEMORYTYPE_DEVICE;copy.srcDevice=directPlanes[i];copy.srcPitch=directPitches[i];
-            copy.dstMemoryType=CU_MEMORYTYPE_ARRAY;copy.dstArray=arrays[i];copy.WidthInBytes=size_t(target.width)*4;copy.Height=target.height;
-            cu.check(cu.copy2D(&copy,displayStream),"GPU copy to NGX input texture");
-        }
-        cu.diagnosticSync(displayStream,"Diagnostic: direct NGX input");
-        cu.check(cu.unmap(3,directResources,displayStream),"Hand NGX input textures to D3D11");directMapped=false;
-        dx.Present(nullptr,nullptr,flags,true);return true;
-    }
     void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady) {
         dx.reflex.Begin();
         auto& out=outputs[outputIndex];
         auto& state=states[current];
-        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed);
-        const bool aiReady=depthReady&&!useFlat&&DepthReady(current,previous,flowReady);
-        unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
-        if(depthReady&&DrawDirect(dx,current,previous,horizon,radius,feather,flowReady,flags,aiReady))return;
-        if(depthReady&&!out.depthInterop){
-            const uint64_t elements=uint64_t(dx.screenW)*dx.screenH;
-            if(elements>UINT_MAX/16)throw Error("Guidance output too large");
-            D3D11_BUFFER_DESC d{};d.ByteWidth=UINT(elements*16);d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-            Check(dx.dev11->CreateBuffer(&d,nullptr,&out.depthPixels),"AI depth output buffer");
-            D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=UINT(elements);
-            Check(dx.dev11->CreateShaderResourceView(out.depthPixels.Get(),&v,&out.depthView),"AI depth output view");
-            cu.check(cu.registerD3D(&out.depthInterop,out.depthPixels.Get(),CU_GRAPHICS_REGISTER_FLAGS_NONE),"Register AI depth output");
-        }
-        const bool needFlow=horizon>0||(depthReady&&flowReady);
+        const bool needFlow=horizon>0&&flowReady;
+        if(!needFlow)horizon=0;
         SourcePair images=pair(current,previous,needFlow);CUdeviceptr cut=needFlow?state.sceneCut:0;
         if(needFlow)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order after optical flow");
-        CUgraphicsResource resources[]={out.interop,out.depthInterop};const unsigned resourceCount=depthReady?2u:1u;
-        cu.check(cu.map(resourceCount,resources,displayStream),"Map CUDA color/guidance together");
-        out.mapped=true;out.depthMapped=depthReady;
+        cu.check(cu.map(1,&out.interop,displayStream),"Map CUDA color output");
+        out.mapped=true;
         CUdeviceptr pixels{};size_t bytes=0;
         cu.check(cu.mappedPointer(&pixels,&bytes,out.interop),"Get CUDA output pointer");
         if(!pixels||bytes<uint64_t(dx.screenW)*dx.screenH*4)throw Error("Mapped CUDA output is too small");
         OutputImage target{pixels,dx.screenW,dx.screenH};
-        if(depthReady){
-            CUdeviceptr d{};size_t size=0;
-            cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
-            if(!d||size<uint64_t(target.width)*target.height*16)throw Error("AI depth output too small");
-            OutputImage guidance{d,target.width,target.height};
-            unsigned previousDepth=aiReady&&!ai->Ready(current,capture.frames[current].sequence)?1u:0u;
-            const int depthSlot=previousDepth?previous:current;
-            CUdeviceptr raw=aiReady?ai->Raw(depthSlot):0,range=aiReady?ai->Range(depthSlot):0;
-            float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
-            void* args[]={&images,&target,&guidance,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
-            cu.launch(fusedKernel,displayStream,target.width,target.height,args);
-        }else{
-            void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&flags};
-            cu.launch(renderKernel,displayStream,target.width,target.height,args);
-        }
-        cu.diagnosticSync(displayStream,"Diagnostic: fused presentation kernel");
-        cu.check(cu.unmap(resourceCount,resources,displayStream),"Hand color/guidance to D3D11 together");
-        out.mapped=false;out.depthMapped=false;
-        dx.Present(out.view.Get(),depthReady?out.depthView.Get():nullptr,flags);
+        unsigned flags=0; // no HUD or gun freeze
+        void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&flags};
+        cu.launch(renderKernel,displayStream,target.width,target.height,args);
+        cu.diagnosticSync(displayStream,"Diagnostic: CUDA presentation kernel");
+        cu.check(cu.unmap(1,&out.interop,displayStream),"Hand CUDA color to D3D11");
+        out.mapped=false;
+        dx.Present(out.view.Get());
         outputIndex=(outputIndex+1)%outputs.size();
     }
     ~CudaPipeline() {
@@ -423,15 +282,13 @@ public:
         if (flowInputStream) cu.syncStream(flowInputStream);
         if (flowOutputStream) cu.syncStream(flowOutputStream);
         if (displayStream) cu.syncStream(displayStream);
-        ai.reset();freeOutputs();
+        freeOutputs();
         for (auto& state:states) {
             if(state.texture)cu.destroyTexture(state.texture);
             if(state.flowTexture)cu.destroyTexture(state.flowTexture);
             if (state.input.handle) api.nvOFDestroyGPUBufferCuda(state.input.handle);
             if (state.vectors.handle) api.nvOFDestroyGPUBufferCuda(state.vectors.handle);
             if (state.sceneCut) cu.freeMemory(state.sceneCut);
-            if(state.probes)cu.freeMemory(state.probes);
-            if(state.hostProbes)cu.hostFree(state.hostProbes);
             if (state.lumaReady) cu.destroyEvent(state.lumaReady);
             if (state.ready) cu.destroyEvent(state.ready);
             if (state.lastDisplayRead) cu.destroyEvent(state.lastDisplayRead);

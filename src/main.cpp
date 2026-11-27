@@ -41,10 +41,8 @@
 #include "pixel_types.h"
 #include "display_clock.h"
 #include "gpu_timing.h"
-#include "warp_presenter.h"
 #include <fstream>
 #include <initializer_list>
-#include <NvInferRuntime.h>
 #include <nvapi.h>
 #include "reflex_presenter.h"
 
@@ -58,14 +56,13 @@ constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
     kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109,
-    kWarp = 110,kHud = 111,kGun = 112,kReflex = 113;
+    kReflex = 113;
 constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
-HWND g_refresh{},g_warp{},g_hud{},g_gun{},g_reflex{},g_reflexStatus{};
+HWND g_refresh{},g_reflex{},g_reflexStatus{};
 std::atomic<bool> g_reflexEnabled{true};
 std::atomic<ReflexState> g_reflexState{ReflexState::Idle};
-std::atomic<bool> g_warpEnabled{true},g_hudEnabled{true},g_gunEnabled{true};
 HFONT g_font{},g_fontBold{},g_fontSmall{},g_fontHero{};
 HBRUSH g_bgBrush{},g_fieldBrush{},g_panelBrush{};
 const COLORREF kBackground=RGB(10,14,22),kPanel=RGB(20,27,38),kField=RGB(26,36,49),kText=RGB(233,244,250),kMuted=RGB(145,160,173),kAccent=RGB(61,226,220);
@@ -180,10 +177,8 @@ struct DxDevices {
     bool allowTearing{};
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps,warpPS,depthPS;
-    std::unique_ptr<fgwarp::Presenter> warp;
+    ComPtr<ID3D11PixelShader> ps;
     FgReflex reflex;
-    fgwarp::InputWorker* input{};
     double periodMs=3.125,monitorPeriodMs=3.125;
     ScanoutClock scanout;
     GpuTiming gpuTiming;
@@ -192,21 +187,11 @@ struct DxDevices {
         gpuTiming.Poll(scanout);
         if(++statsCounter%4)return;
         DXGI_FRAME_STATISTICS s{};const HRESULT hr=swap->GetFrameStatistics(&s);
-        if(hr==S_OK&&ticksPerMs>0)scanout.Observe(double(s.SyncQPCTime.QuadPart)/ticksPerMs,s.SyncRefreshCount,double(fgwarp::stamp())/ticksPerMs,monitorPeriodMs);
+        LARGE_INTEGER now{};QueryPerformanceCounter(&now);
+        if(hr==S_OK&&ticksPerMs>0)scanout.Observe(double(s.SyncQPCTime.QuadPart)/ticksPerMs,s.SyncRefreshCount,double(now.QuadPart)/ticksPerMs,monitorPeriodMs);
         else scanout.ResetPhase();
     }
-    uint64_t lastGuidanceSequence{};
-    double lastGuidanceHorizon{};
-    float MotionInterval(uint64_t sequence,double horizon)const{
-        if(!lastGuidanceSequence)return 0.f;
-        if(sequence==lastGuidanceSequence)return float(std::clamp(horizon-lastGuidanceHorizon,0.,2.));
-        if(sequence==lastGuidanceSequence+1)return float(std::clamp(1.+horizon-lastGuidanceHorizon,0.,2.));
-        return 0.f;
-    }
-    uint64_t warpSequence{}; int64_t warpPrevious{},warpCurrent{};
-    double warpHorizon{},ticksPerMs{},cameraDelayMs{},cameraGain=fgmath::nominal;UINT warpSrcW{},warpSrcH{};
-    void ResetWarpHistory(){lastGuidanceSequence=0;lastGuidanceHorizon=0;if(warp)warp->resetHistory();}
-    void DrainWarp(){if(!warp)return;ctx11->ClearState();D3D11_QUERY_DESC q{D3D11_QUERY_EVENT,0};ComPtr<ID3D11Query> event;Check(dev11->CreateQuery(&q,&event),"NGX shutdown query");ctx11->End(event.Get());ctx11->Flush();HRESULT r;while((r=ctx11->GetData(event.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH))==S_FALSE)Sleep(1);Check(r,"NGX drain");warp.reset();}
+    double ticksPerMs{};
     ComPtr<ID3D11Buffer> constants;
     UINT screenW{},screenH{},swapFlags{};
     ComPtr<IDXGIAdapter> matchingAdapter;
@@ -264,10 +249,6 @@ struct DxDevices {
         // only scans the registered pixel buffer into the same flip-model RTV.
         static const char* shader=R"HLSL(
 Buffer<float4> pixels : register(t0);
-Texture2D<float4> warped : register(t1);
-Buffer<float4> aiDepth : register(t2);
-Texture2D<float4> unwarped : register(t3);
-Texture2D<float> freezeMask : register(t4);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
@@ -275,15 +256,6 @@ float4 VS(uint id : SV_VertexID) : SV_Position {
 float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
 }
-float4 WarpPS(float4 position:SV_Position):SV_Target {
-    int3 p=int3(int2(position.xy),0);float a=freezeMask.Load(p);
-    // Branch for hard freeze: never allow NGX output to contaminate protected pixels.
-    if(a>=1.0)return unwarped.Load(p);
-    float4 c=warped.Load(p);
-    return a>0?lerp(c,unwarped.Load(p),a):c;
-}
-struct Guidance {float4 color:SV_Target0;float depth:SV_Target1;float2 motion:SV_Target2;};
-Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uint(position.x);float4 p=aiDepth.Load(i);Guidance g;g.color=pixels.Load(i).bgra;g.depth=p.x;g.motion=p.yz;return g;}
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",
@@ -292,25 +264,19 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
                          D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&pixel,nullptr),"Compile DXGI pixel shader");
         Check(dev11->CreateVertexShader(vertex->GetBufferPointer(),vertex->GetBufferSize(),nullptr,&vs),"Create vertex shader");
         Check(dev11->CreatePixelShader(pixel->GetBufferPointer(),pixel->GetBufferSize(),nullptr,&ps),"Create pixel shader");
-        ComPtr<ID3DBlob> warpPixel;
-        Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"WarpPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&warpPixel,nullptr),"Compile NGX output shader");
-        Check(dev11->CreatePixelShader(warpPixel->GetBufferPointer(),warpPixel->GetBufferSize(),nullptr,&warpPS),"Create NGX output shader");
-        ComPtr<ID3DBlob> depthPixel;
-        Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"DepthPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&depthPixel,nullptr),"Compile AI depth shader");
-        Check(dev11->CreatePixelShader(depthPixel->GetBufferPointer(),depthPixel->GetBufferSize(),nullptr,&depthPS),"Create AI depth shader");
         D3D11_BUFFER_DESC layout{};
         layout.ByteWidth=16; layout.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&layout,nullptr,&constants),"Create DXGI image layout");
         SetStride();
     }
-    ~DxDevices() { reflex.Disable();g_reflexState.store(ReflexState::Idle);try{DrainWarp();}catch(...){warp.reset();} if (frameReady) CloseHandle(frameReady); }
+    ~DxDevices() { reflex.Disable();g_reflexState.store(ReflexState::Idle);if (frameReady) CloseHandle(frameReady); }
     void SetStride() {
         const UINT data[4]={screenW,0,0,0};
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,data,0,0);
     }
     void ResizeOutput(UINT width, UINT height) {
         if (width==screenW && height==screenH) return;
-        DrainWarp();scanout.ResetPhase();
+        scanout.ResetPhase();
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
         rtv.Reset();
         ctx11->Flush();
@@ -320,48 +286,24 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
         Check(dev11->CreateRenderTargetView(back.Get(),nullptr,&rtv),"Create resized RTV");
         screenW=width; screenH=height; SetStride();
     }
-    void DrawTo(ID3D11ShaderResourceView* image,ID3D11RenderTargetView* target,bool texture){
+    void DrawTo(ID3D11ShaderResourceView* image,ID3D11RenderTargetView* target){
         D3D11_VIEWPORT viewport{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&viewport);
         ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);
-        ctx11->PSSetShader(texture?warpPS.Get():ps.Get(),nullptr,0);
+        ctx11->PSSetShader(ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-        ctx11->PSSetShaderResources(texture?1:0,1,&image);
-        if(texture){ID3D11ShaderResourceView* protectedViews[]={warp->colorSRV.Get(),warp->maskSRV.Get()};ctx11->PSSetShaderResources(3,2,protectedViews);}
+        ctx11->PSSetShaderResources(0,1,&image);
         ctx11->Draw(3,0);
-        if(texture){ID3D11ShaderResourceView* empty[2]{};ctx11->PSSetShaderResources(3,2,empty);}
         ID3D11ShaderResourceView* none=nullptr;
-        ctx11->PSSetShaderResources(texture?1:0,1,&none);
+        ctx11->PSSetShaderResources(0,1,&none);
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
     }
-    void EnsureWarp(){
-        if(!warp){warp=std::make_unique<fgwarp::Presenter>();warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);}
-    }
-    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage,unsigned freezeFlags,bool direct=false){
-        if(direct||(g_warpEnabled.load(std::memory_order_relaxed)&&depthImage)){
-            EnsureWarp();gpuTiming.Begin();
-            if(!direct){
-            D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};ctx11->RSSetViewports(1,&vp);
-            ID3D11RenderTargetView* guidance[]={warp->inputRTV.Get(),warp->depthRTV.Get(),warp->motionRTV.Get()};
-            ctx11->OMSetRenderTargets(3,guidance,nullptr);
-            ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
-            ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(0,1,&image);ctx11->PSSetShaderResources(2,1,&depthImage);
-            ctx11->Draw(3,0);ctx11->ClearState();
-            }
-            warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
-                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,cameraDelayMs,cameraGain,periodMs,monitorPeriodMs,allowTearing,scanout,gpuTiming);
-            DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
-            gpuTiming.End();
-            lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
-        }else{
-            // Depth may not be ready for the newest real image. Never wait or
-            // destroy/recreate NGX on a temporary miss.
-            ResetWarpHistory();
-            DrawTo(image,rtv.Get(),false);
-        }
+    void Present(ID3D11ShaderResourceView* image){
+        gpuTiming.Begin();
+        DrawTo(image,rtv.Get());
+        gpuTiming.Late();gpuTiming.End();
         reflex.Marker(RENDERSUBMIT_END);reflex.Marker(PRESENT_START);
         const HRESULT presented=swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0);
         reflex.Marker(PRESENT_END);PollTiming();g_reflexState.store(reflex.State(),std::memory_order_relaxed);Check(presented,"DXGI low-latency Present");
@@ -371,7 +313,6 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
 
 #include "cuda_driver.h"
 #include "capture_cuda.h"
-#include "ai_depth.h"
 #include "cuda_pipeline.h"
 #include "async_flow.h"
 
@@ -438,7 +379,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(tracked.Exited())return SessionOutcome::Stop;
         // CUDA/DX11 shared resources are created on this single render thread.
         OverlayWindow overlay;overlay.Init(game.window);
-        fgwarp::InputWorker input(game.pid);
         MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);
         UINT monitorHz=320;
         if(GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)){
@@ -446,7 +386,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>=30)
                 monitorHz=dm.dmDisplayFrequency;
         }
-        DxDevices dx; dx.input=&input;dx.monitorPeriodMs=1000./double(monitorHz);dx.Init(overlay.hwnd,overlay.width,overlay.height);
+        DxDevices dx; dx.monitorPeriodMs=1000./double(monitorHz);dx.Init(overlay.hwnd,overlay.width,overlay.height);
         CudaDriver cuda;
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
@@ -524,7 +464,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double sourcePeriod=1.0/60.0, pairPeriod=sourcePeriod;
         DisplayClock displayClock;
         LARGE_INTEGER previousCaptureAt{};
-        int64_t previousPoseTime=0,currentPoseTime=0;
         int current=-1,previous=-1;
         bool realFramePending=false;
         bool pairEligible=false;
@@ -571,7 +510,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
-                if(wasFocused){input.Focus(false);dx.scanout.ResetPhase();dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
+                if(wasFocused){dx.scanout.ResetPhase();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -581,8 +520,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
-                input.Focus(true);gpu.ResetCamera();dx.scanout.ResetPhase();dx.ResetWarpHistory();
-                previousPoseTime=currentPoseTime=0;
+                dx.scanout.ResetPhase();
                 resumeWarmup=2;
                 displayClock.reset();
                 QueryPerformanceCounter(&last);
@@ -614,7 +552,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                             sourcePeriod=0.90*sourcePeriod+0.10*sample;
                     }else pairPeriod=sourcePeriod;
                 }
-                previousPoseTime=currentPoseTime;currentPoseTime=captureTime.QuadPart;
                 previousCaptureAt=captureTime;
                 last=captureTime;
                 realFramePending=true;
@@ -639,14 +576,11 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
                 const bool useFlow=pairEligible && extrapolate;
                 const auto sequence=capture.frames[current].sequence;
-                gpu.PollDepth();
                 if(useFlow){
                     gpu.PreparePair(current,previous);
                     flow.Request(current,previous,sequence);
                 }
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
-                gpu.UpdateCamera(dx,current,flowReady,previousPoseTime,currentPoseTime);
-                const bool cameraReady=g_warpEnabled.load(std::memory_order_relaxed)&&extrapolate;
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);
                 if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65){
@@ -660,13 +594,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // frame takes the next display slot (up to 20% early), not an
                 // additional slot that would crowd out extrapolated frames.
                 const bool doPresent=extrapolate
-                    ? (realFramePending || flowReady || cameraReady) && displayClock.due(clockNow,realFramePending,realFramePending?0.:dx.scanout.EarlyMs(step*1000.)/1000.)
+                    ? (realFramePending || flowReady) && displayClock.due(clockNow,realFramePending,realFramePending?0.:dx.scanout.EarlyMs(step*1000.)/1000.)
                     : realFramePending;
-                if(g_warpEnabled.load(std::memory_order_relaxed)){
-                    const double slack=(displayClock.deadline()-clockNow)*1000.;
-                    const bool depthUrgent=doPresent||(dx.scanout.Measured()&&!dx.scanout.DepthBudget(slack,step*1000.));
-                    gpu.PrepareDepth(current,previous,flowReady,depthUrgent);
-                }
                 if(doPresent){
                     // Queue target 0: if a previous Present still occupies the
                     // only allowed DXGI frame slot, keep the newest real source
@@ -704,8 +633,6 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     const double age=double(now.QuadPart-last.QuadPart)/double(freq.QuadPart);
                     const float prediction=(realFramePending||!flowReady)?0.f:
                         float(std::clamp(age/pairPeriod,0.0,1.25));
-                    dx.warpSequence=sequence;dx.warpPrevious=previousPoseTime;dx.warpCurrent=currentPoseTime;
-                    dx.warpHorizon=prediction;dx.warpSrcW=capture.frames[current].width;dx.warpSrcH=capture.frames[current].height;
                     gpu.Draw(dx,current,previous>=0?previous:current,prediction,
                              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
                              float(g_centerFeatherPx.load(std::memory_order_relaxed)),flowReady);
@@ -820,7 +747,7 @@ void DrawUi(HWND hwnd,HDC dc){
     PaintRoundBox(dc,20,210,cr.right-20,306,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,316,cr.right-20,390,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,397,cr.right-20,476,kPanel,RGB(40,58,70));
-    PaintRoundBox(dc,20,483,cr.right-20,645,kPanel,RGB(40,58,70));
+    PaintRoundBox(dc,20,483,cr.right-20,557,kPanel,RGB(40,58,70));
     HICON icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(kIconId));
     if(icon)DrawIconEx(dc,24,18,icon,52,52,0,nullptr,DI_NORMAL);
     SetBkMode(dc,TRANSPARENT);
@@ -912,12 +839,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             HWND c=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x,y,width,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
             StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
         };
-        g_warp=checkbox(L"Adaptive depth + NVIDIA Frame Warp",36,493,480,kWarp);
-        g_hud=checkbox(L"Freeze HUD regions",36,524,250,kHud);
-        g_gun=checkbox(L"Freeze gun region",285,524,250,kGun);
-        g_reflex=checkbox(L"NVIDIA Reflex + Boost",36,552,490,kReflex);
-        g_reflexStatus=UiLabel(hwnd,L"Reflex: ready (start FG to verify)",36,581,490,20,true);
-        UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,610,490,20,true);
+        g_reflex=checkbox(L"NVIDIA Reflex + Boost",36,493,490,kReflex);
+        g_reflexStatus=UiLabel(hwnd,L"Reflex: ready (start FG to verify)",36,524,490,20,true);
         // The timer is a fallback for a missed/late worker completion message.
         // It never enables Start while NvFBC is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
@@ -989,9 +912,6 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:{
         switch(LOWORD(wp)){
         case kReflex:if(HIWORD(wp)==BN_CLICKED){g_reflexEnabled.store(SendMessageW(g_reflex,BM_GETCHECK,0,0)==BST_CHECKED);if(!g_running.load())g_reflexState.store(g_reflexEnabled.load()?ReflexState::Idle:ReflexState::Off);}break;
-        case kWarp:if(HIWORD(wp)==BN_CLICKED)g_warpEnabled.store(SendMessageW(g_warp,BM_GETCHECK,0,0)==BST_CHECKED);break;
-        case kHud:if(HIWORD(wp)==BN_CLICKED)g_hudEnabled.store(SendMessageW(g_hud,BM_GETCHECK,0,0)==BST_CHECKED);break;
-        case kGun:if(HIWORD(wp)==BN_CLICKED)g_gunEnabled.store(SendMessageW(g_gun,BM_GETCHECK,0,0)==BST_CHECKED);break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
