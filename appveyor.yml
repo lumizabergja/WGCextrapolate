@@ -4,7 +4,7 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-v15-cuda-vulkan-native-latewarp
+    - fg-v15-reflex2-lateinput-adaptive
 clone_depth: 1
 install:
   - ps: .\ci-setup.ps1
