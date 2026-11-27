@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <exception>
 #include <optional>
+#include <memory>
 #include <vector>
 #include <array>
 #include <algorithm>
@@ -39,6 +40,7 @@
 #include <nvOpticalFlowCuda.h>
 #include "pixel_types.h"
 #include "display_clock.h"
+#include "warp_presenter.h"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -49,11 +51,13 @@ constexpr int kOpticalFlowGrid = 4;
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
-    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109;
+    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109,
+    kWarp = 110,kHud = 111,kGun = 112;
 constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
-HWND g_refresh{};
+HWND g_refresh{},g_warp{},g_hud{},g_gun{};
+std::atomic<bool> g_warpEnabled{true},g_hudEnabled{true},g_gunEnabled{true};
 HFONT g_font{},g_fontBold{},g_fontSmall{},g_fontHero{};
 HBRUSH g_bgBrush{},g_fieldBrush{},g_panelBrush{};
 const COLORREF kBackground=RGB(10,14,22),kPanel=RGB(20,27,38),kField=RGB(26,36,49),kText=RGB(233,244,250),kMuted=RGB(145,160,173),kAccent=RGB(61,226,220);
@@ -168,12 +172,18 @@ struct DxDevices {
     bool allowTearing{};
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps,warpPS;
+    std::unique_ptr<fgwarp::Presenter> warp;
+    uint64_t warpSequence{}; int64_t warpPrevious{},warpCurrent{};
+    double warpHorizon{},ticksPerMs{};UINT warpSrcW{},warpSrcH{};
+    void ResetWarpHistory(){if(warp)warp->resetHistory();}
+    void DrainWarp(){if(!warp)return;ctx11->ClearState();D3D11_QUERY_DESC q{D3D11_QUERY_EVENT,0};ComPtr<ID3D11Query> event;Check(dev11->CreateQuery(&q,&event),"NGX shutdown query");ctx11->End(event.Get());ctx11->Flush();HRESULT r;while((r=ctx11->GetData(event.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH))==S_FALSE)Sleep(1);Check(r,"NGX drain");warp.reset();}
     ComPtr<ID3D11Buffer> constants;
     UINT screenW{},screenH{},swapFlags{};
     ComPtr<IDXGIAdapter> matchingAdapter;
     void Init(HWND output,UINT outputW,UINT outputH){
         screenW=outputW;screenH=outputH;
+        LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);ticksPerMs=double(frequency.QuadPart)/1000.;
         HMONITOR monitor=MonitorFromWindow(output,MONITOR_DEFAULTTONEAREST);
         ComPtr<IDXGIFactory1> factory;Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"CreateDXGIFactory1");
         for(UINT i=0;;++i){
@@ -224,6 +234,7 @@ struct DxDevices {
         // only scans the registered pixel buffer into the same flip-model RTV.
         static const char* shader=R"HLSL(
 Buffer<float4> pixels : register(t0);
+Texture2D<float4> warped : register(t1);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
@@ -231,6 +242,7 @@ float4 VS(uint id : SV_VertexID) : SV_Position {
 float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
 }
+float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(int2(position.xy),0));}
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",
@@ -239,18 +251,22 @@ float4 PS(float4 position : SV_Position) : SV_Target {
                          D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&pixel,nullptr),"Compile DXGI pixel shader");
         Check(dev11->CreateVertexShader(vertex->GetBufferPointer(),vertex->GetBufferSize(),nullptr,&vs),"Create vertex shader");
         Check(dev11->CreatePixelShader(pixel->GetBufferPointer(),pixel->GetBufferSize(),nullptr,&ps),"Create pixel shader");
+        ComPtr<ID3DBlob> warpPixel;
+        Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"WarpPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&warpPixel,nullptr),"Compile NGX output shader");
+        Check(dev11->CreatePixelShader(warpPixel->GetBufferPointer(),warpPixel->GetBufferSize(),nullptr,&warpPS),"Create NGX output shader");
         D3D11_BUFFER_DESC layout{};
         layout.ByteWidth=16; layout.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&layout,nullptr,&constants),"Create DXGI image layout");
         SetStride();
     }
-    ~DxDevices() { if (frameReady) CloseHandle(frameReady); }
+    ~DxDevices() { try{DrainWarp();}catch(...){warp.reset();} if (frameReady) CloseHandle(frameReady); }
     void SetStride() {
         const UINT data[4]={screenW,0,0,0};
         ctx11->UpdateSubresource(constants.Get(),0,nullptr,data,0,0);
     }
     void ResizeOutput(UINT width, UINT height) {
         if (width==screenW && height==screenH) return;
+        DrainWarp();
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
         rtv.Reset();
         ctx11->Flush();
@@ -260,20 +276,37 @@ float4 PS(float4 position : SV_Position) : SV_Target {
         Check(dev11->CreateRenderTargetView(back.Get(),nullptr,&rtv),"Create resized RTV");
         screenW=width; screenH=height; SetStride();
     }
-    void Present(ID3D11ShaderResourceView* image) {
+    void DrawTo(ID3D11ShaderResourceView* image,ID3D11RenderTargetView* target,bool texture){
         D3D11_VIEWPORT viewport{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&viewport);
-        ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
+        ctx11->OMSetRenderTargets(1,&target,nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);
-        ctx11->PSSetShader(ps.Get(),nullptr,0);
+        ctx11->PSSetShader(texture?warpPS.Get():ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-        ctx11->PSSetShaderResources(0,1,&image);
+        ctx11->PSSetShaderResources(texture?1:0,1,&image);
         ctx11->Draw(3,0);
         ID3D11ShaderResourceView* none=nullptr;
-        ctx11->PSSetShaderResources(0,1,&none);
+        ctx11->PSSetShaderResources(texture?1:0,1,&none);
+        ctx11->OMSetRenderTargets(0,nullptr,nullptr);
+    }
+    void Present(ID3D11ShaderResourceView* image){
+        if(g_warpEnabled.load(std::memory_order_relaxed)){
+            if(!warp){
+                warp=std::make_unique<fgwarp::Presenter>();
+                warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);
+            }
+            DrawTo(image,warp->inputRTV.Get(),false);
+            warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),g_hudEnabled.load(),g_gunEnabled.load(),
+                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs);
+            DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
+        }else{
+            if(warp)DrainWarp();
+            DrawTo(image,rtv.Get(),false);
+        }
         Check(swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0),"DXGI low-latency Present");
     }
+
 };
 
 #include "cuda_driver.h"
@@ -344,6 +377,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         if(tracked.Exited())return SessionOutcome::Stop;
         // CUDA/DX11 shared resources are created on this single render thread.
         OverlayWindow overlay;overlay.Init(game.window);
+        RAWINPUTDEVICE mouse{1,2,RIDEV_INPUTSINK,overlay.hwnd};
+        if(!RegisterRawInputDevices(&mouse,1,sizeof(mouse)))throw Error("Register raw mouse input",GetLastError());
+        struct RawRegistration {~RawRegistration(){fgwarp::acceptInput=false;RAWINPUTDEVICE r{1,2,RIDEV_REMOVE,nullptr};RegisterRawInputDevices(&r,1,sizeof(r));}} rawRegistration;
+        fgwarp::acceptInput=false;fgwarp::resetInput();
         MONITORINFOEXW monitorInfo{};monitorInfo.cbSize=sizeof(monitorInfo);
         UINT monitorHz=320;
         if(GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&monitorInfo)){
@@ -429,6 +466,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double sourcePeriod=1.0/60.0, pairPeriod=sourcePeriod;
         DisplayClock displayClock;
         LARGE_INTEGER previousCaptureAt{};
+        int64_t previousPoseTime=0,currentPoseTime=0;
         int current=-1,previous=-1;
         bool realFramePending=false;
         bool pairEligible=false;
@@ -475,6 +513,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
+                if(wasFocused){fgwarp::acceptInput=false;fgwarp::resetInput();dx.ResetWarpHistory();}
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -484,6 +523,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
+                fgwarp::resetInput();fgwarp::acceptInput=true;dx.ResetWarpHistory();
+                previousPoseTime=currentPoseTime=0;
                 resumeWarmup=2;
                 displayClock.reset();
                 QueryPerformanceCounter(&last);
@@ -515,6 +556,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                             sourcePeriod=0.90*sourcePeriod+0.10*sample;
                     }else pairPeriod=sourcePeriod;
                 }
+                previousPoseTime=currentPoseTime;currentPoseTime=captureTime.QuadPart;
                 previousCaptureAt=captureTime;
                 last=captureTime;
                 realFramePending=true;
@@ -593,6 +635,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     const double age=double(now.QuadPart-last.QuadPart)/double(freq.QuadPart);
                     const float prediction=(realFramePending||!flowReady)?0.f:
                         float(std::clamp(age/pairPeriod,0.0,1.25));
+                    dx.warpSequence=sequence;dx.warpPrevious=previousPoseTime;dx.warpCurrent=currentPoseTime;
+                    dx.warpHorizon=prediction;dx.warpSrcW=capture.frames[current].width;dx.warpSrcH=capture.frames[current].height;
                     gpu.Draw(dx,current,previous>=0?previous:current,prediction,
                              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
                              float(g_centerFeatherPx.load(std::memory_order_relaxed)));
@@ -706,6 +750,7 @@ void DrawUi(HWND hwnd,HDC dc){
     PaintRoundBox(dc,20,210,cr.right-20,306,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,316,cr.right-20,390,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,397,cr.right-20,476,kPanel,RGB(40,58,70));
+    PaintRoundBox(dc,20,483,cr.right-20,585,kPanel,RGB(40,58,70));
     HICON icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(kIconId));
     if(icon)DrawIconEx(dc,24,18,icon,52,52,0,nullptr,DI_NORMAL);
     SetBkMode(dc,TRANSPARENT);
@@ -751,6 +796,7 @@ void DrawUiCombo(const DRAWITEMSTRUCT* ds){
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
+    if(msg==WM_INPUT){fgwarp::rawInput(lp);return DefWindowProcW(hwnd,msg,wp,lp);}
     if(msg==WM_NCHITTEST)return HTTRANSPARENT;
     if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -793,6 +839,14 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             285,429,200,30,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCenterFeather)),nullptr,nullptr);
         StyleControl(g_centerFeatherEdit);
         SendMessageW(g_centerFeatherEdit,EM_SETLIMITTEXT,3,0);
+        auto checkbox=[&](const wchar_t* label,int x,int y,int width,int id){
+            HWND c=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x,y,width,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
+            StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
+        };
+        g_warp=checkbox(L"NVIDIA Frame Warp (adaptive 0-5 ms)",36,493,480,kWarp);
+        g_hud=checkbox(L"Automatic HUD protection",36,524,250,kHud);
+        g_gun=checkbox(L"Automatic gun protection",285,524,250,kGun);
+        UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,552,490,20,true);
         // The timer is a fallback for a missed/late worker completion message.
         // It never enables Start while NvFBC is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
@@ -845,6 +899,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
+        case kWarp:if(HIWORD(wp)==BN_CLICKED)g_warpEnabled.store(SendMessageW(g_warp,BM_GETCHECK,0,0)==BST_CHECKED);break;
+        case kHud:if(HIWORD(wp)==BN_CLICKED)g_hudEnabled.store(SendMessageW(g_hud,BM_GETCHECK,0,0)==BST_CHECKED);break;
+        case kGun:if(HIWORD(wp)==BN_CLICKED)g_gunEnabled.store(SendMessageW(g_gun,BM_GETCHECK,0,0)==BST_CHECKED);break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
@@ -954,7 +1011,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     c.hbrBackground=CreateSolidBrush(kBackground);
     if(!RegisterClassW(&c))return 1;
     g_control=CreateWindowW(c.lpszClassName,L"FG",WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX&~WS_THICKFRAME,
-        CW_USEDEFAULT,CW_USEDEFAULT,570,540,nullptr,nullptr,instance,nullptr);
+        CW_USEDEFAULT,CW_USEDEFAULT,570,650,nullptr,nullptr,instance,nullptr);
     if(!g_control)return 2;
     RegisterHotKey(g_control,kEmergencyHotkey,MOD_CONTROL|MOD_SHIFT,VK_F12);
     HICON appIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));
