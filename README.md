@@ -1,7 +1,9 @@
-# FG V15 v16 - deadline / texture CUDA revision
+# FG CUDA Safe Address Fix
 
-Run FG.exe, select the game, select Off, x2-x6 or Dynamic, and Start. Dynamic defaults to 320 FPS. Working NvFBC CUDA PID capture is required. The UI, center radius/feather, D3D11 flip-model presenter and NvOFA 4x4 FAST (cost off) remain unchanged.
+Repair/isolation build for CUDA_ERROR_ILLEGAL_ADDRESS reported at capture event publication in Ultra Pipeline. Based on the Deadline + Texture branch. Retains NvFBC CUDA capture, D3D11 flip-model presentation, UI, Off/x2-x6, fractional Dynamic 320 clock and NvOFA 4x4 FAST cost OFF.
 
-Changes from the supplied Early NvOFA source: phase-locked deadline pacing without integer Dynamic rounding, latest-source selection after a DXGI queue slot becomes available, actual frame-pair interval for extrapolation, and optional CUDA hardware bilinear sampling for BGRA and motion vectors. Incompatible texture pitches use the original manual sampling. No CPU frame copy is introduced. The old D3D11 map/unmap path is retained; persistent graphics sharing, half-resolution flow and CUDA graphs are not included in this revision.
+The experimental imported KMT texture/surface, external fence handoff, overlapping luma stream and confidence cache are not used. Native capture and NvOFA vectors use original bounded software loads instead of CUDA texture objects. Registered D3D11 output buffers are mapped/unmapped explicitly. No CPU frame readback.
 
-Build: open an x64 Visual Studio Developer Command Prompt, set CUDA_PATH to the CUDA Toolkit directory and run Build.cmd. PTX is regenerated on every build because the kernel argument ABI changed. Run Build.cmd --blackwell with CUDA 12.8+ to embed an SM 120 cubin alongside the generic PTX. The application loads the cubin if supported and otherwise loads PTX. Test.cmd runs CPU simulation tests; it does not test the NVIDIA driver or actual display cadence.
+Normal mode uses the existing asynchronous pipeline. For optional troubleshooting, start from PowerShell with $env:FG_CUDA_DIAGNOSTIC='1'; .\FG.exe . It adds stream synchronization after capture, luma, OFA, scene gate and rendering to improve error attribution, but will increase latency and still cannot guarantee attribution across concurrent streams. Close FG and remove the environment variable for normal performance. A CUDA illegal address can poison the process context; restart FG after the error. This is a candidate repair, not a verified runtime fix.
+
+Build.cmd --blackwell builds CUDA PTX + SM120; Test.cmd runs CPU tests. AppVeyor publishes source and Windows x64 ZIPs.

@@ -86,8 +86,9 @@ class CudaPipeline {
             allocateFlowBuffer(state.vectors,(width+kOpticalFlowGrid-1)/kOpticalFlowGrid,
                                (height+kOpticalFlowGrid-1)/kOpticalFlowGrid,
                                NV_OF_BUFFER_USAGE_OUTPUT,NV_OF_BUFFER_FORMAT_SHORT2);
-            state.flowTexture=makeTexture(state.vectors.pixels,(width+3)/4,(height+3)/4,
-                                          size_t(state.vectors.pitchElements)*4,CU_AD_FORMAT_SIGNED_INT16,2);
+            // NvOFA owns this allocation. Use bounded SHORT2 loads, not a
+            // texture view over an externally managed pitched resource.
+            state.flowTexture=0;
             cu.check(cu.allocate(&state.sceneCut,sizeof(unsigned)),"Allocate CUDA scene flag");
         }
     }
@@ -102,6 +103,7 @@ class CudaPipeline {
         UINT pitch=frame.pitchPixels, width=frame.width, height=frame.height;
         void* args[]={&pixels,&pitch,&state.input.pixels,&state.input.pitchElements,&width,&height};
         cu.launch(stageKernel,flowInputStream,width,height,args);
+        cu.diagnosticSync(flowInputStream,"Diagnostic: luma conversion");
         state.stagedSequence=frame.sequence;
     }
     SourcePair pair(int current,int previous,bool useVectors) const {
@@ -188,9 +190,10 @@ public:
         if(state.textureWidth!=frame.width || state.textureHeight!=frame.height || state.texturePitch!=frame.pitchPixels){
             if(state.texture)cu.check(cu.destroyTexture(state.texture),"Release resized capture texture");
             state.texture=0; state.textureWidth=frame.width; state.textureHeight=frame.height; state.texturePitch=frame.pitchPixels;
-            // If the NvFBC pitch is incompatible, retain software sampling.
-            state.texture=makeTexture(frame.pixels,frame.width,frame.height,size_t(frame.pitchPixels)*4,
-                                      CU_AD_FORMAT_UNSIGNED_INT8,4);
+            // The NvFBC allocation can end at the last visible pixel rather
+            // than at the end of a complete pitched texture row. Keep the
+            // original bounded color reads until a texture view is validated.
+            state.texture=0;
         }
         cu.check(cu.waitEvent(displayStream,frame.captured,0),"Wait for captured real frame");
     }
@@ -218,10 +221,12 @@ public:
         NV_OF_EXECUTE_OUTPUT_PARAMS out{};
         out.outputBuffer=state.vectors.handle;
         NvCheck(api.nvOFExecute(flow,&in,&out),"Execute CUDA NvOFA");
+        cu.diagnosticSync(flowOutputStream,"Diagnostic: NvOFA output");
         lastFlowSequence=frame.sequence;
         SourcePair images=pair(current,previous,true);
         void* args[]={&images,&state.sceneCut};
         cu.check(cu.launchKernel(sceneKernel,1,1,1,1,1,1,0,flowOutputStream,args,nullptr),"Evaluate V15 scene cut");
+        cu.diagnosticSync(flowOutputStream,"Diagnostic: scene gate");
         cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow for this frame pair");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
@@ -242,6 +247,7 @@ public:
         OutputImage target{pixels,dx.screenW,dx.screenH};
         void* args[]={&images,&target,&horizon,&radius,&feather,&cut};
         cu.launch(renderKernel,displayStream,target.width,target.height,args);
+        cu.diagnosticSync(displayStream,horizon>0?"Diagnostic: extrapolation kernel":"Diagnostic: real-frame kernel");
         // Unmap orders the next graphics use after the CUDA write. Present
         // needs no CPU readback, intermediate texture copy, or cuCtxSynchronize.
         cu.check(cu.unmap(1,&out.interop,displayStream),"Hand CUDA output to DXGI");

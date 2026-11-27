@@ -356,7 +356,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
         AsyncFlow flow(gpu,cuda,capture.context);
-        Status(L"Running");
+        Status(L"Running - safe CUDA interop");
 
         CaptureMailbox mailbox;
         std::array<bool,kNumCapture> retiredPending{};

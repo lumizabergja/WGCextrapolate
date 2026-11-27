@@ -125,7 +125,7 @@ extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, floa
     if (x>=target.width || y>=target.height) return;
     unsigned* destination=reinterpret_cast<unsigned*>(target.pixels)+y*target.width+x;
     bool native=pair.width==target.width && pair.height==target.height;
-    bool extrapolate=horizon>.00001f && !*cut;
+    bool extrapolate=horizon>.00001f && cut && !*cut && pair.flow && pair.flowPitch;
     const unsigned* source=reinterpret_cast<const unsigned*>(pair.current);
     if (native && !extrapolate) { *destination=source[y*pair.currentPitch+x]; return; }
     float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};

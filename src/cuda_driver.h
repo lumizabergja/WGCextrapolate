@@ -69,6 +69,14 @@ struct CudaDriver {
         errorName(status,&name);
         throw std::runtime_error(std::string(operation)+": "+(name?name:std::to_string(int(status))));
     }
+    // Opt-in diagnostic only; no additional synchronization in normal mode.
+    bool diagnosticEnabled() const {
+        wchar_t value[8]{};
+        return GetEnvironmentVariableW(L"FG_CUDA_DIAGNOSTIC",value,8)==1 && value[0]==L'1';
+    }
+    void diagnosticSync(CUstream stream,const char* operation) const {
+        if(diagnosticEnabled())check(syncStream(stream),operation);
+    }
     bool complete(CUevent event) const {
         auto result=queryEvent(event);
         if (result==CUDA_ERROR_NOT_READY) return false;

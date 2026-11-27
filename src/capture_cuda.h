@@ -103,6 +103,7 @@ public:
             throw Error("Invalid NvFBC capture dimensions or pitch");
         slot.width=info.dwWidth; slot.height=info.dwHeight; slot.pitchPixels=info.dwBufferWidth;
         slot.sequence=++lastSequence;
+        cu.diagnosticSync(nullptr,"Diagnostic: NvFBC capture");
         cu.check(cu.recordEvent(slot.captured,nullptr),"Publish captured CUDA frame");
         return true;
     }
