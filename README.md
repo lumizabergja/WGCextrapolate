@@ -7,3 +7,7 @@ The experimental imported KMT texture/surface, external fence handoff, overlappi
 Normal mode uses the existing asynchronous pipeline. For optional troubleshooting, start from PowerShell with $env:FG_CUDA_DIAGNOSTIC='1'; .\FG.exe . It adds stream synchronization after capture, luma, OFA, scene gate and rendering to improve error attribution, but will increase latency and still cannot guarantee attribution across concurrent streams. Close FG and remove the environment variable for normal performance. A CUDA illegal address can poison the process context; restart FG after the error. This is a candidate repair, not a verified runtime fix.
 
 Build.cmd --blackwell builds CUDA PTX + SM120; Test.cmd runs CPU tests. AppVeyor publishes source and Windows x64 ZIPs.
+
+## Safe overlap revision
+
+Restores only independent grayscale preparation. Each selected capture slot has a non-timing CUDA completion event. The render thread queues luma immediately after selecting a new frame, or when preparing a pair after switching from Off. The NvOFA input stream waits on both events. The capture slot is not recycled until display and luma events complete and no active optical-flow job owns it. No shared texture/surface import, texture-object sampling or confidence cache is reintroduced. The existing asynchronous flow worker remains single-job/latest-pair. Diagnostic mode remains optional. CPU tests do not validate driver behavior or actual overlap; target GPU testing required.

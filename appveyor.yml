@@ -4,7 +4,7 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-v15-v16-cuda-safe-address-fix
+    - fg-v15-v16-cuda-safe-overlap-luma
 clone_depth: 1
 install:
   - ps: .\Install-ZeroCopy-CUDA.ps1
@@ -20,11 +20,11 @@ build_script:
       if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
       if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-Safe-Address-Fix-Windows-x64.zip' -Force
-      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1' -DestinationPath 'artifacts/FG-CUDA-Safe-Address-Fix-Source.zip' -Force
+      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-Safe-Overlap-Luma-Windows-x64.zip' -Force
+      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1' -DestinationPath 'artifacts/FG-CUDA-Safe-Overlap-Luma-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-CUDA-Safe-Address-Fix-Windows-x64.zip
-    name: FG-CUDA-Safe-Address-Fix-Windows-x64
-  - path: artifacts\FG-CUDA-Safe-Address-Fix-Source.zip
-    name: FG-CUDA-Safe-Address-Fix-Source
+  - path: artifacts\FG-CUDA-Safe-Overlap-Luma-Windows-x64.zip
+    name: FG-CUDA-Safe-Overlap-Luma-Windows-x64
+  - path: artifacts\FG-CUDA-Safe-Overlap-Luma-Source.zip
+    name: FG-CUDA-Safe-Overlap-Luma-Source

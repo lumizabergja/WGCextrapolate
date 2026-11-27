@@ -356,7 +356,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
         AsyncFlow flow(gpu,cuda,capture.context);
-        Status(L"Running - safe CUDA interop");
+        Status(L"Running - safe CUDA interop + early luma");
 
         CaptureMailbox mailbox;
         std::array<bool,kNumCapture> retiredPending{};
@@ -499,7 +499,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(current>=0 && (capture.frames[current].width!=incoming.width ||
                                   capture.frames[current].height!=incoming.height))
                     return SessionOutcome::Recreate;
-                gpu.NewFrame(next);
+                gpu.NewFrame(next,g_fgMode.load(std::memory_order_relaxed)!=1);
                 const int retiring=previous;
                 previous=current;current=next;
                 // Use producer capture-completion timestamps, not the time the
@@ -539,7 +539,10 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
                 const bool useFlow=pairEligible && extrapolate;
                 const auto sequence=capture.frames[current].sequence;
-                if(useFlow) flow.Request(current,previous,sequence);
+                if(useFlow){
+                    gpu.PreparePair(current,previous);
+                    flow.Request(current,previous,sequence);
+                }
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);

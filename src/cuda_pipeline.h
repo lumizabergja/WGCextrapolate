@@ -13,10 +13,10 @@ class CudaPipeline {
     struct FrameState {
         FlowBuffer input, vectors;
         CUdeviceptr sceneCut{};
-        CUevent ready{},lastDisplayRead{};
+        CUevent ready{},lastDisplayRead{},lumaReady{};
         CUtexObject texture{},flowTexture{};
         UINT textureWidth{},textureHeight{},texturePitch{};
-        uint64_t stagedSequence{}; // owned by the optical-flow worker
+        uint64_t stagedSequence{}; // render-thread only; worker sees published events
     };
     struct OutputBuffer {
         ComPtr<ID3D11Buffer> pixels;
@@ -30,7 +30,7 @@ class CudaPipeline {
     NV_OF_CUDA_API_FUNCTION_LIST api{};
     NvOFHandle flow{};
     uint64_t lastFlowSequence{};
-    CUstream displayStream{},flowInputStream{},flowOutputStream{};
+    CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
     CUfunction stageKernel{},sceneKernel{},renderKernel{};
     std::array<FrameState,kNumCapture> states{};
@@ -98,12 +98,16 @@ class CudaPipeline {
         if (state.stagedSequence==frame.sequence) return;
         // NvFBC writes at most its advertised maximum to its own slot. NvOFA
         // owns its pitched input; never pass that smaller allocation to NvFBC.
-        cu.check(cu.waitEvent(flowInputStream,frame.captured,0),"Wait for NvFBC input to NvOFA");
+        if(!frame.sequence || !frame.width || !frame.height || !state.input.pixels ||
+            state.input.pitchElements<frame.width || frame.pitchPixels<frame.width)
+            throw Error("Invalid luma preparation buffer");
+        cu.check(cu.waitEvent(lumaStream,frame.captured,0),"Wait for NvFBC input to luma");
         auto pixels=frame.pixels;
         UINT pitch=frame.pitchPixels, width=frame.width, height=frame.height;
         void* args[]={&pixels,&pitch,&state.input.pixels,&state.input.pitchElements,&width,&height};
-        cu.launch(stageKernel,flowInputStream,width,height,args);
-        cu.diagnosticSync(flowInputStream,"Diagnostic: luma conversion");
+        cu.launch(stageKernel,lumaStream,width,height,args);
+        cu.diagnosticSync(lumaStream,"Diagnostic: overlapping luma conversion");
+        cu.check(cu.recordEvent(state.lumaReady,lumaStream),"Publish prepared luma");
         state.stagedSequence=frame.sequence;
     }
     SourcePair pair(int current,int previous,bool useVectors) const {
@@ -134,10 +138,12 @@ public:
         cu.check(cu.streamPriorities(&leastPriority,&highestPriority),"Get CUDA stream priority range");
         cu.check(cu.createPriorityStream(&displayStream,CU_STREAM_NON_BLOCKING,highestPriority),"Create CUDA display stream");
         cu.check(cu.createStream(&flowInputStream,CU_STREAM_NON_BLOCKING),"Create NvOFA input stream");
+        cu.check(cu.createStream(&lumaStream,CU_STREAM_NON_BLOCKING),"Create independent luma preparation stream");
         cu.check(cu.createStream(&flowOutputStream,CU_STREAM_NON_BLOCKING),"Create NvOFA output stream");
         for (auto& state:states) {
             state.ready=cu.event();
             state.lastDisplayRead=cu.event();
+            state.lumaReady=cu.event();
         }
         HMODULE exe=GetModuleHandleW(nullptr);
         HRSRC resource=FindResourceW(exe,MAKEINTRESOURCEW(102),RT_RCDATA);
@@ -183,7 +189,7 @@ public:
         cu.check(cu.syncStream(displayStream),"Finish CUDA output before resize");
         freeOutputs();
     }
-    void NewFrame(int index) {
+    void NewFrame(int index,bool prepareLuma) {
         const auto& frame=capture.frames[index];
         auto& state=states[index];
         // A slot is recycled only after display and optical flow readers retire.
@@ -196,6 +202,20 @@ public:
             state.texture=0;
         }
         cu.check(cu.waitEvent(displayStream,frame.captured,0),"Wait for captured real frame");
+        // Initialize on the render thread before the first request is published.
+        // After initialization only the worker calls nvOFExecute.
+        if(prepareLuma){
+            if(!flow)initializeFlow(frame.width,frame.height);
+            stage(index);
+        }
+    }
+    void PreparePair(int current,int previous) {
+        // Called by the render thread before Request, including after switching
+        // from Off. Existing staged events are never re-recorded for the same
+        // capture sequence. The mailbox keeps both slots owned.
+        if(!flow)initializeFlow(capture.frames[current].width,capture.frames[current].height);
+        stage(previous);
+        stage(current);
     }
     void Retire(int index) {
         auto& state=states[index];
@@ -203,13 +223,16 @@ public:
     }
     bool Retired(int index) const {
         const auto& state=states[index];
-        return cu.complete(state.lastDisplayRead);
+        // A source slot cannot be overwritten until BOTH its display and
+        // grayscale reads finish; the caller also checks active OFA ownership.
+        return cu.complete(state.lastDisplayRead) && cu.complete(state.lumaReady);
     }
     void Calculate(int current, int previous) {
         const auto& frame=capture.frames[current];
-        if (!flow) initializeFlow(frame.width,frame.height);
-        stage(previous);
-        stage(current);
+        // Both events were recorded before the render thread published this
+        // request. Use GPU dependencies rather than a CPU synchronization.
+        cu.check(cu.waitEvent(flowInputStream,states[previous].lumaReady,0),"Wait for reference luma");
+        cu.check(cu.waitEvent(flowInputStream,states[current].lumaReady,0),"Wait for current luma");
         auto& state=states[current];
         NV_OF_EXECUTE_INPUT_PARAMS in{};
         // The V15 sampler expects backwards lookup from CURRENT into PREVIOUS.
@@ -256,6 +279,8 @@ public:
         outputIndex=(outputIndex+1)%outputs.size();
     }
     ~CudaPipeline() {
+        // AsyncFlow joins its worker before this destructor runs.
+        if(lumaStream)cu.syncStream(lumaStream);
         if (flowInputStream) cu.syncStream(flowInputStream);
         if (flowOutputStream) cu.syncStream(flowOutputStream);
         if (displayStream) cu.syncStream(displayStream);
@@ -266,11 +291,13 @@ public:
             if (state.input.handle) api.nvOFDestroyGPUBufferCuda(state.input.handle);
             if (state.vectors.handle) api.nvOFDestroyGPUBufferCuda(state.vectors.handle);
             if (state.sceneCut) cu.freeMemory(state.sceneCut);
+            if (state.lumaReady) cu.destroyEvent(state.lumaReady);
             if (state.ready) cu.destroyEvent(state.ready);
             if (state.lastDisplayRead) cu.destroyEvent(state.lastDisplayRead);
         }
         if (flow) api.nvOFDestroy(flow);
         if (module) cu.unloadModule(module);
+        if(lumaStream)cu.destroyStream(lumaStream);
         if (flowInputStream) cu.destroyStream(flowInputStream);
         if (flowOutputStream) cu.destroyStream(flowOutputStream);
         if (displayStream) cu.destroyStream(displayStream);
