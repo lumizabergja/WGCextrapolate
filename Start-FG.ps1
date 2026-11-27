@@ -1,4 +1,16 @@
 $ErrorActionPreference='Stop'
+# Windows PowerShell 5.1 can promote ordinary native stderr progress into
+# terminating errors. Only the native process exit code decides success.
+function Invoke-Native {
+    param([string]$Exe,[string[]]$Arguments)
+    $saved=$ErrorActionPreference
+    try {
+        $ErrorActionPreference='Continue'
+        & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+        $code=$LASTEXITCODE
+    } finally { $ErrorActionPreference=$saved }
+    if($code -ne 0){throw "$Exe exited with code $code"}
+}
 Set-Location $PSScriptRoot
 try {
     $ai=Join-Path $PSScriptRoot AI
@@ -17,8 +29,8 @@ try {
     if(!(Test-Path $plan)){
         $temp="$plan.tmp"
         Write-Host 'Building FP16 engine for this GPU, once.'
-        & $trtexec "--onnx=$onnx" "--saveEngine=$temp" --fp16 --inputIOFormats=fp32:chw --outputIOFormats=fp32:chw --skipInference
-        if($LASTEXITCODE -or !(Test-Path $temp)){throw 'TensorRT engine build failed.'}
+        Invoke-Native $trtexec @("--onnx=$onnx","--saveEngine=$temp","--fp16","--inputIOFormats=fp32:chw","--outputIOFormats=fp32:chw","--skipInference")
+        if(!(Test-Path $temp)){throw 'TensorRT engine build failed.'}
         Move-Item -LiteralPath $temp -Destination $plan -Force
     }
     Start-Process -FilePath (Join-Path $PSScriptRoot 'FG.exe') -WorkingDirectory $PSScriptRoot
