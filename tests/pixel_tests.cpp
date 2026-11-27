@@ -26,13 +26,13 @@ unsigned pattern(int x,int y) {
     return 0xff000000u | (((x*11+y*3)%256)<<16) | (((x*7+y*13)%256)<<8) | ((x*19+y*5)%256);
 }
 unsigned long long address(const void* p){return (unsigned long long)(uintptr_t)p;}
-std::vector<unsigned> display(const SourcePair& pair,unsigned w,unsigned h,float horizon,float r,float f,unsigned cut) {
+std::vector<unsigned> display(const SourcePair& pair,unsigned w,unsigned h,float horizon,float r,float f,unsigned cut,unsigned flags=0) {
     std::vector<unsigned> pixels(w*h);
     OutputImage output{address(pixels.data()),w,h};
     blockDim={1,1,1};
     for (unsigned y=0;y<h;++y) for(unsigned x=0;x<w;++x) {
         blockIdx={x,y,0};
-        renderFrame(pair,output,horizon,r,f,horizon>0?&cut:nullptr);
+        renderFrame(pair,output,horizon,r,f,horizon>0?&cut:nullptr,flags);
     }
     return pixels;
 }
@@ -53,10 +53,22 @@ int main(){
     auto protectedCenter=display(pair,w,h,1.f,6,0,0);
     auto feather=display(pair,w,h,1.f,3,10,0);
     auto cutBypass=display(pair,w,h,1.f,0,0,1);
+    auto hud=display(pair,w,h,1.f,0,0,0,1);
+    auto gun=display(pair,w,h,1.f,0,0,0,2);
+    auto both=display(pair,w,h,1.f,0,0,0,3);
+    auto bothReal=display(pair,w,h,0.f,0,0,0,3);
+    unsigned hudCount=0,gunCount=0,unprotectedCount=0;
     for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++){
         unsigned i=y*w+x;
         assert(real[i]==cur.at(x,y));
         assert(cutBypass[i]==real[i]);
+        const float rx=(x+.5f)/w*1650.f,ry=(y+.5f)/h*927.f;
+        const bool isHUD=FG_HUD_REGION(rx,ry),isGun=FG_GUN_REGION(rx,ry);
+        assert(hud[i]==(isHUD?real[i]:predicted[i]));
+        assert(gun[i]==(isGun?real[i]:predicted[i]));
+        assert(both[i]==((isHUD||isGun)?real[i]:predicted[i]));
+        assert(bothReal[i]==real[i]);
+        hudCount+=isHUD;gunCount+=isGun;unprotectedCount+=!isHUD&&!isGun;
         if(x>=5) assert(predicted[i]==cur.at(x-delta,y));
         if(x<=2) assert(predicted[i]==real[i]);
         float d=std::hypot(float(x)-32.f,float(y)-18.f);
@@ -65,6 +77,7 @@ int main(){
         if(d<2.9f)assert(feather[i]==real[i]);
         if(d>13.1f)assert(feather[i]==predicted[i]);
     }
+    assert(hudCount>0&&gunCount>0&&unprotectedCount>0);
     assert(feather[18*w+39]!=real[18*w+39] && feather[18*w+39]!=predicted[18*w+39]);
     std::fill(prev.data.begin(),prev.data.end(),0xff000000u);
     std::fill(cur.data.begin(),cur.data.end(),0xffffffffu);
@@ -95,5 +108,5 @@ int main(){
     auto scaled=display(colors,8,4,0,0,0,0);
     assert(scaled.front()==small.at(0,0) && scaled.back()==small.at(3,1));
     assert(scaled[1*8+1]==0xff14000au);
-    std::puts("PASS: exact real-frame color, BGRA-to-luma, padded buffers, motion direction, bounds, scene cut, radius/feather, stretched resampling.");
+    std::puts("PASS: exact real-frame color, BGRA-to-luma, padded buffers, motion direction, bounds, scene cut, radius/feather, stretched resampling, independent HUD/gun freeze and combined freeze.");
 }
