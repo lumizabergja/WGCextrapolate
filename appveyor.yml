@@ -4,34 +4,10 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-v15-v16-cuda-zero-copy
+    - fg-v15-v16-cuda-deadline-texture
 clone_depth: 1
 install:
-  - ps: |
-      $ErrorActionPreference = 'Stop'
-      $bytes = [Convert]::FromBase64String((Get-Content -Raw 'zero-copy-source.b64'))
-      $zip = Join-Path $pwd 'zero-copy-source.zip'
-      [IO.File]::WriteAllBytes($zip, $bytes)
-      $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-      if ($hash -ne '49ea61cc12c77df7e5218cd14483481bd343519a7453975062f6529bba9c3ab5') { throw "Source SHA256 mismatch: $hash" }
-      Expand-Archive -LiteralPath $zip -DestinationPath 'zero-copy' -Force
-      if (!(Test-Path 'zero-copy/Build.cmd')) { throw 'Build script missing' }
-      $header = Join-Path $pwd 'zero-copy/src/zero_present.h'
-      $source = [IO.File]::ReadAllText($header)
-      $old = 'for(unsigned i=0;i<slots.size();++i)if(slots[i].buffer && slots[i].buffer->IsAvailable())return int(i);'
-      $new = @'
-          for(unsigned i=0;i<slots.size();++i) {
-              if(!slots[i].buffer.Get()) continue;
-              boolean available = FALSE;
-              Check(slots[i].buffer->IsAvailable(&available), "Query displayable buffer availability");
-              if(available) return int(i);
-          }
-      '@
-      if (!$source.Contains($old)) { throw 'Expected availability call not found' }
-      [IO.File]::WriteAllText($header, $source.Replace($old,$new), (New-Object System.Text.UTF8Encoding($false)))
-      python Patch-ZeroCopy-Pacing.py
-      if ($LASTEXITCODE -ne 0) { throw 'Zero-copy pacing patch failed' }
-      .\Install-ZeroCopy-CUDA.ps1
+  - ps: .\Install-ZeroCopy-CUDA.ps1
 build_script:
   - ps: |
       $ErrorActionPreference = 'Stop'
@@ -40,17 +16,15 @@ build_script:
       $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
       if (!$vs) { throw 'MSVC missing' }
       $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
-      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call zero-copy\Build.cmd --zero-copy-blackwell > build-zero-copy.log 2>&1')
-      $status = $LASTEXITCODE
-      if (Test-Path build-zero-copy.log) { Get-Content build-zero-copy.log }
-      if ($status -ne 0) { throw "Compilation failed: $status" }
-      $exe = 'zero-copy/bin/FG-ZeroCopy-Blackwell-Experimental.exe'
-      if (!(Test-Path $exe)) { throw 'Executable missing' }
+      & cmd.exe /d /s /c ('call "' + $vcvars + '" && call Build.cmd --blackwell && call Test.cmd')
+      if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
+      if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path $exe,'zero-copy/README.md','zero-copy/TEST-RESULTS.txt' -DestinationPath 'artifacts/FG-ZeroCopy-Blackwell-Windows-x64.zip' -Force
+      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-Deadline-Texture-Windows-x64.zip' -Force
+      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1' -DestinationPath 'artifacts/FG-CUDA-Deadline-Texture-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-ZeroCopy-Blackwell-Windows-x64.zip
-    name: FG-ZeroCopy-Blackwell-Windows-x64
-  - path: build-zero-copy.log
-    name: Build log
+  - path: artifacts\FG-CUDA-Deadline-Texture-Windows-x64.zip
+    name: FG-CUDA-Deadline-Texture-Windows-x64
+  - path: artifacts\FG-CUDA-Deadline-Texture-Source.zip
+    name: FG-CUDA-Deadline-Texture-Source

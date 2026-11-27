@@ -1,7 +1,0 @@
-bin/
-artifacts/
-build.log
-vendor/
-*.obj
-*.pdb
-__pycache__/

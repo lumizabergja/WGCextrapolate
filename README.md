@@ -1,29 +1,7 @@
-# WGC Extrapolate — visible motion v3 (D3D11 / Windows)
+# FG V15 v16 - deadline / texture CUDA revision
 
-Experimental **Windows Graphics Capture → D3D11 → NVIDIA Optical Flow (FAST 4x4) → extrapolation shader → DXGI flip presentation**, with Off, Dynamic, and fixed x2–x6.
+Run FG.exe, select the game, select Off, x2-x6 or Dynamic, and Start. Dynamic defaults to 320 FPS. Working NvFBC CUDA PID capture is required. The UI, center radius/feather, D3D11 flip-model presenter and NvOFA 4x4 FAST (cost off) remain unchanged.
 
-## Why the previous version looked like native frames
+Changes from the supplied Early NvOFA source: phase-locked deadline pacing without integer Dynamic rounding, latest-source selection after a DXGI queue slot becomes available, actual frame-pair interval for extrapolation, and optional CUDA hardware bilinear sampling for BGRA and motion vectors. Incompatible texture pitches use the original manual sampling. No CPU frame copy is introduced. The old D3D11 map/unmap path is retained; persistent graphics sharing, half-resolution flow and CUDA graphs are not included in this revision.
 
-Two different failure modes were possible:
-
-- The scheduler previously prioritized new native frames so aggressively that it could starve generated slots at high source FPS.
-- Even when it submitted an FG frame, the shader's scene-cut/residual/confidence checks could reject the optical-flow warp and return a copy of the real frame, particularly during camera movement.
-
-**v3** removes that overaggressive shader gate and uses a cheaper single-flow-warp prediction shader. Fixed x2–x6 modes reserve at most one imminent generated presentation opportunity before accepting the latest waiting native frame. Off and Dynamic retain a real-frame-first path. There are no additional CPU pixel copies or D3D11-to-DX12 conversions.
-
-## Identify your build
-
-The v3 executable window title is `FG WGC v3`. Its status line reads:
-`v3 WGC .../s  Real .../s  FG .../s  OF .../s`
-
-- `OF=0` while real captures update in fixed x4: the optical-flow engine is not executing, so check mode/initialization/errors.
-- `OF>0, FG=0`: a scheduler/flip-slot timing problem remains.
-- `OF>0, FG>0` but still no visible motion: the shader may be receiving zero or invalid motion vectors. The FG number counts submitted draws, not actual scanout or changed pixels.
-
-## Build in AppVeyor
-
-The public repo's `appveyor.yml` calls `python reconstruct.py` to produce the SHA256-verified v3 source from three small patch stages (base, pacing v2, motion v3). Then it downloads Nvidia optical-flow headers, compiles on Visual Studio 2022, and should publish `FG-WGC-D3D11-LowLatency-Windows-x64.zip` in Artifacts **if successful**.
-
-For local builds use x64 Visual Studio Developer Command Prompt, then `python reconstruct.py` and `Build-And-Pack.cmd`.
-
-**Important:** This is an unverified source-level fix. It has passed deterministic source-reconstruction validation, not Windows compilation or actual GPU runtime tests. At 240 Hz the display can show at most 240 total frames/s; adding FG frames at 240 native FPS replaces some native display opportunities. To see stronger extrapolation, first try fixed x4 at 60 native FPS on a moving scene.
+Build: open an x64 Visual Studio Developer Command Prompt, set CUDA_PATH to the CUDA Toolkit directory and run Build.cmd. PTX is regenerated on every build because the kernel argument ABI changed. Run Build.cmd --blackwell with CUDA 12.8+ to embed an SM 120 cubin alongside the generic PTX. The application loads the cubin if supported and otherwise loads PTX. Test.cmd runs CPU simulation tests; it does not test the NVIDIA driver or actual display cadence.

@@ -1,1 +1,5 @@
 101 ICON "FG.ico"
+102 RCDATA "predict.ptx"
+#ifdef FG_BLACKWELL
+103 RCDATA "predict.cubin"
+#endif
