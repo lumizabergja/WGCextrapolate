@@ -95,5 +95,23 @@ int main(){
     auto scaled=display(colors,8,4,0,0,0,0);
     assert(scaled.front()==small.at(0,0) && scaled.back()==small.at(3,1));
     assert(scaled[1*8+1]==0xff14000au);
+    // A generated frame must respond even with no optical-flow buffer.
+    Frame aim(65,37,75);
+    for(unsigned y=0;y<37;++y)for(unsigned x=0;x<65;++x)aim.at(x,y)=0xff000000u|x*3u;
+    SourcePair aimPair{address(aim.data.data()),address(aim.data.data()),0,65,37,75,75,0};
+    std::vector<unsigned> aimOutput(65*37);
+    OutputImage aimTarget{address(aimOutput.data()),65,37};
+    auto centerPixel=[&](float angle){
+        InputPose pose{};pose.active=1;pose.fx=.6f;pose.fy=.8f;
+        pose.latest.sy=std::sin(angle);pose.latest.cy=std::cos(angle);
+        blockIdx={32,18,0};blockDim={1,1,1};threadIdx={0,0,0};
+        renderInputFrame(aimPair,aimTarget,0,0,0,nullptr,pose);
+        return aimOutput[18*65+32]&255u;
+    };
+    const unsigned stationary=centerPixel(0);
+    assert(centerPixel(.04f)>stationary);
+    assert(centerPixel(-.04f)<stationary);
+    assert(centerPixel(0)==stationary);
+    std::puts("PASS: input-only response, reversal, stationary recovery without NvOFA.");
     std::puts("PASS: exact real-frame color, BGRA-to-luma, padded buffers, motion direction, bounds, scene cut, radius/feather, stretched resampling.");
 }

@@ -133,3 +133,86 @@ extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, floa
     if (extrapolate) base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
     *destination=pack(base);
 }
+
+// Rotational inverse projection, evaluated directly in the existing output
+// kernel. Positive relative mouse counts sample right/down in the old image.
+// No second warp pass or intermediate output image.
+__device__ __forceinline__ float2 cameraUV(float2 uv,CameraRotation r,float fx,float fy){
+    float x=(uv.x-.5f)/fx,y=(uv.y-.5f)/fy;
+    float rx=r.cy*x+r.sy,z=r.cy-r.sy*x;
+    float ry=r.cp*y+r.sp*z,rz=r.cp*z-r.sp*y;
+    if(rz<.15f)rz=.15f;
+    return {.5f+fx*rx/rz,.5f+fy*ry/rz};
+}
+__device__ __forceinline__ float2 displacement(float2 uv,CameraRotation r,float fx,float fy){
+    auto q=cameraUV(uv,r,fx,fy);return {q.x-uv.x,q.y-uv.y};
+}
+__device__ __forceinline__ float2 sub2(float2 a,float2 b){return {a.x-b.x,a.y-b.y};}
+__device__ __forceinline__ float norm2(float2 a){return magnitude(a.x,a.y);}
+__device__ __forceinline__ float cameraWeight(SourcePair pair,float2 uv,Color base,InputPose pose,bool hasFlow,float2 v,float2 historical){
+    if(!pose.history||(!pose.hud&&!pose.gun))return 1.f;
+    const float movement=norm2(historical);
+    if(movement<.0012f)return 1.f;
+    // Evaluate screen-space stability against the predicted background match.
+    // The lower-screen prior gates weapon detection, never freezes an area.
+    const float2 old={uv.x+historical.x,uv.y+historical.y};
+    if(outside(old))return 1.f;
+    const float screenError=residual(base,sampleColor(pair,pair.previous,pair.previousPitch,uv));
+    const float sceneError=residual(base,sampleColor(pair,pair.previous,pair.previousPitch,old));
+    const float staticEvidence=(1.f-smooth(.025f,.12f,screenError))*smooth(.018f,.12f,sceneError-screenError);
+    const float motionEvidence=hasFlow?(1.f-smooth(.001f,.008f,norm2(v))):1.f;
+    const float hud=pose.hud?staticEvidence*motionEvidence:0.f;
+    const float prior=smooth(.49f,.76f,uv.y);
+    const float disagreement=hasFlow?smooth(.0025f,.02f,norm2(sub2(v,historical))):0.f;
+    const float independent=smooth(.035f,.19f,sceneError)*disagreement;
+    const float gun=pose.gun?prior*fmaxf(staticEvidence,independent*.8f):0.f;
+    return 1.f-fminf(1.f,fmaxf(hud,gun));
+}
+extern "C" __global__ void renderInputFrame(SourcePair pair,OutputImage target,float horizon,
+                                            float radius,float feather,const unsigned* cut,InputPose pose){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    const auto* source=reinterpret_cast<const unsigned*>(pair.current);
+    unsigned* dest=reinterpret_cast<unsigned*>(target.pixels)+y*target.width+x;
+    float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
+    bool native=pair.width==target.width&&pair.height==target.height;
+    Color base=native?unpack(source[y*pair.currentPitch+x]):sampleColor(pair,pair.current,pair.currentPitch,uv);
+    const bool hasFlow=cut&&!*cut&&pair.flow&&pair.flowPitch;
+    // A scene cut or invalid timestamp uses the unchanged V15 path.
+    if(!pose.active||(cut&&*cut)){
+        if(hasFlow&&horizon>.00001f)base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
+        *dest=pack(base);return;
+    }
+    const float center=protection(uv,target,radius,feather);
+    if(center<=0.f){*dest=pack(base);return;}
+    float2 late=displacement(uv,pose.latest,pose.fx,pose.fy);
+    float2 old=pose.history?displacement(uv,pose.historical,pose.fx,pose.fy):float2{0,0};
+    float2 v=hasFlow?flowAt(pair,uv):float2{0,0};
+    const float weight=cameraWeight(pair,uv,base,pose,hasFlow,v,old);
+    // Replace the estimated camera component, keeping local object motion.
+    // If history is unavailable, keep original flow extrapolation but omit
+    // the additional mouse correction when that would double-count motion.
+    if(hasFlow&&horizon>0.f&&!pose.history){
+        *dest=pack(predict(pair,uv,base,horizon,center));return;
+    }
+    const float2 cameraQ={uv.x+late.x*weight,uv.y+late.y*weight};
+    // Feather only at the newly exposed image boundary.
+    const float edge=smooth(0.f,.015f,fminf(fminf(cameraQ.x,1.f-cameraQ.x),fminf(cameraQ.y,1.f-cameraQ.y)));
+    Color camera=outside(cameraQ)?base:mixColor(base,sampleColor(pair,pair.current,pair.currentPitch,cameraQ),edge);
+    if(hasFlow&&horizon>.00001f){
+        const float2 object={v.x-old.x*weight,v.y-old.y*weight};
+        const float2 q={cameraQ.x+horizon*object.x,cameraQ.y+horizon*object.y};
+        if(!outside(q)){
+            const float2 mv=flowAt(pair,q);
+            const float2 prev={q.x+mv.x,q.y+mv.y};
+            if(!outside(prev)&&norm2(mv)<.12f){
+                const Color candidate=sampleColor(pair,pair.current,pair.currentPitch,q);
+                const Color reference=sampleColor(pair,pair.previous,pair.previousPitch,prev);
+                const float confidence=(1.f-smooth(.045f,.20f,residual(candidate,reference)))*
+                                       (1.f-smooth(.003f,.025f,norm2(sub2(mv,v))));
+                camera=mixColor(camera,candidate,confidence*edge);
+            }
+        }
+    }
+    *dest=pack(mixColor(base,camera,center));
+}

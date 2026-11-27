@@ -49,11 +49,13 @@ constexpr int kOpticalFlowGrid = 4;
 constexpr UINT kIconId = 101;
 constexpr UINT kEmergencyHotkey = 0x5240;
 constexpr int kTarget = 101, kRefresh = 102, kMultiplier = 103, kStart = 104, kStop = 105,
-    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109;
+    kDynamicTarget = 107, kCenterRadius = 108, kCenterFeather = 109,
+    kLateInput=110,kAutoHud=111,kAutoGun=112;
 constexpr UINT WM_FG_STATUS = WM_APP+77, WM_FG_STOPPED = WM_APP+78;
 HWND g_control{},g_targets{},g_multi{},g_start{},g_stop{},g_overlay{},g_dynamicTarget{};
 HWND g_centerRadiusEdit{},g_centerFeatherEdit{};
-HWND g_refresh{};
+HWND g_refresh{},g_lateInput{},g_autoHud{},g_autoGun{};
+std::atomic<bool> g_inputEnabled{true},g_autoHudEnabled{true},g_autoGunEnabled{true};
 HFONT g_font{},g_fontBold{},g_fontSmall{},g_fontHero{};
 HBRUSH g_bgBrush{},g_fieldBrush{},g_panelBrush{};
 const COLORREF kBackground=RGB(10,14,22),kPanel=RGB(20,27,38),kField=RGB(26,36,49),kText=RGB(233,244,250),kMuted=RGB(145,160,173),kAccent=RGB(61,226,220);
@@ -278,6 +280,7 @@ float4 PS(float4 position : SV_Position) : SV_Target {
 
 #include "cuda_driver.h"
 #include "capture_cuda.h"
+#include "late_mouse.h"
 #include "cuda_pipeline.h"
 #include "async_flow.h"
 
@@ -356,6 +359,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
         AsyncFlow flow(gpu,cuda,capture.context);
+        LateMouse mouse;
         Status(L"Running - safe CUDA interop + early luma");
 
         CaptureMailbox mailbox;
@@ -429,6 +433,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         double sourcePeriod=1.0/60.0, pairPeriod=sourcePeriod;
         DisplayClock displayClock;
         LARGE_INTEGER previousCaptureAt{};
+        int64_t previousPose=0,currentPose=0;
         int current=-1,previous=-1;
         bool realFramePending=false;
         bool pairEligible=false;
@@ -475,6 +480,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
+                if(wasFocused)mouse.Focus(false);
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -484,6 +490,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
+                mouse.Focus(true);previousPose=currentPose=0;
                 resumeWarmup=2;
                 displayClock.reset();
                 QueryPerformanceCounter(&last);
@@ -515,6 +522,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                             sourcePeriod=0.90*sourcePeriod+0.10*sample;
                     }else pairPeriod=sourcePeriod;
                 }
+                previousPose=currentPose;currentPose=captureTime.QuadPart;
                 previousCaptureAt=captureTime;
                 last=captureTime;
                 realFramePending=true;
@@ -537,16 +545,18 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const int target=std::clamp(configuredTarget==0?int(monitorHz):configuredTarget,30,1000);
                 if(mode!=lastMode){displayClock.reset();lastMode=mode;}
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
-                const bool useFlow=pairEligible && extrapolate;
+                const bool lateInput=g_inputEnabled.load(std::memory_order_relaxed);
+                const bool useFlow=pairEligible && (extrapolate || (lateInput&&mode!=1));
                 const auto sequence=capture.frames[current].sequence;
                 if(useFlow){
                     gpu.PreparePair(current,previous);
                     flow.Request(current,previous,sequence);
                 }
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
+                const bool cameraCadence=lateInput&&mode!=1&&elapsed<=.050;
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);
-                if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65){
+                if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65&&!cameraCadence){
                     // Allow short capture jitter without abruptly freezing FG;
                     // stop extrapolating only when a real-frame gap is large.
                     SwitchToThread();continue;
@@ -556,8 +566,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // Off presents each real frame exactly once. In FG mode a real
                 // frame takes the next display slot (up to 20% early), not an
                 // additional slot that would crowd out extrapolated frames.
-                const bool doPresent=extrapolate
-                    ? (realFramePending || flowReady) && displayClock.due(clockNow,realFramePending)
+                const bool doPresent=(extrapolate||cameraCadence)
+                    ? (realFramePending || flowReady || cameraCadence) && displayClock.due(clockNow,realFramePending)
                     : realFramePending;
                 if(doPresent){
                     // Queue target 0: if a previous Present still occupies the
@@ -595,7 +605,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                         float(std::clamp(age/pairPeriod,0.0,1.25));
                     gpu.Draw(dx,current,previous>=0?previous:current,prediction,
                              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
-                             float(g_centerFeatherPx.load(std::memory_order_relaxed)));
+                             float(g_centerFeatherPx.load(std::memory_order_relaxed)),
+                             lateInput?&mouse:nullptr,previousPose,currentPose,flowReady);
                     displaySlotReserved=false;
                     realFramePending=false;
                     displayClock.submitted(submitTime);
@@ -706,6 +717,7 @@ void DrawUi(HWND hwnd,HDC dc){
     PaintRoundBox(dc,20,210,cr.right-20,306,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,316,cr.right-20,390,kPanel,RGB(40,58,70));
     PaintRoundBox(dc,20,397,cr.right-20,476,kPanel,RGB(40,58,70));
+    PaintRoundBox(dc,20,483,cr.right-20,585,kPanel,RGB(40,58,70));
     HICON icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(kIconId));
     if(icon)DrawIconEx(dc,24,18,icon,52,52,0,nullptr,DI_NORMAL);
     SetBkMode(dc,TRANSPARENT);
@@ -793,6 +805,14 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             285,429,200,30,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCenterFeather)),nullptr,nullptr);
         StyleControl(g_centerFeatherEdit);
         SendMessageW(g_centerFeatherEdit,EM_SETLIMITTEXT,3,0);
+        auto checkbox=[&](const wchar_t* label,int x,int y,int width,int id){
+            HWND c=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x,y,width,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
+            StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
+        };
+        g_lateInput=checkbox(L"Ultra Late Input (adaptive 0-5 ms)",36,493,480,kLateInput);
+        g_autoHud=checkbox(L"Automatic HUD protection",36,524,250,kAutoHud);
+        g_autoGun=checkbox(L"Automatic gun protection",285,524,250,kAutoGun);
+        UiLabel(hwnd,L"Raw Input / 1000 Hz device recommended",36,552,490,20,true);
         // The timer is a fallback for a missed/late worker completion message.
         // It never enables Start while NvFBC is still restarting or tearing down.
         SetTimer(hwnd,kLauncherLifecycleTimer,100,nullptr);
@@ -845,6 +865,9 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     case WM_COMMAND:{
         switch(LOWORD(wp)){
+        case kLateInput:if(HIWORD(wp)==BN_CLICKED)g_inputEnabled.store(SendMessageW(g_lateInput,BM_GETCHECK,0,0)==BST_CHECKED);break;
+        case kAutoHud:if(HIWORD(wp)==BN_CLICKED)g_autoHudEnabled.store(SendMessageW(g_autoHud,BM_GETCHECK,0,0)==BST_CHECKED);break;
+        case kAutoGun:if(HIWORD(wp)==BN_CLICKED)g_autoGunEnabled.store(SendMessageW(g_autoGun,BM_GETCHECK,0,0)==BST_CHECKED);break;
         case kRefresh:if(!g_running.load())RefreshGames();break;
         case kMultiplier:
             if(HIWORD(wp)==CBN_SELCHANGE){
@@ -954,7 +977,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
     c.hbrBackground=CreateSolidBrush(kBackground);
     if(!RegisterClassW(&c))return 1;
     g_control=CreateWindowW(c.lpszClassName,L"FG",WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX&~WS_THICKFRAME,
-        CW_USEDEFAULT,CW_USEDEFAULT,570,540,nullptr,nullptr,instance,nullptr);
+        CW_USEDEFAULT,CW_USEDEFAULT,570,650,nullptr,nullptr,instance,nullptr);
     if(!g_control)return 2;
     RegisterHotKey(g_control,kEmergencyHotkey,MOD_CONTROL|MOD_SHIFT,VK_F12);
     HICON appIcon=LoadIconW(instance,MAKEINTRESOURCEW(kIconId));

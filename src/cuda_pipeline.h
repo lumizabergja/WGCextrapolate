@@ -32,7 +32,7 @@ class CudaPipeline {
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{},inputKernel{};
     std::array<FrameState,kNumCapture> states{};
     std::array<OutputBuffer,2> outputs{};
     unsigned outputIndex{};
@@ -164,6 +164,7 @@ public:
         cu.check(cu.getFunction(&stageKernel,module,"stageFlowInput"),"Load NvOFA input kernel");
         cu.check(cu.getFunction(&sceneKernel,module,"sceneGate"),"Load CUDA scene-cut kernel");
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
+        cu.check(cu.getFunction(&inputKernel,module,"renderInputFrame"),"Load input-controlled prediction kernel");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -253,12 +254,14 @@ public:
         cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow for this frame pair");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
-    void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather) {
+    void Draw(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,
+              LateMouse* mouse,int64_t previousPose,int64_t currentPose,bool flowReady) {
         auto& out=outputs[outputIndex];
         auto& state=states[current];
-        SourcePair images=pair(current,previous,horizon>0);
-        CUdeviceptr cut=horizon>0?state.sceneCut:0;
-        if (horizon>0)
+        const bool useVectors=horizon>0||(mouse&&flowReady);
+        SourcePair images=pair(current,previous,useVectors);
+        CUdeviceptr cut=useVectors?state.sceneCut:0;
+        if (useVectors)
             cu.check(cu.waitEvent(displayStream,state.ready,0),"Order prediction after optical flow");
         cu.check(cu.map(1,&out.interop,displayStream),"Map DXGI output for CUDA");
         out.mapped=true;
@@ -269,7 +272,13 @@ public:
             throw Error("Mapped CUDA output is too small");
         OutputImage target{pixels,dx.screenW,dx.screenH};
         void* args[]={&images,&target,&horizon,&radius,&feather,&cut};
-        cu.launch(renderKernel,displayStream,target.width,target.height,args);
+        if(mouse){
+            // Latch after buffer mapping, immediately before GPU dispatch.
+            InputPose pose=mouse->Sample(previousPose,currentPose,images.width,images.height,
+                g_autoHudEnabled.load(std::memory_order_relaxed),g_autoGunEnabled.load(std::memory_order_relaxed));
+            void* inputArgs[]={&images,&target,&horizon,&radius,&feather,&cut,&pose};
+            cu.launch(inputKernel,displayStream,target.width,target.height,inputArgs);
+        }else cu.launch(renderKernel,displayStream,target.width,target.height,args);
         cu.diagnosticSync(displayStream,horizon>0?"Diagnostic: extrapolation kernel":"Diagnostic: real-frame kernel");
         // Unmap orders the next graphics use after the CUDA write. Present
         // needs no CPU readback, intermediate texture copy, or cuCtxSynchronize.
