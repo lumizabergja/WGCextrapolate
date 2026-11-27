@@ -41,6 +41,9 @@
 #include "pixel_types.h"
 #include "display_clock.h"
 #include "warp_presenter.h"
+#include <fstream>
+#include <initializer_list>
+#include <NvInferRuntime.h>
 
 using Microsoft::WRL::ComPtr;
 namespace {

@@ -1,8 +1,6 @@
 #pragma once
-#include <NvInferRuntime.h>
-#include <filesystem>
-#include <fstream>
-#include <memory>
+// Included inside FG implementation namespace; SDK/STL headers must be
+// included at global scope in main.cpp.
 // TensorRT runtime is loaded from a user-installed NVIDIA SDK; no runtime
 // binary or weights are redistributed. All execution uses the capture context.
 class AiDepth {
