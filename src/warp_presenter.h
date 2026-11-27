@@ -146,7 +146,7 @@ float PS(float4 pos:SV_Position):SV_Target {
         radiusCache=radius;featherCache=feather;lastHud=hud;lastGun=gun;maskValid=true;
     }
     bool lastHud{},lastGun{};
-    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs,InputWorker& input,double periodMs,double monitorPeriodMs,bool tearing,const ScanoutClock& scanout,GpuTiming& timing){
+    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs,InputWorker& input,double cameraDelayMs,double cameraGain,double periodMs,double monitorPeriodMs,bool tearing,const ScanoutClock& scanout,GpuTiming& timing){
         ctx->ClearState();
         updateMask(radius,feather,hud,gun);
         (void)sequence;
@@ -156,10 +156,11 @@ float PS(float4 pos:SV_Position):SV_Target {
         // into the guidance textures. Conventions follow NVIDIA's sample.
         fglate::Counts prev{},cur{};
         bool havePair=false;
-        const bool sampled=input.Pair(previousTime,sourceTime,prev,cur,havePair);
+        const auto delayTicks=int64_t(std::clamp(cameraDelayMs,0.,130.)*ticksPerMs);
+        const bool sampled=input.Pair(previousTime-delayTicks,sourceTime-delayTicks,prev,cur,havePair);
         const double hx=havePair?horizon*(cur.x-prev.x):0.;
         const double hy=havePair?horizon*(cur.y-prev.y):0.;
-        constexpr double rad=-.022*1.5*3.14159265358979323846/180.;
+        const double rad=-std::clamp(cameraGain,.3*fgmath::nominal,1.6*fgmath::nominal);
         // Local relative pose: reset source to identity for each new NGX input.
         // Subtract the camera motion already estimated by extrapolation.
         const double sourceYaw=sampled?(cur.x+hx)*rad:0.;

@@ -12,7 +12,8 @@ struct FlowBuffer {
 class CudaPipeline {
     struct FrameState {
         FlowBuffer input, vectors;
-        CUdeviceptr sceneCut{};
+        CUdeviceptr sceneCut{},probes{};
+        fgmath::Probe* hostProbes{};
         CUevent ready{},lastDisplayRead{},lumaReady{};
         CUtexObject texture{},flowTexture{};
         UINT textureWidth{},textureHeight{},texturePitch{};
@@ -31,13 +32,18 @@ class CudaPipeline {
     const CudaDriver& cu;
     const CaptureCuda& capture;
     std::unique_ptr<AiDepth> ai;
+    bool aiUnavailable{},useFlat=true;
+    fgmath::Calibrator calibration;
+    uint64_t fittedSequence{};
+    fgmath::Fit latestFit{};
+    int64_t fitTime{};
     SystemLibrary flowLibrary{L"nvofapi64.dll"};
     NV_OF_CUDA_API_FUNCTION_LIST api{};
     NvOFHandle flow{};
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{},directKernel{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{},fusedKernel{},directKernel{},probeKernel{};
     CUgraphicsResource directResources[3]{};
     CUdeviceptr directPlanes[3]{};size_t directPitches[3]{};
     bool directAttempted{},directReady{},directMapped{};
@@ -98,6 +104,8 @@ class CudaPipeline {
             // texture view over an externally managed pitched resource.
             state.flowTexture=0;
             cu.check(cu.allocate(&state.sceneCut,sizeof(unsigned)),"Allocate CUDA scene flag");
+            cu.check(cu.allocate(&state.probes,sizeof(fgmath::Probe)*fgmath::count),"Allocate flow probes");
+            cu.check(cu.hostAlloc(reinterpret_cast<void**>(&state.hostProbes),sizeof(fgmath::Probe)*fgmath::count),"Allocate pinned flow probes");
         }
     }
     void stage(int index) {
@@ -182,6 +190,7 @@ public:
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
         cu.check(cu.getFunction(&fusedKernel,module,"renderFused"),"Load fused color/depth/motion kernel");
         cu.check(cu.getFunction(&directKernel,module,"renderDirect"),"Load direct texture staging kernel");
+        cu.check(cu.getFunction(&probeKernel,module,"cameraProbes"),"Load camera fit probes");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -208,11 +217,28 @@ public:
         freeOutputs();
     }
     void PollDepth(){if(ai)ai->Poll();}
+    void ResetCamera(){calibration.reset();latestFit={};fittedSequence=0;fitTime=0;useFlat=true;}
+    void UpdateCamera(DxDevices& dx,int current,bool flowReady,int64_t previousTime,int64_t currentTime){
+        if(flowReady&&fittedSequence!=capture.frames[current].sequence){
+            const auto& frame=capture.frames[current];
+            latestFit=fgmath::fit(states[current].hostProbes,double(frame.width)/frame.height);
+            fittedSequence=frame.sequence;fitTime=currentTime;
+            if(latestFit.rotation)calibration.observe(latestFit,dx.input->DelayedPairs(previousTime,currentTime,dx.ticksPerMs));
+        }
+        // Conservative translation hint; keyboard is read only while target is foreground.
+        bool moving=false;for(int key:std::array<int,6>{'W','A','S','D',VK_SPACE,VK_CONTROL})if(GetAsyncKeyState(key)&0x8000)moving=true;
+        const bool recent=fitTime&&currentTime-fitTime>=0&&double(currentTime-fitTime)/dx.ticksPerMs<75.;
+        useFlat=!moving&&recent&&latestFit.rotation;
+        dx.cameraDelayMs=calibration.trusted?calibration.delayMs:0.;
+        dx.cameraGain=calibration.trusted?calibration.gain:fgmath::nominal;
+    }
     bool DepthReady(int current,int previous,bool flowReady){
         PollDepth();return ai&&(ai->Ready(current,capture.frames[current].sequence)||(flowReady&&previous>=0&&ai->Ready(previous,capture.frames[previous].sequence)));
     }
     void PrepareDepth(int current,int previous,bool flowReady,bool urgent){
-        if(!ai){if(urgent)return;ai=std::make_unique<AiDepth>(cu,capture.context);ai->Open(module);}
+        if(useFlat||aiUnavailable||urgent)return;
+        wchar_t disable[4]{};if(GetEnvironmentVariableW(L"FG_AI_DEPTH",disable,4)==1&&disable[0]==L'0'){aiUnavailable=true;return;}
+        if(!ai){try{ai=std::make_unique<AiDepth>(cu,capture.context);ai->Open(module);}catch(...){ai.reset();aiUnavailable=true;return;}}
         ai->Poll();if(urgent)return;
         // Skip only a contiguous source whose previous exact depth is ready
         // and whose backward flow is already published. Never chain stale depth.
@@ -281,7 +307,10 @@ public:
         void* args[]={&images,&state.sceneCut};
         cu.check(cu.launchKernel(sceneKernel,1,1,1,1,1,1,0,flowOutputStream,args,nullptr),"Evaluate V15 scene cut");
         cu.diagnosticSync(flowOutputStream,"Diagnostic: scene gate");
-        cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow for this frame pair");
+        void* probeArgs[]={&images,&state.sceneCut,&state.probes};
+        cu.check(cu.launchKernel(probeKernel,1,1,1,64,1,1,0,flowOutputStream,probeArgs,nullptr),"Sample camera flow");
+        cu.check(cu.copyHost(state.hostProbes,state.probes,sizeof(fgmath::Probe)*fgmath::count,flowOutputStream),"Read small camera sample");
+        cu.check(cu.recordEvent(state.ready,flowOutputStream),"Publish optical flow and camera sample");
     }
     bool PairReady(int current) const { return cu.complete(states[current].ready); }
     bool PrepareDirect(DxDevices& dx){
@@ -298,7 +327,7 @@ public:
         }
         directReady=true;return true;
     }
-    bool DrawDirect(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady,unsigned flags){
+    bool DrawDirect(DxDevices& dx,int current,int previous,float horizon,float radius,float feather,bool flowReady,unsigned flags,bool aiReady){
         if(!PrepareDirect(dx))return false;
         // Register and map only owned NGX input textures, not capture surfaces.
         CUresult mapped=cu.map(3,directResources,displayStream);
@@ -325,9 +354,9 @@ public:
         if(needFlow)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order direct output after optical flow");
         OutputImage target{directPlanes[0],dx.screenW,dx.screenH},guidance{directPlanes[1],dx.screenW,dx.screenH};
         unsigned cp=unsigned(directPitches[0]),dp=unsigned(directPitches[1]),mp=unsigned(directPitches[2]);
-        unsigned previousDepth=ai->Ready(current,capture.frames[current].sequence)?0u:1u;
+        unsigned previousDepth=aiReady&&!ai->Ready(current,capture.frames[current].sequence)?1u:0u;
         const int depthSlot=previousDepth?previous:current;
-        CUdeviceptr raw=ai->Raw(depthSlot),range=ai->Range(depthSlot),motion=directPlanes[2];
+        CUdeviceptr raw=aiReady?ai->Raw(depthSlot):0,range=aiReady?ai->Range(depthSlot):0,motion=directPlanes[2];
         float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
         void* args[]={&images,&target,&guidance,&motion,&cp,&dp,&mp,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
         cu.launch(directKernel,displayStream,target.width,target.height,args);
@@ -344,9 +373,10 @@ public:
         dx.reflex.Begin();
         auto& out=outputs[outputIndex];
         auto& state=states[current];
-        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
+        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed);
+        const bool aiReady=depthReady&&!useFlat&&DepthReady(current,previous,flowReady);
         unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
-        if(depthReady&&DrawDirect(dx,current,previous,horizon,radius,feather,flowReady,flags))return;
+        if(depthReady&&DrawDirect(dx,current,previous,horizon,radius,feather,flowReady,flags,aiReady))return;
         if(depthReady&&!out.depthInterop){
             const uint64_t elements=uint64_t(dx.screenW)*dx.screenH;
             if(elements>UINT_MAX/16)throw Error("Guidance output too large");
@@ -371,9 +401,9 @@ public:
             cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
             if(!d||size<uint64_t(target.width)*target.height*16)throw Error("AI depth output too small");
             OutputImage guidance{d,target.width,target.height};
-            unsigned previousDepth=ai->Ready(current,capture.frames[current].sequence)?0u:1u;
+            unsigned previousDepth=aiReady&&!ai->Ready(current,capture.frames[current].sequence)?1u:0u;
             const int depthSlot=previousDepth?previous:current;
-            CUdeviceptr raw=ai->Raw(depthSlot),range=ai->Range(depthSlot);
+            CUdeviceptr raw=aiReady?ai->Raw(depthSlot):0,range=aiReady?ai->Range(depthSlot):0;
             float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
             void* args[]={&images,&target,&guidance,&horizon,&radius,&feather,&cut,&raw,&range,&interval,&previousDepth,&flags};
             cu.launch(fusedKernel,displayStream,target.width,target.height,args);
@@ -400,6 +430,8 @@ public:
             if (state.input.handle) api.nvOFDestroyGPUBufferCuda(state.input.handle);
             if (state.vectors.handle) api.nvOFDestroyGPUBufferCuda(state.vectors.handle);
             if (state.sceneCut) cu.freeMemory(state.sceneCut);
+            if(state.probes)cu.freeMemory(state.probes);
+            if(state.hostProbes)cu.hostFree(state.hostProbes);
             if (state.lumaReady) cu.destroyEvent(state.lumaReady);
             if (state.ready) cu.destroyEvent(state.ready);
             if (state.lastDisplayRead) cu.destroyEvent(state.lastDisplayRead);

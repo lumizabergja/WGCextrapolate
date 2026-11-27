@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <stdexcept>
 #include "late_input.h"
+#include "camera_fit.h"
 namespace fgwarp {
 inline int64_t stamp(){LARGE_INTEGER t{};QueryPerformanceCounter(&t);return t.QuadPart;}
 class InputWorker {
@@ -56,6 +57,15 @@ public:
     bool Pair(int64_t previous,int64_t current,fglate::Counts& prev,fglate::Counts& cur,bool& havePair){
         std::lock_guard<std::mutex> g(lock);const bool sampled=accept&&history.at(current,cur);
         havePair=sampled&&previous<current&&history.at(previous,prev);return sampled;
+    }
+    std::array<fgmath::Delta,fgmath::delays> DelayedPairs(int64_t prev,int64_t cur,double ticksPerMs){
+        std::array<fgmath::Delta,fgmath::delays> result{};
+        std::lock_guard<std::mutex> g(lock);
+        if(!accept||prev>=cur)return result;
+        for(unsigned i=0;i<result.size();++i){
+            fglate::Counts a{},b{};auto shift=int64_t(10.*i*ticksPerMs);
+            if(history.at(prev-shift,a)&&history.at(cur-shift,b))result[i]={b.x-a.x,b.y-a.y,true};
+        }return result;
     }
     bool Latest(int64_t now,double ticksPerMs,double lead,fglate::Counts& current,fglate::Counts& future){
         std::lock_guard<std::mutex> g(lock);if(!accept||!history.at(now,current))return false;

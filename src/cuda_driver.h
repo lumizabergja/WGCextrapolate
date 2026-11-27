@@ -40,6 +40,9 @@ struct CudaDriver {
     FG_DRIVER(allocatePitch,cuMemAllocPitch);
     FG_DRIVER(copy2D,cuMemcpy2DAsync);
     FG_DRIVER(copyDevice,cuMemcpyDtoDAsync);
+    FG_DRIVER(copyHost,cuMemcpyDtoHAsync);
+    FG_DRIVER(hostAlloc,cuMemAllocHost);
+    FG_DRIVER(hostFree,cuMemFreeHost);
     FG_DRIVER(mappedArray,cuGraphicsSubResourceGetMappedArray);
     FG_DRIVER(arrayDesc,cuArrayGetDescriptor);
     FG_DRIVER(beginCapture,cuStreamBeginCapture);

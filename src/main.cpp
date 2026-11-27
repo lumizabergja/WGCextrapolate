@@ -204,7 +204,7 @@ struct DxDevices {
         return 0.f;
     }
     uint64_t warpSequence{}; int64_t warpPrevious{},warpCurrent{};
-    double warpHorizon{},ticksPerMs{};UINT warpSrcW{},warpSrcH{};
+    double warpHorizon{},ticksPerMs{},cameraDelayMs{},cameraGain=fgmath::nominal;UINT warpSrcW{},warpSrcH{};
     void ResetWarpHistory(){lastGuidanceSequence=0;lastGuidanceHorizon=0;if(warp)warp->resetHistory();}
     void DrainWarp(){if(!warp)return;ctx11->ClearState();D3D11_QUERY_DESC q{D3D11_QUERY_EVENT,0};ComPtr<ID3D11Query> event;Check(dev11->CreateQuery(&q,&event),"NGX shutdown query");ctx11->End(event.Get());ctx11->Flush();HRESULT r;while((r=ctx11->GetData(event.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH))==S_FALSE)Sleep(1);Check(r,"NGX drain");warp.reset();}
     ComPtr<ID3D11Buffer> constants;
@@ -352,7 +352,7 @@ Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uin
             ctx11->Draw(3,0);ctx11->ClearState();
             }
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
-                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,periodMs,monitorPeriodMs,allowTearing,scanout,gpuTiming);
+                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,cameraDelayMs,cameraGain,periodMs,monitorPeriodMs,allowTearing,scanout,gpuTiming);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
             gpuTiming.End();
             lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
@@ -581,7 +581,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
-                input.Focus(true);dx.scanout.ResetPhase();dx.ResetWarpHistory();
+                input.Focus(true);gpu.ResetCamera();dx.scanout.ResetPhase();dx.ResetWarpHistory();
                 previousPoseTime=currentPoseTime=0;
                 resumeWarmup=2;
                 displayClock.reset();
@@ -645,7 +645,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     flow.Request(current,previous,sequence);
                 }
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
-                const bool cameraReady=g_warpEnabled.load(std::memory_order_relaxed)&&extrapolate&&gpu.DepthReady(current,previous,flowReady);
+                gpu.UpdateCamera(dx,current,flowReady,previousPoseTime,currentPoseTime);
+                const bool cameraReady=g_warpEnabled.load(std::memory_order_relaxed)&&extrapolate;
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);
                 if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65){
@@ -911,7 +912,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             HWND c=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x,y,width,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
             StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
         };
-        g_warp=checkbox(L"AI depth + NVIDIA Frame Warp (0-5 ms)",36,493,480,kWarp);
+        g_warp=checkbox(L"Adaptive depth + NVIDIA Frame Warp",36,493,480,kWarp);
         g_hud=checkbox(L"Freeze HUD regions",36,524,250,kHud);
         g_gun=checkbox(L"Freeze gun region",285,524,250,kGun);
         g_reflex=checkbox(L"NVIDIA Reflex + Boost",36,552,490,kReflex);

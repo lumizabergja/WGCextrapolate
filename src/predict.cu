@@ -198,7 +198,7 @@ extern "C" __global__ void renderFused(SourcePair pair,OutputImage target,Output
         reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);
         reinterpret_cast<float4*>(guidance.pixels)[idx]={.999f,0,0,0};return;
     }
-    float d=readDepth(raw,uv);float2 motion={0,0};
+    float d=raw?readDepth(raw,uv):0.f;float2 motion={0,0};
     if(previousDepth&&cut&&*cut){reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);reinterpret_cast<float4*>(guidance.pixels)[idx]={.999f,0,0,0};return;}
     if(cut&&!*cut&&pair.flow&&pair.flowPitch){
         float2 v=flowAt(pair,uv),q={uv.x+horizon*v.x,uv.y+horizon*v.y};
@@ -211,17 +211,36 @@ extern "C" __global__ void renderFused(SourcePair pair,OutputImage target,Output
                 float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*(1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
                 float weight=confidence*protection(uv,target,radius,feather);
                 if(horizon>.00001f)base=mixColor(base,next,weight);
-                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
-                if(!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
+                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(raw&&previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
+                if(raw&&!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
             }
         }
     }
-    float lo=range[0],hi=range[1];
+    float lo=range?range[0]:0.f,hi=range?range[1]:0.f;
     float disparity=(isfinite(d)&&hi-lo>1.e-6f)?fminf(1.f,fmaxf(0.f,(d-lo)/(hi-lo))):0.f;
     float inv=.02f+1.98f*disparity;
-    float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
+    float depth=raw?(1000.f/(1000.f-.1f))*(1.f-.1f*inv):.999f;
     reinterpret_cast<unsigned*>(target.pixels)[idx]=pack(base);
     reinterpret_cast<float4*>(guidance.pixels)[idx]={fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y,0.f};
+}
+
+// A small confidence-filtered flow sample, read asynchronously once per source pair.
+struct CameraProbe{float u,v,dx,dy,weight;};
+extern "C" __global__ void cameraProbes(SourcePair pair,const unsigned* cut,CameraProbe* out){
+    unsigned i=threadIdx.x;if(i>=48)return;
+    float2 uv={(float(i%8)+.5f)/8,(float(i/8)+.5f)/6};
+    CameraProbe p{uv.x,uv.y,0,0,0};
+    if(!*cut&&!fixedFreeze(uv,3u)&&!(fabsf(uv.x-.5f)<.045f&&fabsf(uv.y-.5f)<.045f)){
+        float2 v=flowAt(pair,uv),old={uv.x+v.x,uv.y+v.y};
+        if(!outside(old)&&magnitude(v.x,v.y)<.16f){
+            Color a=sampleColor(pair,pair.current,pair.currentPitch,uv);
+            Color b=sampleColor(pair,pair.previous,pair.previousPitch,old);
+            float2 px={uv.x+4.f/pair.width,uv.y},py={uv.x,uv.y+4.f/pair.height};
+            float texture=fmaxf(residual(a,sampleColor(pair,pair.current,pair.currentPitch,px)),residual(a,sampleColor(pair,pair.current,pair.currentPitch,py)));
+            p.dx=v.x;p.dy=v.y;p.weight=(1.f-smooth(.035f,.12f,residual(a,b)))*smooth(.008f,.04f,texture);
+        }
+    }
+    out[i]=p;
 }
 
 // Explicit pitched linear planes copied into mapped D3D11 CUDA arrays.
@@ -244,7 +263,7 @@ extern "C" __global__ void renderDirect(SourcePair pair,OutputImage target,Outpu
     if(fixedFreeze(uv,flags)){
         writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,.999f,0.f,0.f);return;
     }
-    float d=readDepth(raw,uv);float2 motion={0,0};
+    float d=raw?readDepth(raw,uv):0.f;float2 motion={0,0};
     if(previousDepth&&cut&&*cut){writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,.999f,0.f,0.f);return;}
     if(cut&&!*cut&&pair.flow&&pair.flowPitch){
         float2 v=flowAt(pair,uv),q={uv.x+horizon*v.x,uv.y+horizon*v.y};
@@ -257,15 +276,15 @@ extern "C" __global__ void renderDirect(SourcePair pair,OutputImage target,Outpu
                 float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*(1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
                 float weight=confidence*protection(uv,target,radius,feather);
                 if(horizon>.00001f)base=mixColor(base,next,weight);
-                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
-                if(!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
+                if(mag<.12f){motion={mv.x*target.width*interval*weight,mv.y*target.height*interval*weight};if(raw&&previousDepth)d=mixValue(d,readDepth(raw,old),weight);}
+                if(raw&&!previousDepth&&horizon>.00001f)d=mixValue(d,readDepth(raw,q),weight);
             }
         }
     }
-    float lo=range[0],hi=range[1];
+    float lo=range?range[0]:0.f,hi=range?range[1]:0.f;
     float disparity=(isfinite(d)&&hi-lo>1.e-6f)?fminf(1.f,fmaxf(0.f,(d-lo)/(hi-lo))):0.f;
     float inv=.02f+1.98f*disparity;
-    float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
+    float depth=raw?(1000.f/(1000.f-.1f))*(1.f-.1f*inv):.999f;
     writeDirect(target,guidance,motionPlane,colorPitch,depthPitch,motionPitch,x,y,base,fminf(1.f,fmaxf(0.f,depth)),motion.x,motion.y);
 }
 #endif
