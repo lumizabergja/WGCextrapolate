@@ -50,6 +50,13 @@ int main(){
     sceneGate(pair,&cut); assert(cut==0);
     auto real=display(pair,w,h,0,0,0,0);
     auto predicted=display(pair,w,h,1.f,0,0,0);
+    std::vector<unsigned char> confidence(w*h);
+    blockDim={1,1,1};threadIdx={0,0,0};
+    for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){blockIdx={x,y,0};buildConfidence(pair,confidence.data());}
+    pair.confidence=address(confidence.data());
+    auto cached=display(pair,w,h,1.f,0,0,0);
+    for(unsigned y=0;y<h;++y)for(unsigned x=5;x<w;++x)assert(cached[y*w+x]==predicted[y*w+x]);
+    pair.confidence=0;
     auto protectedCenter=display(pair,w,h,1.f,6,0,0);
     auto feather=display(pair,w,h,1.f,3,10,0);
     auto cutBypass=display(pair,w,h,1.f,0,0,1);

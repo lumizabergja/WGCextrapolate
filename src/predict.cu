@@ -1,4 +1,7 @@
 #include "pixel_types.h"
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#endif
 
 // Full-range BT.601 luma from NvFBC's little-endian BGRA pixels. CUDA NvOFA
 // consumes one byte per pixel. The original color buffers feed presentation.
@@ -102,6 +105,30 @@ __device__ __forceinline__ float protection(float2 uv, OutputImage target, float
     float d=magnitude((uv.x-.5f)*target.width,(uv.y-.5f)*target.height);
     return feather>0 ? smooth(radius,radius+feather,d) : float(d>radius);
 }
+// Source-space photometric consistency is independent of prediction horizon.
+// Keep the original per-output flow-discontinuity check.
+__device__ __forceinline__ float confidenceAt(const SourcePair& pair,float2 uv) {
+#if defined(__CUDA_ARCH__)
+    if(pair.confidenceTexture)
+        return tex2D<float>(static_cast<cudaTextureObject_t>(pair.confidenceTexture),uv.x,uv.y);
+#endif
+    const auto* p=reinterpret_cast<const unsigned char*>(pair.confidence);
+    Cell x=cell(uv.x*pair.width-.5f,pair.width),y=cell(uv.y*pair.height-.5f,pair.height);
+    return mixValue(mixValue(p[y.lo*pair.width+x.lo],p[y.lo*pair.width+x.hi],x.f),
+                    mixValue(p[y.hi*pair.width+x.lo],p[y.hi*pair.width+x.hi],x.f),y.f)/255.f;
+}
+extern "C" __global__ void buildConfidence(SourcePair pair,unsigned char* out) {
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=pair.width||y>=pair.height)return;
+    float2 uv={(x+.5f)/pair.width,(y+.5f)/pair.height},v=flowAt(pair,uv);
+    float2 old={uv.x+v.x,uv.y+v.y};
+    float confidence=0;
+    if(!outside(old)&&magnitude(v.x,v.y)<=.12f)
+        confidence=1.f-smooth(.045f,.20f,residual(
+            sampleColor(pair,pair.current,pair.currentPitch,uv),
+            sampleColor(pair,pair.previous,pair.previousPitch,old)));
+    out[y*pair.width+x]=static_cast<unsigned char>(__float2uint_rn(confidence*255.f));
+}
 __device__ __forceinline__ Color predict(const SourcePair& pair, float2 uv, Color base,
                                          float horizon, float centerWeight) {
     if (centerWeight==0) return base;
@@ -112,24 +139,48 @@ __device__ __forceinline__ Color predict(const SourcePair& pair, float2 uv, Colo
     float2 old={q.x+mv.x,q.y+mv.y};
     if (outside(old) || magnitude(mv.x,mv.y)>.12f) return base;
     Color next=sampleColor(pair,pair.current,pair.currentPitch,q);
-    Color prev=sampleColor(pair,pair.previous,pair.previousPitch,old);
-    float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*
-                     (1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
+    float photo;
+    if(pair.confidence)photo=confidenceAt(pair,q);
+    else {
+        Color prev=sampleColor(pair,pair.previous,pair.previousPitch,old);
+        photo=1.f-smooth(.045f,.20f,residual(next,prev));
+    }
+    float confidence=photo*(1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
     return mixColor(base,next,confidence*centerWeight);
 }
 
-extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, float horizon,
-                                       float radius, float feather, const unsigned* cut) {
-    unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x>=target.width || y>=target.height) return;
-    unsigned* destination=reinterpret_cast<unsigned*>(target.pixels)+y*target.width+x;
+__device__ __forceinline__ unsigned renderedPixel(SourcePair pair, OutputImage target,float horizon,
+                                       float radius,float feather,const unsigned* cut,unsigned x,unsigned y) {
     bool native=pair.width==target.width && pair.height==target.height;
     bool extrapolate=horizon>.00001f && !*cut;
     const unsigned* source=reinterpret_cast<const unsigned*>(pair.current);
-    if (native && !extrapolate) { *destination=source[y*pair.currentPitch+x]; return; }
+    if (native && !extrapolate) return source[y*pair.currentPitch+x];
     float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
     Color base=native ? unpack(source[y*pair.currentPitch+x]) : sampleColor(pair,pair.current,pair.currentPitch,uv);
     if (extrapolate) base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
-    *destination=pack(base);
+    return pack(base);
 }
+extern "C" __global__ void renderFrame(SourcePair pair,OutputImage target,float horizon,float radius,float feather,const unsigned* cut){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    reinterpret_cast<unsigned*>(target.pixels)[y*target.width+x]=renderedPixel(pair,target,horizon,radius,feather,cut,x,y);
+}
+#ifdef __CUDACC__
+extern "C" __global__ void renderSurface(SourcePair pair,OutputImage target,float horizon,float radius,float feather,const unsigned* cut,cudaSurfaceObject_t surface){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    surf2Dwrite(renderedPixel(pair,target,horizon,radius,feather,cut,x,y),surface,x*4,y);
+}
+#endif
+extern "C" __global__ void renderReal(SourcePair pair,OutputImage target){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    reinterpret_cast<unsigned*>(target.pixels)[y*target.width+x]=renderedPixel(pair,target,0,0,0,nullptr,x,y);
+}
+#ifdef __CUDACC__
+extern "C" __global__ void renderRealSurface(SourcePair pair,OutputImage target,cudaSurfaceObject_t surface){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    surf2Dwrite(renderedPixel(pair,target,0,0,0,nullptr,x,y),surface,x*4,y);
+}
+#endif

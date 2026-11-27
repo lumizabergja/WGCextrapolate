@@ -59,6 +59,17 @@ struct CudaDriver {
     FG_DRIVER(mappedPointer,cuGraphicsResourceGetMappedPointer);
     FG_DRIVER(createTexture,cuTexObjectCreate);
     FG_DRIVER(destroyTexture,cuTexObjectDestroy);
+    FG_DRIVER(importMemory,cuImportExternalMemory);
+    FG_DRIVER(mappedMip,cuExternalMemoryGetMappedMipmappedArray);
+    FG_DRIVER(destroyMemory,cuDestroyExternalMemory);
+    FG_DRIVER(mipLevel,cuMipmappedArrayGetLevel);
+    FG_DRIVER(destroyMip,cuMipmappedArrayDestroy);
+    FG_DRIVER(createSurface,cuSurfObjectCreate);
+    FG_DRIVER(destroySurface,cuSurfObjectDestroy);
+    FG_DRIVER(importSemaphore,cuImportExternalSemaphore);
+    FG_DRIVER(destroySemaphore,cuDestroyExternalSemaphore);
+    FG_DRIVER(waitSemaphore,cuWaitExternalSemaphoresAsync);
+    FG_DRIVER(signalSemaphore,cuSignalExternalSemaphoresAsync);
 #undef FG_DRIVER
 #undef FG_DRIVER_STRING
 #undef FG_DRIVER_STRING_IMPL

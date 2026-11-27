@@ -1,7 +1,10 @@
-# FG V15 v16 - deadline / texture CUDA revision
+# FG CUDA Ultra Pipeline
 
-Run FG.exe, select the game, select Off, x2-x6 or Dynamic, and Start. Dynamic defaults to 320 FPS. Working NvFBC CUDA PID capture is required. The UI, center radius/feather, D3D11 flip-model presenter and NvOFA 4x4 FAST (cost off) remain unchanged.
+This experimental revision keeps NvFBC CUDA PID capture, the existing UI, Dynamic 320, x2-x6, center protection and full-resolution NvOFA 4x4 FAST cost OFF.
 
-Changes from the supplied Early NvOFA source: phase-locked deadline pacing without integer Dynamic rounding, latest-source selection after a DXGI queue slot becomes available, actual frame-pair interval for extrapolation, and optional CUDA hardware bilinear sampling for BGRA and motion vectors. Incompatible texture pitches use the original manual sampling. No CPU frame copy is introduced. The old D3D11 map/unmap path is retained; persistent graphics sharing, half-resolution flow and CUDA graphs are not included in this revision.
+- Persistent D3D11 shared KMT textures, imported CUDA surface arrays and per-slot D3D11/CUDA timeline fences. If texture import or fence initialization fails, the original mapped-buffer presenter is selected before any output submission. Status indicates the chosen route. No runtime recovery after a GPU submission failure.
+- Separate luma preparation stream: prepare each selected frame before its OFA pair is requested, including while prior OFA work is active. Slot retirement also waits for luma completion.
+- Source-resolution photometric confidence map per pair, reused across predictions. Flow discontinuity and border/center protection remain per output. Bilinear confidence lookup approximates the previous exact color-residual calculation.
+- Separate real-frame kernel, phase-locked output, bounded event waits and limited prediction lead based on deadline and measured CPU submission time; not a scanout measurement.
 
-Build: open an x64 Visual Studio Developer Command Prompt, set CUDA_PATH to the CUDA Toolkit directory and run Build.cmd. PTX is regenerated on every build because the kernel argument ABI changed. Run Build.cmd --blackwell with CUDA 12.8+ to embed an SM 120 cubin alongside the generic PTX. The application loads the cubin if supported and otherwise loads PTX. Test.cmd runs CPU simulation tests; it does not test the NVIDIA driver or actual display cadence.
+Build with Build.cmd --blackwell, then Test.cmd. AppVeyor produces Windows and source ZIPs. Real GPU synchronization, KMT texture allocation-size compatibility and latency require testing on the target PC. No claim of native 320 FPS input latency.

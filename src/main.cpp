@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
@@ -168,7 +169,7 @@ struct DxDevices {
     bool allowTearing{};
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> ps, texturePS;
     ComPtr<ID3D11Buffer> constants;
     UINT screenW{},screenH{},swapFlags{};
     ComPtr<IDXGIAdapter> matchingAdapter;
@@ -224,12 +225,16 @@ struct DxDevices {
         // only scans the registered pixel buffer into the same flip-model RTV.
         static const char* shader=R"HLSL(
 Buffer<float4> pixels : register(t0);
+Texture2D<float4> imageTexture : register(t1);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
 }
 float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
+}
+float4 TexturePS(float4 position : SV_Position) : SV_Target {
+    return imageTexture.Load(int3(int2(position.xy),0)).bgra;
 }
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
@@ -239,6 +244,9 @@ float4 PS(float4 position : SV_Position) : SV_Target {
                          D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&pixel,nullptr),"Compile DXGI pixel shader");
         Check(dev11->CreateVertexShader(vertex->GetBufferPointer(),vertex->GetBufferSize(),nullptr,&vs),"Create vertex shader");
         Check(dev11->CreatePixelShader(pixel->GetBufferPointer(),pixel->GetBufferSize(),nullptr,&ps),"Create pixel shader");
+        ComPtr<ID3DBlob> texPixel;
+        Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"TexturePS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&texPixel,nullptr),"Compile persistent texture shader");
+        Check(dev11->CreatePixelShader(texPixel->GetBufferPointer(),texPixel->GetBufferSize(),nullptr,&texturePS),"Create persistent texture shader");
         D3D11_BUFFER_DESC layout{};
         layout.ByteWidth=16; layout.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&layout,nullptr,&constants),"Create DXGI image layout");
@@ -260,18 +268,22 @@ float4 PS(float4 position : SV_Position) : SV_Target {
         Check(dev11->CreateRenderTargetView(back.Get(),nullptr,&rtv),"Create resized RTV");
         screenW=width; screenH=height; SetStride();
     }
-    void Present(ID3D11ShaderResourceView* image) {
+    void Present(ID3D11ShaderResourceView* image,bool sharedTexture=false,ID3D11DeviceContext4* fenceContext=nullptr,ID3D11Fence* fence=nullptr,UINT64 releaseValue=0) {
         D3D11_VIEWPORT viewport{0,0,float(screenW),float(screenH),0,1};
         ctx11->RSSetViewports(1,&viewport);
         ctx11->OMSetRenderTargets(1,rtv.GetAddressOf(),nullptr);
         ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx11->VSSetShader(vs.Get(),nullptr,0);
-        ctx11->PSSetShader(ps.Get(),nullptr,0);
+        ctx11->PSSetShader(sharedTexture?texturePS.Get():ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
-        ctx11->PSSetShaderResources(0,1,&image);
+        ctx11->PSSetShaderResources(sharedTexture?1:0,1,&image);
         ctx11->Draw(3,0);
         ID3D11ShaderResourceView* none=nullptr;
-        ctx11->PSSetShaderResources(0,1,&none);
+        ctx11->PSSetShaderResources(sharedTexture?1:0,1,&none);
+        if(fenceContext){
+            Check(fenceContext->Signal(fence,releaseValue),"Signal D3D11 texture read complete");
+            ctx11->Flush(); // submit the release before CUDA can wait on the next reuse
+        }
         Check(swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0),"DXGI low-latency Present");
     }
 };
@@ -356,7 +368,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
         AsyncFlow flow(gpu,cuda,capture.context);
-        Status(L"Running");
+        Status(gpu.Persistent()?L"Running - persistent CUDA sharing":L"Running - compatible CUDA interop");
 
         CaptureMailbox mailbox;
         std::array<bool,kNumCapture> retiredPending{};
@@ -427,6 +439,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
         CaptureProducerGuard producerGuard{producer,mailbox,&overlay};
         LARGE_INTEGER freq{},last{},now{};QueryPerformanceFrequency(&freq);QueryPerformanceCounter(&last);
         double sourcePeriod=1.0/60.0, pairPeriod=sourcePeriod;
+        double submissionEstimate=0.00025;
         DisplayClock displayClock;
         LARGE_INTEGER previousCaptureAt{};
         int current=-1,previous=-1;
@@ -499,7 +512,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 if(current>=0 && (capture.frames[current].width!=incoming.width ||
                                   capture.frames[current].height!=incoming.height))
                     return SessionOutcome::Recreate;
-                gpu.NewFrame(next);
+                gpu.NewFrame(next,g_fgMode.load(std::memory_order_relaxed)!=1);
                 const int retiring=previous;
                 previous=current;current=next;
                 // Use producer capture-completion timestamps, not the time the
@@ -539,14 +552,14 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
                 const bool useFlow=pairEligible && extrapolate;
                 const auto sequence=capture.frames[current].sequence;
-                if(useFlow) flow.Request(current,previous,sequence);
+                if(useFlow){gpu.PreparePair(current,previous);flow.Request(current,previous,sequence);}
                 const bool flowReady=useFlow && flow.Ready(current,sequence);
                 const double step=displayPeriod(mode,target,sourcePeriod);
                 displayClock.configure(clockNow,step);
                 if(next<0&&!realFramePending&&elapsed>sourcePeriod*1.65){
                     // Allow short capture jitter without abruptly freezing FG;
                     // stop extrapolating only when a real-frame gap is large.
-                    SwitchToThread();continue;
+                    MsgWaitForMultipleObjectsEx(1,&mailbox.readyEvent,1,QS_ALLINPUT,MWMO_INPUTAVAILABLE);continue;
                 }
                 // A real frame whose DXGI slot was busy remains urgent even if
                 // the mailbox is empty on the following iteration.
@@ -589,14 +602,19 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                     const double submitTime=double(now.QuadPart)/double(freq.QuadPart);
                     const double age=double(now.QuadPart-last.QuadPart)/double(freq.QuadPart);
                     const float prediction=(realFramePending||!flowReady)?0.f:
-                        float(std::clamp(age/pairPeriod,0.0,1.25));
+                        float(std::clamp((age+std::clamp(displayClock.deadline()-submitTime+submissionEstimate,0.0,step*0.5))/pairPeriod,0.0,1.25));
                     gpu.Draw(dx,current,previous>=0?previous:current,prediction,
                              float(g_centerRadiusPx.load(std::memory_order_relaxed)),
                              float(g_centerFeatherPx.load(std::memory_order_relaxed)));
                     displaySlotReserved=false;
                     realFramePending=false;
                     displayClock.submitted(submitTime);
-                }else SwitchToThread();
+                    QueryPerformanceCounter(&now);
+                    const double submitCost=double(now.QuadPart)/double(freq.QuadPart)-submitTime;
+                    submissionEstimate=0.9*submissionEstimate+0.1*std::clamp(submitCost,0.0,step*0.5);
+                }else if(displayClock.deadline()-clockNow>0.002 || (!flowReady&&!realFramePending))
+                    MsgWaitForMultipleObjectsEx(1,&mailbox.readyEvent,1,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+                else SwitchToThread();
             } else {
                 // No current frame: block on capture publication instead of
                 // waiting for an arbitrary 1ms polling tick. Bound the wait
