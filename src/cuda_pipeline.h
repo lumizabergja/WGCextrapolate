@@ -286,7 +286,8 @@ public:
         if (!pixels || bytes<uint64_t(dx.screenW)*dx.screenH*4)
             throw Error("Mapped CUDA output is too small");
         OutputImage target{pixels,dx.screenW,dx.screenH};
-        void* args[]={&images,&target,&horizon,&radius,&feather,&cut};
+        unsigned flags=(g_hudEnabled.load(std::memory_order_relaxed)?1u:0u)|(g_gunEnabled.load(std::memory_order_relaxed)?2u:0u);
+        void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&flags};
         cu.launch(renderKernel,displayStream,target.width,target.height,args);
         PollDepth();
         const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&DepthReady(current,previous,flowReady);
@@ -308,7 +309,7 @@ public:
             SourcePair guidance=pair(current,previous,flowReady);CUdeviceptr guidanceCut=flowReady?state.sceneCut:0;
             if(flowReady)cu.check(cu.waitEvent(displayStream,state.ready,0),"Order guidance after optical flow");
             float interval=dx.MotionInterval(dx.warpSequence,dx.warpHorizon);
-            void* depthArgs[]={&guidance,&depthTarget,&horizon,&radius,&feather,&guidanceCut,&raw,&range,&interval,&previousDepth};
+            void* depthArgs[]={&guidance,&depthTarget,&horizon,&radius,&feather,&guidanceCut,&raw,&range,&interval,&previousDepth,&flags};
             cu.launch(depthKernel,displayStream,target.width,target.height,depthArgs);
             cu.check(cu.unmap(1,&out.depthInterop,displayStream),"Hand AI depth to D3D11");out.depthMapped=false;
         }
@@ -317,7 +318,7 @@ public:
         // needs no CPU readback, intermediate texture copy, or cuCtxSynchronize.
         cu.check(cu.unmap(1,&out.interop,displayStream),"Hand CUDA output to DXGI");
         out.mapped=false;
-        dx.Present(out.view.Get(),depthReady?out.depthView.Get():nullptr);
+        dx.Present(out.view.Get(),depthReady?out.depthView.Get():nullptr,flags);
         outputIndex=(outputIndex+1)%outputs.size();
     }
     ~CudaPipeline() {

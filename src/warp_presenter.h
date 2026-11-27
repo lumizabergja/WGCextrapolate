@@ -3,6 +3,7 @@
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include "late_input.h"
+#include "freeze_regions.h"
 #include <wrl/client.h>
 #include <nvsdk_ngx.h>
 #include <array>
@@ -39,14 +40,13 @@ struct Presenter {
     bool initialized{},sdkReady{};
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11Texture2D> color,output,depth,motion,ui,mask,history;
-    ComPtr<ID3D11ShaderResourceView> colorSRV,historySRV,depthSRV,motionSRV;
+    ComPtr<ID3D11Texture2D> color,output,depth,motion,ui,mask;
+    ComPtr<ID3D11ShaderResourceView> colorSRV,maskSRV;
     ComPtr<ID3D11RenderTargetView> maskRTV;
     ComPtr<ID3D11VertexShader> maskVS;
     ComPtr<ID3D11PixelShader> maskPS;
     ComPtr<ID3D11Buffer> maskConstants;
-    bool historyValid=false; uint64_t historySequence=0;
-    int64_t historyTime=0;
+    bool maskValid=false;
     ComPtr<ID3D11RenderTargetView> inputRTV,depthRTV,motionRTV;
     ComPtr<ID3D11ShaderResourceView> outputSRV;
     NVSDK_NGX_Parameter* params{};
@@ -86,13 +86,10 @@ struct Presenter {
         check(device->CreateRenderTargetView(depth.Get(),nullptr,&depthRTV),"AI depth RTV");
         motion=tex(DXGI_FORMAT_R16G16_FLOAT,sr|D3D11_BIND_RENDER_TARGET,zeros.data(),w*4);
         check(device->CreateRenderTargetView(motion.Get(),nullptr,&motionRTV),"AI motion RTV");
-        check(device->CreateShaderResourceView(depth.Get(),nullptr,&depthSRV),"Depth mask SRV");
-        check(device->CreateShaderResourceView(motion.Get(),nullptr,&motionSRV),"Motion mask SRV");
         ui=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr,zeros.data(),w*4);
         mask=tex(DXGI_FORMAT_R8_UNORM,sr|D3D11_BIND_RENDER_TARGET);
-        history=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr);
         check(device->CreateShaderResourceView(color.Get(),nullptr,&colorSRV),"Mask current color SRV");
-        check(device->CreateShaderResourceView(history.Get(),nullptr,&historySRV),"Mask history SRV");
+        check(device->CreateShaderResourceView(mask.Get(),nullptr,&maskSRV),"Fixed protection mask SRV");
         check(device->CreateRenderTargetView(mask.Get(),nullptr,&maskRTV),"Mask RTV");
         compileMask();
         const float zero[4]{};ctx->ClearRenderTargetView(maskRTV.Get(),zero);
@@ -114,80 +111,38 @@ struct Presenter {
     }
     void compileMask(){
         static const char* shader=R"HLSL(
-Texture2D<float4> currentImage : register(t0);
-Texture2D<float4> previousImage : register(t1);
-Texture2D<float> sceneDepth : register(t2);
-Texture2D<float2> sceneMotion : register(t3);
 cbuffer Config : register(b0) {
-    float2 size; float2 shift;
+    float2 size; float2 unused;
     float hud; float gun; float radius; float feather;
-    float valid; float pad0; float pad1; float pad2;
 };
 float4 VS(uint i:SV_VertexID):SV_Position {
     return float4(i==2?3.0:-1.0,i==1?3.0:-1.0,0,1);
 }
-float3 at(Texture2D<float4> img,float2 p){
-    return img.Load(int3(int2(clamp(p,float2(0,0),size-1)),0)).rgb;
-}
-float diff(float3 a,float3 b){return dot(abs(a-b),float3(.299,.587,.114));}
 float PS(float4 pos:SV_Position):SV_Target {
-    float2 p=pos.xy, uv=p/size;
-    float3 c=at(currentImage,p);
-    float edge=max(diff(c,at(currentImage,p+float2(1,0))),diff(c,at(currentImage,p+float2(0,1))));
-    // The camera shift is only an estimate; compare both its sign candidates.
-    float screenError=diff(c,at(previousImage,p));
-    float sceneError=min(diff(c,at(previousImage,p+shift)),diff(c,at(previousImage,p-shift)));
-    float move=smoothstep(1.5,5.0,length(shift))*valid;
-    float stable=(1-smoothstep(.025,.12,screenError))*smoothstep(.025,.14,sceneError-screenError);
-    float neighborhood=0;
-    [unroll] for(int y=-2;y<=2;y+=2){
-       [unroll] for(int x=-2;x<=2;x+=2){
-          float2 q=p+float2(x,y);float3 a=at(currentImage,q);
-          float d=diff(a,at(previousImage,q));
-          float e=min(diff(a,at(previousImage,q+shift)),diff(a,at(previousImage,q-shift)));
-          neighborhood=max(neighborhood,(1-smoothstep(.025,.12,d))*smoothstep(.025,.14,e-d));
-       }
-    }
-    // HUD: coherent screen-space edges, not a protected rectangle.
-    float hudMask=hud*move*max(stable,neighborhood*.8)*smoothstep(.012,.12,edge+neighborhood*.07);
-    // Weapon: lower-screen spatial prior only gates detection; no fixed area
-    // is protected without independent-motion evidence at the pixel.
-    float prior=smoothstep(.48,.77,uv.y)*smoothstep(.08,.25,abs(uv.x-.5)+.10);
-    float weaponMotion=smoothstep(.055,.22,sceneError)*smoothstep(.015,.12,edge+screenError*.5);
-    // A near-depth prior plus independent motion strengthens the existing
-    // conservative foreground mask. Not a trained semantic classifier.
-    float nearEvidence=1-smoothstep(.90,.985,sceneDepth.Load(int3(int2(p),0)));
-    float2 mv=sceneMotion.Load(int3(int2(p),0));
-    float independent=smoothstep(1.0,8.0,min(length(mv-shift),length(mv+shift)));
-    float weaponMask=gun*move*prior*max(stable*.8,weaponMotion)*(.45+.55*max(nearEvidence,independent));
+    float2 p=pos.xy,uv=p/size;
+    float x=uv.x*1650.0,y=uv.y*927.0;
+    bool fixedHUD=(hud>0.5) && )HLSL" FG_FREEZE_STR(FG_HUD_REGION(x,y)) R"HLSL(;
+    bool fixedGun=(gun>0.5) && )HLSL" FG_FREEZE_STR(FG_GUN_REGION(x,y)) R"HLSL(;
     float d=length(p-size*.5);
-    float center=(radius+feather>0)?(1-smoothstep(radius,max(radius+.001,radius+feather),d)):0;
-    return saturate(max(center,max(hudMask,weaponMask)));
+    float center=feather>0 ? 1-smoothstep(radius,radius+feather,d) : ((radius>0 && d<=radius)?1:0);
+    return (fixedHUD||fixedGun)?1: center;
 }
 )HLSL";
         ComPtr<ID3DBlob> vs,ps,err;
         auto compile=[&](const char* entry,const char* profile,ID3DBlob** blob){
-            HRESULT hr=D3DCompile(shader,strlen(shader),"FG auto mask",nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,blob,&err);
-            if(FAILED(hr))throw std::runtime_error(err?static_cast<const char*>(err->GetBufferPointer()):"Compile automatic mask");
+            HRESULT hr=D3DCompile(shader,strlen(shader),"FG fixed freeze mask",nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,blob,&err);
+            if(FAILED(hr))throw std::runtime_error(err?static_cast<const char*>(err->GetBufferPointer()):"Compile fixed freeze mask");
         };
         compile("VS","vs_5_0",vs.GetAddressOf());compile("PS","ps_5_0",ps.GetAddressOf());
         check(device->CreateVertexShader(vs->GetBufferPointer(),vs->GetBufferSize(),nullptr,&maskVS),"Create mask VS");
         check(device->CreatePixelShader(ps->GetBufferPointer(),ps->GetBufferSize(),nullptr,&maskPS),"Create mask PS");
-        D3D11_BUFFER_DESC d{};d.ByteWidth=48;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_BUFFER_DESC d{};d.ByteWidth=32;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         check(device->CreateBuffer(&d,nullptr,&maskConstants),"Create mask constants");
     }
-    void resetHistory(){historyValid=false;historySequence=0;historyTime=0;}
-    void updateMask(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t sourceTime){
-        // Keep detection on the real-frame cadence. Generated images use the
-        // latest inferred per-pixel mask, never a frozen historical color region.
-        if(historySequence==sequence && radiusCache==radius && featherCache==feather && lastHud==hud && lastGun==gun)return;
-        fglate::Counts a{},b{};
-        bool valid=historyValid && historyTime<sourceTime && inputHistory.at(historyTime,a)&&inputHistory.at(sourceTime,b);
-        constexpr double rad=.022*1.5*3.14159265358979323846/180.;
-        const float focal=float(h)*projection[5]*.5f;
-        const float shiftX=valid?float(std::clamp((b.x-a.x)*rad*focal,-double(w)*.12,double(w)*.12)):0;
-        const float shiftY=valid?float(std::clamp((b.y-a.y)*rad*focal,-double(h)*.12,double(h)*.12)):0;
-        const float data[12]={float(w),float(h),shiftX,shiftY,float(hud),float(gun),float(radius),float(feather),float(valid),0,0,0};
+    void resetHistory(){/* Fixed mask is independent of source frames. */}
+    void updateMask(UINT radius,UINT feather,bool hud,bool gun){
+        if(maskValid&&radiusCache==radius&&featherCache==feather&&lastHud==hud&&lastGun==gun)return;
+        const float data[8]={float(w),float(h),0,0,float(hud),float(gun),float(radius),float(feather)};
         ctx->UpdateSubresource(maskConstants.Get(),0,nullptr,data,0,0);
         D3D11_VIEWPORT viewport{0,0,float(w),float(h),0,1};
         ctx->RSSetViewports(1,&viewport);
@@ -195,18 +150,14 @@ float PS(float4 pos:SV_Position):SV_Target {
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(maskVS.Get(),nullptr,0);ctx->PSSetShader(maskPS.Get(),nullptr,0);
         ctx->PSSetConstantBuffers(0,1,maskConstants.GetAddressOf());
-        ID3D11ShaderResourceView* views[]={colorSRV.Get(),historyValid?historySRV.Get():colorSRV.Get(),depthSRV.Get(),motionSRV.Get()};
-        ctx->PSSetShaderResources(0,4,views);ctx->Draw(3,0);
-        ctx->ClearState();
-        if(historySequence!=sequence){
-            ctx->CopyResource(history.Get(),color.Get());historyValid=true;historySequence=sequence;historyTime=sourceTime;
-        }
-        radiusCache=radius;featherCache=feather;lastHud=hud;lastGun=gun;
+        ctx->Draw(3,0);ctx->ClearState();
+        radiusCache=radius;featherCache=feather;lastHud=hud;lastGun=gun;maskValid=true;
     }
     bool lastHud{},lastGun{};
     void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs){
         ctx->ClearState();
-        updateMask(radius,feather,hud,gun,sequence,sourceTime);
+        updateMask(radius,feather,hud,gun);
+        (void)sequence;
         // Every submitted image is a new NGX source, including CUDA-generated
         // images. A second evaluation applies the late pose to that source.
         // Relative depth and backward pixel-space motion have been drawn

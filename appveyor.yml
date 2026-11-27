@@ -4,7 +4,7 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-cuda-ai-reflex2-boost
+    - fg-cuda-ai-reflex2-fixed-freeze
 clone_depth: 1
 install:
   - ps: .\Install-ZeroCopy-CUDA.ps1
@@ -20,11 +20,11 @@ build_script:
       if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
       if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Boost-Update.zip' -Force
-      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Fetch-NVAPI.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1','Start-FG.ps1','Start-FG.cmd','Export-Portable-Model.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Boost-Source.zip' -Force
+      Compress-Archive -Path 'bin/FG.exe','README.md' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Fixed-Freeze-Update.zip' -Force
+      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Fetch-NVAPI.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1','Start-FG.ps1','Start-FG.cmd','Export-Portable-Model.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Fixed-Freeze-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-CUDA-AI-Reflex2-Boost-Source.zip
-    name: FG-CUDA-AI-Reflex2-Boost-Source
-  - path: artifacts\FG-CUDA-AI-Reflex2-Boost-Update.zip
-    name: FG-CUDA-AI-Reflex2-Boost-Update
+  - path: artifacts\FG-CUDA-AI-Reflex2-Fixed-Freeze-Source.zip
+    name: FG-CUDA-AI-Reflex2-Fixed-Freeze-Source
+  - path: artifacts\FG-CUDA-AI-Reflex2-Fixed-Freeze-Update.zip
+    name: FG-CUDA-AI-Reflex2-Fixed-Freeze-Update

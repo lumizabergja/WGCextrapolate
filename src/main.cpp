@@ -252,6 +252,8 @@ struct DxDevices {
 Buffer<float4> pixels : register(t0);
 Texture2D<float4> warped : register(t1);
 Buffer<float4> aiDepth : register(t2);
+Texture2D<float4> unwarped : register(t3);
+Texture2D<float> freezeMask : register(t4);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
@@ -259,7 +261,13 @@ float4 VS(uint id : SV_VertexID) : SV_Position {
 float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
 }
-float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(int2(position.xy),0));}
+float4 WarpPS(float4 position:SV_Position):SV_Target {
+    int3 p=int3(int2(position.xy),0);float a=freezeMask.Load(p);
+    // Branch for hard freeze: never allow NGX output to contaminate protected pixels.
+    if(a>=1.0)return unwarped.Load(p);
+    float4 c=warped.Load(p);
+    return a>0?lerp(c,unwarped.Load(p),a):c;
+}
 struct Guidance {float depth:SV_Target0;float2 motion:SV_Target1;};
 Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(position.y)*stride+uint(position.x));Guidance g;g.depth=p.x;g.motion=p.yz;return g;}
 )HLSL";
@@ -307,12 +315,14 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
         ctx11->PSSetShader(texture?warpPS.Get():ps.Get(),nullptr,0);
         ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());
         ctx11->PSSetShaderResources(texture?1:0,1,&image);
+        if(texture){ID3D11ShaderResourceView* protectedViews[]={warp->colorSRV.Get(),warp->maskSRV.Get()};ctx11->PSSetShaderResources(3,2,protectedViews);}
         ctx11->Draw(3,0);
+        if(texture){ID3D11ShaderResourceView* empty[2]{};ctx11->PSSetShaderResources(3,2,empty);}
         ID3D11ShaderResourceView* none=nullptr;
         ctx11->PSSetShaderResources(texture?1:0,1,&none);
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
     }
-    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage=nullptr){
+    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage,unsigned freezeFlags){
         if(g_warpEnabled.load(std::memory_order_relaxed)&&depthImage){
             if(!warp){
                 warp=std::make_unique<fgwarp::Presenter>();
@@ -326,7 +336,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
             ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
             ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(2,1,&depthImage);
             ctx11->Draw(3,0);ctx11->ClearState();
-            warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),g_hudEnabled.load(),g_gunEnabled.load(),
+            warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
                            warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
             lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
@@ -882,8 +892,8 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
         };
         g_warp=checkbox(L"AI depth + NVIDIA Frame Warp (0-5 ms)",36,493,480,kWarp);
-        g_hud=checkbox(L"Automatic HUD protection",36,524,250,kHud);
-        g_gun=checkbox(L"Automatic gun protection",285,524,250,kGun);
+        g_hud=checkbox(L"Freeze HUD regions",36,524,250,kHud);
+        g_gun=checkbox(L"Freeze gun region",285,524,250,kGun);
         g_reflex=checkbox(L"NVIDIA Reflex + Boost",36,552,490,kReflex);
         g_reflexStatus=UiLabel(hwnd,L"Reflex: ready (start FG to verify)",36,581,490,20,true);
         UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,610,490,20,true);

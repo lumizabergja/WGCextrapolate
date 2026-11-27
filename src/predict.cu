@@ -1,4 +1,9 @@
 #include "pixel_types.h"
+#include "freeze_regions.h"
+__device__ __forceinline__ bool fixedFreeze(float2 uv,unsigned flags){
+    const float x=uv.x*1650.f,y=uv.y*927.f;
+    return ((flags&1u)&&FG_HUD_REGION(x,y))||((flags&2u)&&FG_GUN_REGION(x,y));
+}
 
 // Full-range BT.601 luma from NvFBC's little-endian BGRA pixels. CUDA NvOFA
 // consumes one byte per pixel. The original color buffers feed presentation.
@@ -119,7 +124,7 @@ __device__ __forceinline__ Color predict(const SourcePair& pair, float2 uv, Colo
 }
 
 extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, float horizon,
-                                       float radius, float feather, const unsigned* cut) {
+                                       float radius, float feather, const unsigned* cut,unsigned flags) {
     unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x>=target.width || y>=target.height) return;
@@ -130,7 +135,7 @@ extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, floa
     if (native && !extrapolate) { *destination=source[y*pair.currentPitch+x]; return; }
     float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
     Color base=native ? unpack(source[y*pair.currentPitch+x]) : sampleColor(pair,pair.current,pair.currentPitch,uv);
-    if (extrapolate) base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
+    if (extrapolate && !fixedFreeze(uv,flags)) base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
     *destination=pack(base);
 }
 
@@ -177,11 +182,14 @@ __device__ __forceinline__ float readDepth(const float* d,float2 uv){
 // Follow the original extrapolator's coordinates and confidence blend so
 // synthesized depth approximates the synthesized color. Depth is relative.
 extern "C" __global__ void renderAiDepth(SourcePair pair,OutputImage target,float horizon,float radius,float feather,
-                                          const unsigned* cut,const float* raw,const float* range,float interval,unsigned previousDepth){
+                                          const unsigned* cut,const float* raw,const float* range,float interval,unsigned previousDepth,unsigned flags){
     unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
     if(x>=target.width||y>=target.height)return;
     float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
     float d=readDepth(raw,uv);float2 motion={0,0};
+    if(fixedFreeze(uv,flags)){
+        reinterpret_cast<float4*>(target.pixels)[y*target.width+x]={.999f,0.f,0.f,0.f};return;
+    }
     if(cut&&!*cut&&pair.flow&&pair.flowPitch){
         float2 v0=flowAt(pair,uv);float2 q0={uv.x+horizon*v0.x,uv.y+horizon*v0.y};
         if(!outside(q0)){
