@@ -4,6 +4,7 @@
 #include <d3dcompiler.h>
 #include "late_input.h"
 #include "raw_input_worker.h"
+#include "gpu_timing.h"
 #include "freeze_regions.h"
 #include <wrl/client.h>
 #include <nvsdk_ngx.h>
@@ -145,7 +146,7 @@ float PS(float4 pos:SV_Position):SV_Target {
         radiusCache=radius;featherCache=feather;lastHud=hud;lastGun=gun;maskValid=true;
     }
     bool lastHud{},lastGun{};
-    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs,InputWorker& input,double periodMs){
+    void evaluate(UINT radius,UINT feather,bool hud,bool gun,uint64_t sequence,int64_t previousTime,int64_t sourceTime,double horizon,double ticksPerMs,InputWorker& input,double periodMs,double monitorPeriodMs,bool tearing,const ScanoutClock& scanout,GpuTiming& timing){
         ctx->ClearState();
         updateMask(radius,feather,hud,gun);
         (void)sequence;
@@ -169,8 +170,9 @@ float PS(float4 pos:SV_Position):SV_Target {
         ctx->ClearState();
         // Sample after registration, immediately before the second NGX call.
         // Estimate host submission time, not actual GPU completion/scanout.
+        timing.Late();
         const auto now=stamp();fglate::Counts latest{},future{};
-        const double lead=std::clamp(lateSubmitMs+periodMs*.5,0.0,std::min(5.0,periodMs));
+        const double lead=scanout.Lead(double(now)/ticksPerMs,periodMs,monitorPeriodMs,tearing,lateSubmitMs);
         if(sampled && now>=sourceTime && input.Latest(now,ticksPerMs,lead,latest,future)){
             double dx=(latest.x-cur.x+future.x-hx)*rad,dy=(latest.y-cur.y+future.y-hy)*rad;
             const double limit=4.*3.14159265358979323846/180.;

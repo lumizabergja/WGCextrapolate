@@ -40,6 +40,7 @@
 #include <nvOpticalFlowCuda.h>
 #include "pixel_types.h"
 #include "display_clock.h"
+#include "gpu_timing.h"
 #include "warp_presenter.h"
 #include <fstream>
 #include <initializer_list>
@@ -183,7 +184,17 @@ struct DxDevices {
     std::unique_ptr<fgwarp::Presenter> warp;
     FgReflex reflex;
     fgwarp::InputWorker* input{};
-    double periodMs=3.125;
+    double periodMs=3.125,monitorPeriodMs=3.125;
+    ScanoutClock scanout;
+    GpuTiming gpuTiming;
+    unsigned statsCounter{};
+    void PollTiming(){
+        gpuTiming.Poll(scanout);
+        if(++statsCounter%4)return;
+        DXGI_FRAME_STATISTICS s{};const HRESULT hr=swap->GetFrameStatistics(&s);
+        if(hr==S_OK&&ticksPerMs>0)scanout.Observe(double(s.SyncQPCTime.QuadPart)/ticksPerMs,s.SyncRefreshCount,double(fgwarp::stamp())/ticksPerMs,monitorPeriodMs);
+        else scanout.ResetPhase();
+    }
     uint64_t lastGuidanceSequence{};
     double lastGuidanceHorizon{};
     float MotionInterval(uint64_t sequence,double horizon)const{
@@ -223,6 +234,7 @@ struct DxDevices {
         D3D_FEATURE_LEVEL obtained{};
         Check(D3D11CreateDevice(matchingAdapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&dev11,&obtained,&ctx11),"D3D11CreateDevice");
+        gpuTiming.Init(dev11.Get(),ctx11.Get());
         ComPtr<IDXGIFactory2> f2;Check(matchingAdapter->GetParent(IID_PPV_ARGS(&f2)),"GetParent IDXGIFactory2");
         DXGI_SWAP_CHAIN_DESC1 sc{};sc.Width=screenW;sc.Height=screenH;
         sc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sc.SampleDesc.Count=1;sc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -270,8 +282,8 @@ float4 WarpPS(float4 position:SV_Position):SV_Target {
     float4 c=warped.Load(p);
     return a>0?lerp(c,unwarped.Load(p),a):c;
 }
-struct Guidance {float depth:SV_Target0;float2 motion:SV_Target1;};
-Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(position.y)*stride+uint(position.x));Guidance g;g.depth=p.x;g.motion=p.yz;return g;}
+struct Guidance {float4 color:SV_Target0;float depth:SV_Target1;float2 motion:SV_Target2;};
+Guidance DepthPS(float4 position:SV_Position){uint i=uint(position.y)*stride+uint(position.x);float4 p=aiDepth.Load(i);Guidance g;g.color=pixels.Load(i).bgra;g.depth=p.x;g.motion=p.yz;return g;}
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",
@@ -298,7 +310,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
     }
     void ResizeOutput(UINT width, UINT height) {
         if (width==screenW && height==screenH) return;
-        DrainWarp();
+        DrainWarp();scanout.ResetPhase();
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
         rtv.Reset();
         ctx11->Flush();
@@ -330,17 +342,18 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
                 warp=std::make_unique<fgwarp::Presenter>();
                 warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);
             }
-            DrawTo(image,warp->inputRTV.Get(),false);
+            gpuTiming.Begin();
             D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};ctx11->RSSetViewports(1,&vp);
-            ID3D11RenderTargetView* guidance[]={warp->depthRTV.Get(),warp->motionRTV.Get()};
-            ctx11->OMSetRenderTargets(2,guidance,nullptr);
+            ID3D11RenderTargetView* guidance[]={warp->inputRTV.Get(),warp->depthRTV.Get(),warp->motionRTV.Get()};
+            ctx11->OMSetRenderTargets(3,guidance,nullptr);
             ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
-            ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(2,1,&depthImage);
+            ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(0,1,&image);ctx11->PSSetShaderResources(2,1,&depthImage);
             ctx11->Draw(3,0);ctx11->ClearState();
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),(freezeFlags&1u)!=0,(freezeFlags&2u)!=0,
-                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,periodMs);
+                           warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs,*input,periodMs,monitorPeriodMs,allowTearing,scanout,gpuTiming);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
+            gpuTiming.End();
             lastGuidanceSequence=warpSequence;lastGuidanceHorizon=warpHorizon;
         }else{
             // Depth may not be ready for the newest real image. Never wait or
@@ -350,7 +363,7 @@ Guidance DepthPS(float4 position:SV_Position){float4 p=aiDepth.Load(uint(positio
         }
         reflex.Marker(RENDERSUBMIT_END);reflex.Marker(PRESENT_START);
         const HRESULT presented=swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0);
-        reflex.Marker(PRESENT_END);g_reflexState.store(reflex.State(),std::memory_order_relaxed);Check(presented,"DXGI low-latency Present");
+        reflex.Marker(PRESENT_END);PollTiming();g_reflexState.store(reflex.State(),std::memory_order_relaxed);Check(presented,"DXGI low-latency Present");
     }
 
 };
@@ -432,7 +445,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(EnumDisplaySettingsW(monitorInfo.szDevice,ENUM_CURRENT_SETTINGS,&dm)&&dm.dmDisplayFrequency>=30)
                 monitorHz=dm.dmDisplayFrequency;
         }
-        DxDevices dx; dx.input=&input;dx.Init(overlay.hwnd,overlay.width,overlay.height);
+        DxDevices dx; dx.input=&input;dx.monitorPeriodMs=1000./double(monitorHz);dx.Init(overlay.hwnd,overlay.width,overlay.height);
         CudaDriver cuda;
         CaptureCuda capture(cuda); capture.Init(game.pid,dx.matchingAdapter.Get());
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);
@@ -557,7 +570,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             }
             overlay.SetVisible(focused);
             if(!focused) {
-                if(wasFocused){input.Focus(false);dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
+                if(wasFocused){input.Focus(false);dx.scanout.ResetPhase();dx.ResetWarpHistory();dx.reflex.Disable();g_reflexState.store(ReflexState::Idle);}
                 wasFocused=false;
                 pairEligible=false;
                 realFramePending=false;
@@ -567,7 +580,7 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
             if(!wasFocused) {
                 // Alt+Tab resume: don't extrapolate from stale pre-switch captures.
                 wasFocused=true;
-                input.Focus(true);dx.ResetWarpHistory();
+                input.Focus(true);dx.scanout.ResetPhase();dx.ResetWarpHistory();
                 previousPoseTime=currentPoseTime=0;
                 resumeWarmup=2;
                 displayClock.reset();
@@ -645,9 +658,13 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 // frame takes the next display slot (up to 20% early), not an
                 // additional slot that would crowd out extrapolated frames.
                 const bool doPresent=extrapolate
-                    ? (realFramePending || flowReady || cameraReady) && displayClock.due(clockNow,realFramePending)
+                    ? (realFramePending || flowReady || cameraReady) && displayClock.due(clockNow,realFramePending,realFramePending?0.:dx.scanout.EarlyMs(step*1000.)/1000.)
                     : realFramePending;
-                if(g_warpEnabled.load(std::memory_order_relaxed))gpu.PrepareDepth(current,previous,flowReady,doPresent);
+                if(g_warpEnabled.load(std::memory_order_relaxed)){
+                    const double slack=(displayClock.deadline()-clockNow)*1000.;
+                    const bool depthUrgent=doPresent||(dx.scanout.Measured()&&!dx.scanout.DepthBudget(slack,step*1000.));
+                    gpu.PrepareDepth(current,previous,flowReady,depthUrgent);
+                }
                 if(doPresent){
                     // Queue target 0: if a previous Present still occupies the
                     // only allowed DXGI frame slot, keep the newest real source

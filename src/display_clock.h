@@ -16,8 +16,8 @@ public:
         }
         period_=period;
     }
-    bool due(double now,bool real) const {
-        return initialized_ && now>=deadline_-(real?period_*0.20:0.0);
+    bool due(double now,bool real,double early=0.) const {
+        return initialized_ && now>=deadline_-(real?period_*0.20:std::clamp(early,0.,period_*.20));
     }
     void submitted(double now) {
         if(period_<=0)return;
