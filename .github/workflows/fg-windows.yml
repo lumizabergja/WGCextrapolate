@@ -1,0 +1,64 @@
+name: FG CUDA Vulkan Windows compile experiment
+on:
+  push:
+    branches: [fg-v15-cuda-vulkan-latewarp-compile]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct source and test mathematical reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python prepare.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source preparation failed' }
+          python -m pip install numpy
+          if ($LASTEXITCODE -ne 0) { throw 'NumPy install failed' }
+          python fg/math-reference/test_camera_depth.py
+          if ($LASTEXITCODE -ne 0) { throw 'Math reference failed' }
+      - name: Install public SDK dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git ngx-sdk
+          if ($LASTEXITCODE -ne 0) { throw 'NGX checkout failed' }
+          git -C ngx-sdk rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'NGX revision check failed' }
+          & .\fg\Install-SDKs.ps1
+      - name: Compile FG and adapter separately; run CPU tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:NGX_SDK = (Resolve-Path ngx-sdk).Path
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if (!$vs) { throw 'MSVC missing' }
+          $vcvars = Join-Path $vs.Trim() 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c ('call "' + $vcvars + '" && call fg\ci-build.cmd > build.log 2>&1')
+          $status = $LASTEXITCODE
+          if (Test-Path build.log) { Get-Content build.log }
+          if ($status -ne 0) { throw "Compile or CPU tests failed: $status" }
+          if (!(Test-Path fg/bin/FG.exe) -or !(Test-Path fg/bin/latewarp_adapter_probe.obj)) { throw 'Expected outputs missing' }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -LiteralPath fg\bin\FG.exe,fg\bin\fg.vert.spv,fg\bin\fg.frag.spv,README.md -DestinationPath artifacts\FG-Reflex-Boost-ONLY-Windows-x64.zip -Force
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-build-log
+          path: build.log
+          if-no-files-found: warn
+      - name: Upload Windows package (Reflex Boost only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: FG-Reflex-Boost-ONLY-Windows-x64
+          path: artifacts/FG-Reflex-Boost-ONLY-Windows-x64.zip
+          if-no-files-found: error
