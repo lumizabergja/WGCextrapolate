@@ -40,7 +40,12 @@ public:
         if(!file)throw Error("Read ZipDepth engine");
         wchar_t dllPath[32768]{};
         const DWORD n=GetEnvironmentVariableW(L"FG_TRT_DLL",dllPath,32768);
-        if(!n||n>=32768)throw Error("Launch using Start-AI-FG.ps1 to select the TensorRT runtime");
+        if(!n||n>=32768){
+            auto portable=folder/L"AI"/L"Runtime"/L"TensorRT-10.13.0.35"/L"lib"/L"nvinfer_10.dll";
+            if(!std::filesystem::exists(portable))portable=folder/L"AI"/L"Runtime"/L"TensorRT-10.13.0.35"/L"bin"/L"nvinfer_10.dll";
+            if(!std::filesystem::exists(portable)||portable.native().size()>=32768)throw Error("Launch using Start-FG.cmd");
+            wcscpy_s(dllPath,32768,portable.c_str());
+        }
         dll=LoadLibraryExW(dllPath,nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if(!dll)throw Error("Load NVIDIA TensorRT runtime",GetLastError());
         using Create=void*(*)(void*,int32_t) noexcept;

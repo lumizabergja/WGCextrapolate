@@ -4,7 +4,7 @@ platform: x64
 configuration: Release
 branches:
   only:
-    - fg-cuda-ai-reflex2-depth
+    - fg-cuda-ai-reflex2-portable
 clone_depth: 1
 install:
   - ps: .\Install-ZeroCopy-CUDA.ps1
@@ -20,11 +20,13 @@ build_script:
       if ($LASTEXITCODE -ne 0) { throw "Compilation or CPU tests failed: $LASTEXITCODE" }
       if (!(Test-Path 'bin/FG.exe')) { throw 'Executable missing' }
       New-Item -ItemType Directory -Force artifacts | Out-Null
-      Compress-Archive -Path 'bin/FG.exe','README.md','Setup-AI-Depth.ps1','Start-AI-FG.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Depth-Windows-x64.zip' -Force
-      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Depth-Source.zip' -Force
+      .\Export-Portable-Model.ps1
+      Copy-Item 'bin/FG.exe','README.md','Start-FG.ps1','Start-FG.cmd' -Destination portable
+      Compress-Archive -Path 'portable/*' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Portable-Windows-x64.zip' -Force
+      Compress-Archive -Path 'src','tests','vendor','Build.cmd','Test.cmd','README.md','appveyor.yml','Install-ZeroCopy-CUDA.ps1','Fetch-Probe-SDK.ps1','Fetch-TensorRT-Headers.ps1','Setup-AI-Depth.ps1','Start-AI-FG.ps1','Start-FG.ps1','Start-FG.cmd','Export-Portable-Model.ps1' -DestinationPath 'artifacts/FG-CUDA-AI-Reflex2-Portable-Source.zip' -Force
 test: off
 artifacts:
-  - path: artifacts\FG-CUDA-AI-Reflex2-Depth-Windows-x64.zip
-    name: FG-CUDA-AI-Reflex2-Depth-Windows-x64
-  - path: artifacts\FG-CUDA-AI-Reflex2-Depth-Source.zip
-    name: FG-CUDA-AI-Reflex2-Depth-Source
+  - path: artifacts\FG-CUDA-AI-Reflex2-Portable-Windows-x64.zip
+    name: FG-CUDA-AI-Reflex2-Portable-Windows-x64
+  - path: artifacts\FG-CUDA-AI-Reflex2-Portable-Source.zip
+    name: FG-CUDA-AI-Reflex2-Portable-Source
