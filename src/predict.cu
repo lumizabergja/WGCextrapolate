@@ -133,3 +133,66 @@ extern "C" __global__ void renderFrame(SourcePair pair, OutputImage target, floa
     if (extrapolate) base=predict(pair,uv,base,horizon,protection(uv,target,radius,feather));
     *destination=pack(base);
 }
+
+#ifdef __CUDACC__
+// ZipDepth reference preprocessing: RGB float CHW in [0,1].
+extern "C" __global__ void prepareDepthRGB(const unsigned* pixels,unsigned pitch,unsigned sw,unsigned sh,float* tensor){
+    constexpr unsigned W=512,H=384;
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=W||y>=H)return;
+    SourcePair pair{};pair.width=sw;pair.height=sh;pair.current=reinterpret_cast<unsigned long long>(pixels);
+    float2 uv={(x+.5f)/W,(y+.5f)/H};
+    Color c=sampleColor(pair,pair.current,pitch,uv);
+    unsigned i=y*W+x;
+    tensor[i]=c.r/255.f;tensor[i+W*H]=c.g/255.f;tensor[i+2*W*H]=c.b/255.f;
+}
+// Robust approximate inverse-depth range. This is NOT metric calibration.
+extern "C" __global__ void depthRange(const float* depth,float* range){
+    float values[64];unsigned n=0;
+    for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++){
+        float v=depth[(y*48+24)*512+x*64+32];
+        if(isfinite(v))values[n++]=v;
+    }
+    if(n<8){range[0]=0;range[1]=0;return;}
+    for(unsigned i=1;i<n;i++){
+        float v=values[i];unsigned j=i;
+        while(j&&values[j-1]>v){values[j]=values[j-1];--j;}
+        values[j]=v;
+    }
+    range[0]=values[n/10];range[1]=values[n-1-n/10];
+}
+__device__ __forceinline__ float readDepth(const float* d,float2 uv){
+    Cell x=cell(uv.x*512-.5f,512),y=cell(uv.y*384-.5f,384);
+    return mixValue(mixValue(d[y.lo*512+x.lo],d[y.lo*512+x.hi],x.f),
+                    mixValue(d[y.hi*512+x.lo],d[y.hi*512+x.hi],x.f),y.f);
+}
+// Follow the original extrapolator's coordinates and confidence blend so
+// synthesized depth approximates the synthesized color. Depth is relative.
+extern "C" __global__ void renderAiDepth(SourcePair pair,OutputImage target,float horizon,float radius,float feather,
+                                          const unsigned* cut,const float* raw,const float* range){
+    unsigned x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;
+    if(x>=target.width||y>=target.height)return;
+    float2 uv={(x+.5f)/target.width,(y+.5f)/target.height};
+    float d=readDepth(raw,uv);
+    if(horizon>.00001f&&cut&&!*cut&&pair.flow&&pair.flowPitch){
+        float2 v=flowAt(pair,uv),q={uv.x+horizon*v.x,uv.y+horizon*v.y};
+        if(!outside(q)){
+            float2 mv=flowAt(pair,q),old={q.x+mv.x,q.y+mv.y};
+            if(!outside(old)&&magnitude(mv.x,mv.y)<=.12f){
+                Color next=sampleColor(pair,pair.current,pair.currentPitch,q);
+                Color prev=sampleColor(pair,pair.previous,pair.previousPitch,old);
+                float confidence=(1.f-smooth(.045f,.20f,residual(next,prev)))*
+                    (1.f-smooth(.003f,.025f,magnitude(mv.x-v.x,mv.y-v.y)));
+                d=mixValue(d,readDepth(raw,q),confidence*protection(uv,target,radius,feather));
+            }
+        }
+    }
+    float lo=range[0],hi=range[1];
+    float disparity=(isfinite(d)&&hi-lo>1.e-6f)?fminf(1.f,fmaxf(0.f,(d-lo)/(hi-lo))):0.f;
+    // Relative disparity to arbitrary scene scale (0.5..50 m), then
+    // conventional D3D perspective depth matching the NGX projection.
+    float inv=.02f+1.98f*disparity;
+    float depth=(1000.f/(1000.f-.1f))*(1.f-.1f*inv);
+    reinterpret_cast<float*>(target.pixels)[y*target.width+x]=fminf(1.f,fmaxf(0.f,depth));
+}
+#endif

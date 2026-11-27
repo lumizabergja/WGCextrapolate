@@ -23,16 +23,21 @@ class CudaPipeline {
         ComPtr<ID3D11ShaderResourceView> view;
         CUgraphicsResource interop{};
         bool mapped{};
+        ComPtr<ID3D11Buffer> depthPixels;
+        ComPtr<ID3D11ShaderResourceView> depthView;
+        CUgraphicsResource depthInterop{};
+        bool depthMapped{};
     };
     const CudaDriver& cu;
     const CaptureCuda& capture;
+    std::unique_ptr<AiDepth> ai;
     SystemLibrary flowLibrary{L"nvofapi64.dll"};
     NV_OF_CUDA_API_FUNCTION_LIST api{};
     NvOFHandle flow{};
     uint64_t lastFlowSequence{};
     CUstream displayStream{},flowInputStream{},flowOutputStream{},lumaStream{};
     CUmodule module{};
-    CUfunction stageKernel{},sceneKernel{},renderKernel{};
+    CUfunction stageKernel{},sceneKernel{},renderKernel{},depthKernel{};
     std::array<FrameState,kNumCapture> states{};
     std::array<OutputBuffer,2> outputs{};
     unsigned outputIndex{};
@@ -128,6 +133,8 @@ class CudaPipeline {
         for (auto& out:outputs) {
             if (out.mapped) cu.unmap(1,&out.interop,displayStream);
             if (out.interop) cu.unregisterD3D(out.interop);
+            if(out.depthMapped)cu.unmap(1,&out.depthInterop,displayStream);
+            if(out.depthInterop)cu.unregisterD3D(out.depthInterop);
             out={};
         }
     }
@@ -164,6 +171,7 @@ public:
         cu.check(cu.getFunction(&stageKernel,module,"stageFlowInput"),"Load NvOFA input kernel");
         cu.check(cu.getFunction(&sceneKernel,module,"sceneGate"),"Load CUDA scene-cut kernel");
         cu.check(cu.getFunction(&renderKernel,module,"renderFrame"),"Load V15 CUDA prediction kernel");
+        cu.check(cu.getFunction(&depthKernel,module,"renderAiDepth"),"Load depth reprojection kernel");
         CreateOutputs(dx);
     }
     void CreateOutputs(DxDevices& dx) {
@@ -188,6 +196,11 @@ public:
     void ReleaseOutputs() {
         cu.check(cu.syncStream(displayStream),"Finish CUDA output before resize");
         freeOutputs();
+    }
+    void PollDepth(){if(ai)ai->Poll();}
+    void PrepareDepth(int current){
+        if(!ai){ai=std::make_unique<AiDepth>(cu);ai->Open(module);}
+        ai->Submit(current,capture.frames[current]);
     }
     void NewFrame(int index,bool prepareLuma) {
         const auto& frame=capture.frames[index];
@@ -221,11 +234,12 @@ public:
         auto& state=states[index];
         cu.check(cu.recordEvent(state.lastDisplayRead,displayStream),"Fence displayed capture");
     }
-    bool Retired(int index) const {
+    bool Retired(int index) {
         const auto& state=states[index];
         // A source slot cannot be overwritten until BOTH its display and
         // grayscale reads finish; the caller also checks active OFA ownership.
-        return cu.complete(state.lastDisplayRead) && cu.complete(state.lumaReady);
+        PollDepth();
+        return (!ai||!ai->UsesSlot(index)) && cu.complete(state.lastDisplayRead) && cu.complete(state.lumaReady);
     }
     void Calculate(int current, int previous) {
         const auto& frame=capture.frames[current];
@@ -270,12 +284,30 @@ public:
         OutputImage target{pixels,dx.screenW,dx.screenH};
         void* args[]={&images,&target,&horizon,&radius,&feather,&cut};
         cu.launch(renderKernel,displayStream,target.width,target.height,args);
+        PollDepth();
+        const bool depthReady=g_warpEnabled.load(std::memory_order_relaxed)&&ai&&ai->Ready(current,capture.frames[current].sequence);
+        if(depthReady){
+            if(!out.depthInterop){
+                D3D11_BUFFER_DESC d{};d.ByteWidth=target.width*target.height*4;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                Check(dx.dev11->CreateBuffer(&d,nullptr,&out.depthPixels),"AI depth output buffer");
+                D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=DXGI_FORMAT_R32_FLOAT;v.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;v.Buffer.NumElements=target.width*target.height;
+                Check(dx.dev11->CreateShaderResourceView(out.depthPixels.Get(),&v,&out.depthView),"AI depth output view");
+                cu.check(cu.registerD3D(&out.depthInterop,out.depthPixels.Get(),CU_GRAPHICS_REGISTER_FLAGS_NONE),"Register AI depth output");
+            }
+            cu.check(cu.map(1,&out.depthInterop,displayStream),"Map AI depth output");out.depthMapped=true;
+            CUdeviceptr d{};size_t size=0;cu.check(cu.mappedPointer(&d,&size,out.depthInterop),"Get AI depth output");
+            if(!d||size<uint64_t(target.width)*target.height*4)throw Error("AI depth output too small");
+            OutputImage depthTarget{d,target.width,target.height};CUdeviceptr raw=ai->Raw(current),range=ai->Range(current);
+            void* depthArgs[]={&images,&depthTarget,&horizon,&radius,&feather,&cut,&raw,&range};
+            cu.launch(depthKernel,displayStream,target.width,target.height,depthArgs);
+            cu.check(cu.unmap(1,&out.depthInterop,displayStream),"Hand AI depth to D3D11");out.depthMapped=false;
+        }
         cu.diagnosticSync(displayStream,horizon>0?"Diagnostic: extrapolation kernel":"Diagnostic: real-frame kernel");
         // Unmap orders the next graphics use after the CUDA write. Present
         // needs no CPU readback, intermediate texture copy, or cuCtxSynchronize.
         cu.check(cu.unmap(1,&out.interop,displayStream),"Hand CUDA output to DXGI");
         out.mapped=false;
-        dx.Present(out.view.Get());
+        dx.Present(out.view.Get(),depthReady?out.depthView.Get():nullptr);
         outputIndex=(outputIndex+1)%outputs.size();
     }
     ~CudaPipeline() {
@@ -284,7 +316,7 @@ public:
         if (flowInputStream) cu.syncStream(flowInputStream);
         if (flowOutputStream) cu.syncStream(flowOutputStream);
         if (displayStream) cu.syncStream(displayStream);
-        freeOutputs();
+        ai.reset();freeOutputs();
         for (auto& state:states) {
             if(state.texture)cu.destroyTexture(state.texture);
             if(state.flowTexture)cu.destroyTexture(state.flowTexture);

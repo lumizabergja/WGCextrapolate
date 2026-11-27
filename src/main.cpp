@@ -172,7 +172,7 @@ struct DxDevices {
     bool allowTearing{};
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps,warpPS;
+    ComPtr<ID3D11PixelShader> ps,warpPS,depthPS;
     std::unique_ptr<fgwarp::Presenter> warp;
     uint64_t warpSequence{}; int64_t warpPrevious{},warpCurrent{};
     double warpHorizon{},ticksPerMs{};UINT warpSrcW{},warpSrcH{};
@@ -235,6 +235,7 @@ struct DxDevices {
         static const char* shader=R"HLSL(
 Buffer<float4> pixels : register(t0);
 Texture2D<float4> warped : register(t1);
+Buffer<float> aiDepth : register(t2);
 cbuffer Layout : register(b0) { uint stride; };
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id==2?3.0:-1.0, id==1?3.0:-1.0, 0, 1);
@@ -243,6 +244,7 @@ float4 PS(float4 position : SV_Position) : SV_Target {
     return pixels.Load(uint(position.y)*stride+uint(position.x)).bgra;
 }
 float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(int2(position.xy),0));}
+float DepthPS(float4 position:SV_Position):SV_Target {return aiDepth.Load(uint(position.y)*stride+uint(position.x));}
 )HLSL";
         ComPtr<ID3DBlob> vertex,pixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"VS","vs_5_0",
@@ -254,6 +256,9 @@ float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(in
         ComPtr<ID3DBlob> warpPixel;
         Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"WarpPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&warpPixel,nullptr),"Compile NGX output shader");
         Check(dev11->CreatePixelShader(warpPixel->GetBufferPointer(),warpPixel->GetBufferSize(),nullptr,&warpPS),"Create NGX output shader");
+        ComPtr<ID3DBlob> depthPixel;
+        Check(D3DCompile(shader,strlen(shader),"FG",nullptr,nullptr,"DepthPS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&depthPixel,nullptr),"Compile AI depth shader");
+        Check(dev11->CreatePixelShader(depthPixel->GetBufferPointer(),depthPixel->GetBufferSize(),nullptr,&depthPS),"Create AI depth shader");
         D3D11_BUFFER_DESC layout{};
         layout.ByteWidth=16; layout.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         Check(dev11->CreateBuffer(&layout,nullptr,&constants),"Create DXGI image layout");
@@ -290,18 +295,26 @@ float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(in
         ctx11->PSSetShaderResources(texture?1:0,1,&none);
         ctx11->OMSetRenderTargets(0,nullptr,nullptr);
     }
-    void Present(ID3D11ShaderResourceView* image){
-        if(g_warpEnabled.load(std::memory_order_relaxed)){
+    void Present(ID3D11ShaderResourceView* image,ID3D11ShaderResourceView* depthImage=nullptr){
+        if(g_warpEnabled.load(std::memory_order_relaxed)&&depthImage){
             if(!warp){
                 warp=std::make_unique<fgwarp::Presenter>();
                 warp->open(dev11.Get(),ctx11.Get(),screenW,screenH,warpSrcW,warpSrcH);
             }
             DrawTo(image,warp->inputRTV.Get(),false);
+            D3D11_VIEWPORT vp{0,0,float(screenW),float(screenH),0,1};ctx11->RSSetViewports(1,&vp);
+            ctx11->OMSetRenderTargets(1,warp->depthRTV.GetAddressOf(),nullptr);
+            ctx11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx11->VSSetShader(vs.Get(),nullptr,0);ctx11->PSSetShader(depthPS.Get(),nullptr,0);
+            ctx11->PSSetConstantBuffers(0,1,constants.GetAddressOf());ctx11->PSSetShaderResources(2,1,&depthImage);
+            ctx11->Draw(3,0);ctx11->ClearState();
             warp->evaluate(g_centerRadiusPx.load(),g_centerFeatherPx.load(),g_hudEnabled.load(),g_gunEnabled.load(),
                            warpSequence,warpPrevious,warpCurrent,warpHorizon,ticksPerMs);
             DrawTo(warp->outputSRV.Get(),rtv.Get(),true);
         }else{
-            if(warp)DrainWarp();
+            // Depth may not be ready for the newest real image. Never wait or
+            // destroy/recreate NGX on a temporary miss.
+            if(warp)warp->resetHistory();
             DrawTo(image,rtv.Get(),false);
         }
         Check(swap->Present(0,allowTearing?DXGI_PRESENT_ALLOW_TEARING:0),"DXGI low-latency Present");
@@ -311,6 +324,7 @@ float4 WarpPS(float4 position:SV_Position):SV_Target {return warped.Load(int3(in
 
 #include "cuda_driver.h"
 #include "capture_cuda.h"
+#include "ai_depth.h"
 #include "cuda_pipeline.h"
 #include "async_flow.h"
 
@@ -581,6 +595,8 @@ SessionOutcome EngineSession(const Game& game,const TrackedGame& tracked){
                 const bool extrapolate=mode==0 ? sourcePeriod*target>1.05 : mode>1;
                 const bool useFlow=pairEligible && extrapolate;
                 const auto sequence=capture.frames[current].sequence;
+                if(g_warpEnabled.load(std::memory_order_relaxed))gpu.PrepareDepth(current);
+                else gpu.PollDepth();
                 if(useFlow){
                     gpu.PreparePair(current,previous);
                     flow.Request(current,previous,sequence);
@@ -843,7 +859,7 @@ LRESULT CALLBACK ControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             HWND c=CreateWindowW(L"BUTTON",label,WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x,y,width,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
             StyleControl(c);SendMessageW(c,BM_SETCHECK,BST_CHECKED,0);return c;
         };
-        g_warp=checkbox(L"NVIDIA Frame Warp (adaptive 0-5 ms)",36,493,480,kWarp);
+        g_warp=checkbox(L"AI depth + NVIDIA Frame Warp (0-5 ms)",36,493,480,kWarp);
         g_hud=checkbox(L"Automatic HUD protection",36,524,250,kHud);
         g_gun=checkbox(L"Automatic gun protection",285,524,250,kGun);
         UiLabel(hwnd,L"Raw Input - set mouse to 1000 Hz in its software",36,552,490,20,true);

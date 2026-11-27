@@ -22,7 +22,9 @@ if /i "%~1"=="--blackwell" (
 if not exist bin mkdir bin
 powershell -NoProfile -ExecutionPolicy Bypass -File Fetch-Probe-SDK.ps1
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File Fetch-TensorRT-Headers.ps1
+if errorlevel 1 exit /b 1
 rc /nologo %RCFLAGS% /i "src" /fo "bin\FG.res" "src\FG.rc"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /utf-8 /O2 /MD /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /I "vendor\headers" /I "%CUDA_PATH%\include" /I probe-sdk "src\main.cpp" probe-sdk\nvsdk_ngx_d.lib "bin\FG.res" /Fo"bin\main.obj" /Fe"bin\FG.exe" /link /SUBSYSTEM:WINDOWS bcrypt.lib wintrust.lib crypt32.lib version.lib shlwapi.lib shell32.lib advapi32.lib ole32.lib d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib dwmapi.lib uxtheme.lib
+cl /nologo /std:c++20 /utf-8 /O2 /MD /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_WIN32_WINNT=0x0A00 /I "vendor\headers" /I "%CUDA_PATH%\include" /I probe-sdk /I trt-sdk "src\main.cpp" probe-sdk\nvsdk_ngx_d.lib "bin\FG.res" /Fo"bin\main.obj" /Fe"bin\FG.exe" /link /SUBSYSTEM:WINDOWS bcrypt.lib wintrust.lib crypt32.lib version.lib shlwapi.lib shell32.lib advapi32.lib ole32.lib d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib dwmapi.lib uxtheme.lib
 exit /b %errorlevel%

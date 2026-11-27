@@ -47,7 +47,7 @@ struct Presenter {
     ComPtr<ID3D11Buffer> maskConstants;
     bool historyValid=false; uint64_t historySequence=0;
     int64_t historyTime=0;
-    ComPtr<ID3D11RenderTargetView> inputRTV;
+    ComPtr<ID3D11RenderTargetView> inputRTV,depthRTV;
     ComPtr<ID3D11ShaderResourceView> outputSRV;
     NVSDK_NGX_Parameter* params{};
     NVSDK_NGX_Handle* feature{};
@@ -82,7 +82,8 @@ struct Presenter {
         output=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr|D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_RENDER_TARGET);
         std::vector<uint32_t> zeros(size_t(w)*h,0);
         std::vector<float> depths(zeros.size(),.999f);
-        depth=tex(DXGI_FORMAT_R32_FLOAT,sr,depths.data(),w*4);
+        depth=tex(DXGI_FORMAT_R32_FLOAT,sr|D3D11_BIND_RENDER_TARGET,depths.data(),w*4);
+        check(device->CreateRenderTargetView(depth.Get(),nullptr,&depthRTV),"AI depth RTV");
         motion=tex(DXGI_FORMAT_R16G16_FLOAT,sr,zeros.data(),w*4);
         ui=tex(DXGI_FORMAT_R8G8B8A8_UNORM,sr,zeros.data(),w*4);
         mask=tex(DXGI_FORMAT_R8_UNORM,sr|D3D11_BIND_RENDER_TARGET);
@@ -198,7 +199,8 @@ float PS(float4 pos:SV_Position):SV_Target {
         updateMask(radius,feather,hud,gun,sequence,sourceTime);
         // Every submitted image is a new NGX source, including CUDA-generated
         // images. A second evaluation applies the late pose to that source.
-        // This uses a synthetic far depth plane and zero MV, not engine depth.
+        // Relative AI depth has been drawn into depthRTV; motion vectors are
+        // still zero until their NGX conventions can be validated.
         fglate::Counts prev{},cur{};
         const bool sampled=inputHistory.at(sourceTime,cur);
         const bool havePair=sampled && previousTime<sourceTime && inputHistory.at(previousTime,prev);
