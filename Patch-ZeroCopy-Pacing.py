@@ -123,3 +123,60 @@ G counts submissions, not unique pixels or displayed generated frames.
 Alt+Tab freezes the last sample. No disk logs or image readback.
 """)
 print("Zero-copy triple-buffer pacing and diagnostic patch applied.")
+
+# V3: explicit surface geometry, tagged display feedback, optional visual probe.
+replace("zero_present.h",[
+('Check(surface->SetColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709),"Composition color space");', '''Check(surface->SetColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709),"Composition color space");
+        surface->SetTag(0x4647);
+        PresentationTransform transform{};
+        transform.M11=1.0f;transform.M22=1.0f;
+        Check(surface->SetTransform(&transform),"Set identity presentation transform");'''),
+('auto& s=slots.at(index);', '''auto& s=slots.at(index);
+        if(index==0){
+            RECT sourceRect{0,0,LONG(width),LONG(height)};
+            Check(surface->SetSourceRect(&sourceRect),"Set full native presentation rectangle");
+        }'''),
+('Check(manager->Present(),"Present same texture allocation");', '''SystemInterruptTime now{};
+        QueryInterruptTimePrecise(&now.value);
+        Check(manager->SetTargetTime(now),"Set immediate presentation target");
+        Check(manager->Present(),"Present same texture allocation");'''),
+('manager->EnablePresentStatisticsKind(PresentStatisticsKind_IndependentFlipFrame,TRUE);', 'Check(manager->EnablePresentStatisticsKind(PresentStatisticsKind_IndependentFlipFrame,TRUE),"Enable independent flip statistics");'),
+('manager->EnablePresentStatisticsKind(PresentStatisticsKind_CompositionFrame,TRUE);', 'Check(manager->EnablePresentStatisticsKind(PresentStatisticsKind_CompositionFrame,TRUE),"Enable composition statistics");'),
+('manager->EnablePresentStatisticsKind(PresentStatisticsKind_PresentStatus,TRUE);', 'Check(manager->EnablePresentStatisticsKind(PresentStatisticsKind_PresentStatus,TRUE),"Enable present status statistics");'),
+('manager->GetPresentStatisticsAvailableEvent(&statisticsEvent);','Check(manager->GetPresentStatisticsAvailableEvent(&statisticsEvent),"Get statistics event");')
+])
+replace("cuda_pipeline.h",[
+('void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&out.zeroSurface};','''// Off by default; opt-in only for a short visibility test.
+        static const unsigned probe=[]{
+            wchar_t value[8]{};
+            return GetEnvironmentVariableW(L"FG_VISUAL_PROBE",value,8)==1 && value[0]==L'1' ? 1u:0u;
+        }();
+        unsigned marker=probe;
+        void* args[]={&images,&target,&horizon,&radius,&feather,&cut,&out.zeroSurface,&marker};''')
+])
+replace("predict.cu",[
+('float horizon,float radius,float feather,const unsigned* cut,cudaSurfaceObject_t surface) {',
+ 'float horizon,float radius,float feather,const unsigned* cut,cudaSurfaceObject_t surface,unsigned marker) {'),
+('    surf2Dwrite(make_uchar4(result&255u,(result>>8)&255u,(result>>16)&255u,result>>24),surface,x*4,y);',
+'''    // Diagnostic only: small corner marker, normal rendering unchanged when off.
+    // Green: real. Magenta: generated. Yellow: scene gate rejected prediction.
+    if(marker && x>=16 && x<96 && y>=16 && y<64) {
+        if(horizon<=0.00001f) result=0xff00ff00u;
+        else if(*cut) result=0xffffff00u;
+        else {
+            unsigned phase=min(3u,unsigned(horizon*4.0f));
+            result=x<16+(phase+1)*20 ? 0xffff00ffu : 0xff300030u;
+        }
+    }
+    surf2Dwrite(make_uchar4(result&255u,(result>>8)&255u,(result>>16)&255u,result>>24),surface,x*4,y);''')
+])
+(root/"README.md").open("a",encoding="utf-8").write("""
+V3: explicit full-resolution source rectangle, identity transform, content tag,
+current interrupt-time presentation target, checked statistics registration.
+For an optional optical visibility test launch with FG_VISUAL_PROBE=1:
+green corner = real submission, magenta phase bar = generated submission,
+yellow corner = scene gate has disabled extrapolation for the current pair.
+The marker is off by default and is drawn by the same CUDA surface kernel,
+not another overlay or GPU copy. Record the monitor using a high-speed camera.
+""")
+print("V3 native geometry and optional visibility probe applied.")
