@@ -14,6 +14,8 @@ python unpack-live.py
 if ($LASTEXITCODE -ne 0) { throw 'Live patch failed' }
 python reflex-late-input.py
 if ($LASTEXITCODE -ne 0) { throw 'Adaptive Reflex 2 patch failed' }
+python native-output.py
+if ($LASTEXITCODE -ne 0) { throw 'Strict native output patch failed' }
 Invoke-CheckedGit -Step 'NGX init' -GitArgs @('init','ngx-sdk')
 Invoke-CheckedGit -Step 'NGX origin' -GitArgs @('-C','ngx-sdk','remote','add','origin','https://github.com/NVIDIA/DLSS.git')
 Invoke-CheckedGit -Step 'NGX SDK fetch' -GitArgs @('-C','ngx-sdk','fetch','--depth','1','origin','9981c6350dc58c0ce21f024fd65e31e851c31689')
