@@ -10,54 +10,6 @@ def edit(path,pairs):
         s=s.replace(old,new,1)
     p.write_text(s,encoding='utf-8',newline='\n')
 
-edit('src/main.cpp',[
- ('VkDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height,cuda);',
-  '''if(overlay.width!=gameW||overlay.height!=gameH)
-            throw Error("Native output requires matching fullscreen display mode: monitor "+
-                std::to_string(overlay.width)+"x"+std::to_string(overlay.height)+", game "+
-                std::to_string(gameW)+"x"+std::to_string(gameH));
-        VkDevices dx; dx.Init(overlay.hwnd,gameW,gameH,cuda);'''),
- ('                    if(usable)gpu.NormalizeCapture(available,gameW,gameH);',
-  '                    // Never resample capture to manufacture native game pixels.'),
- ('                const auto& incoming=capture.frames[next];',
-  '''                const auto& incoming=capture.frames[next];
-                if(incoming.width!=gameW||incoming.height!=gameH)
-                    throw Error("NvFBC capture is "+std::to_string(incoming.width)+"x"+std::to_string(incoming.height)+
-                        "; game client is "+std::to_string(gameW)+"x"+std::to_string(gameH)+
-                        ". True native source unavailable; use fullscreen at the game resolution.");
-                if(dx.vk.extent.width!=gameW||dx.vk.extent.height!=gameH)
-                    throw Error("Vulkan output resolution differs from game client");'''),
- ('                // CS2 may change the logical scanout resolution on focus gain.',
-  '''                RECT liveClient{};
-                if(GetClientRect(game.window,&liveClient)&&
-                   (UINT(liveClient.right-liveClient.left)!=gameW||UINT(liveClient.bottom-liveClient.top)!=gameH))
-                    return SessionOutcome::Recreate;
-                // CS2 may change the logical scanout resolution on focus gain.'''),
- ('Status(L"Native source: "+std::to_wstring(incoming.width)+L"x"+std::to_wstring(incoming.height));',
-  'Status(L"Native source: "+std::to_wstring(incoming.width)+L"x"+std::to_wstring(incoming.height)+L" | Vulkan output: "+std::to_wstring(dx.vk.extent.width)+L"x"+std::to_wstring(dx.vk.extent.height));'),
-])
-
-# Use the previously working standard Vulkan WSI path. No surface/swapchain
-# maintenance extensions, feature-chain changes, or driver present-scaling structs.
-edit('src/vulkan_presenter.h',[
- ('    bool windowedExclusiveControl=false;',
-  '''    bool windowedExclusiveControl=false;
-    VkExtent2D requestedNativeExtent{};'''),
- ('    void Init(HWND hwnd,LUID luid,uint32_t w,uint32_t h){',
-  '''    void Init(HWND hwnd,LUID luid,uint32_t w,uint32_t h){
-        requestedNativeExtent={w,h};'''),
- ('extent=caps.currentExtent.width==UINT32_MAX?VkExtent2D{std::clamp(w,caps.minImageExtent.width,caps.maxImageExtent.width),std::clamp(h,caps.minImageExtent.height,caps.maxImageExtent.height)}:caps.currentExtent;if(!extent.width||!extent.height)throw Error("Vulkan surface minimized");',
-  '''extent=caps.currentExtent.width==UINT32_MAX?VkExtent2D{std::clamp(w,caps.minImageExtent.width,caps.maxImageExtent.width),std::clamp(h,caps.minImageExtent.height,caps.maxImageExtent.height)}:caps.currentExtent;
-        if(!extent.width||!extent.height)throw Error("Vulkan surface minimized");
-        if(extent.width!=requestedNativeExtent.width||extent.height!=requestedNativeExtent.height)
-            throw Error("Native output requires matching Windows/game fullscreen display mode: surface "+
-                std::to_string(extent.width)+"x"+std::to_string(extent.height)+", game "+
-                std::to_string(requestedNativeExtent.width)+"x"+std::to_string(requestedNativeExtent.height));'''),
- ('        sourceExtent={width,height};',
-  '''        if(width!=extent.width||height!=extent.height)throw Error("Source and native output extent mismatch");
-        sourceExtent={width,height};'''),
-])
-
 # Native mode bypasses all resolution percentage computation and staging resampling.
 edit('src/cuda_pipeline.h',[
  ('    UINT flowWidth{},flowHeight{};',
@@ -77,26 +29,6 @@ edit('src/cuda_pipeline.h',[
             throw Error("Native NvOFA source changed dimensions");
         if(nativeFlowResolution||(width==flowWidth&&height==flowHeight)){'''),
 ])
-
-# Only one-to-one color reads: the driver, not FG, stretches for display if required.
-(fg/'src'/'fg.frag').write_text(r'''#version 450
-layout(set=0,binding=0,std430) readonly buffer Pixels { uint pixels[]; };
-layout(push_constant) uniform P { uint sourceWidth; uint sourceHeight; uint outputWidth; uint outputHeight; } p;
-layout(location=0) out vec4 color;
-void main(){
-    uvec2 xy=uvec2(gl_FragCoord.xy);
-    uint v=pixels[xy.y*p.sourceWidth+xy.x];
-    color=vec4(float((v>>16)&255u),float((v>>8)&255u),float(v&255u),255.0)/255.0;
-}
-''',encoding='utf-8',newline='\n')
-edit('src/native_live.h',[
- ('void Record(VkCommandBuffer cmd,VkImage swapImage,uint32_t displayW,uint32_t displayH){',
-  '''void Record(VkCommandBuffer cmd,VkImage swapImage,uint32_t displayW,uint32_t displayH){
-        if(displayW!=w||displayH!=h)throw Error("Native Frame Warp output extent mismatch");'''),
-])
-with (fg/'README.md').open('a',encoding='utf-8') as f:
-    f.write('\n## Strict native output and NvOFA\nCapture, CUDA output, NGX and Vulkan swapchain must match the game client dimensions. No capture normalization or final shader resampling. Vulkan uses the original standard WSI swapchain with a one-to-one extent; no experimental present-scaling extension. FG stops with an explicit error if the game, capture or logical display mode differs rather than silently upscaling or changing Windows display settings. Configure NVIDIA GPU full-screen scaling and a matching fullscreen display mode before starting FG. Use actual fullscreen game resolution, not a borderless internal render scale. Native (100%) NvOFA sets input width and height directly from the captured frame, bypasses percentage/capability arithmetic and uses the original one-to-one BGRA-to-luma stage. Reduced percentages keep the existing scaled branch. Required hardware optical-flow format conversion and native NGX same-size final format blit remain. Adaptive Reflex 2, UI and pacing are unchanged. Windows compilation and target GPU behavior must be verified.\n')
-print('Strict game-native Vulkan output and direct Native NvOFA path applied.')
 
 # Startup synchronization and crash-only diagnostic breadcrumbs.
 edit('src/main.cpp',[
@@ -147,36 +79,13 @@ LONG WINAPI RecordWorkerFault(EXCEPTION_POINTERS* e) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 '''),
- ('        OverlayWindow overlay;overlay.Init(game.window);', '''        // Launcher temporarily owns focus. Do not initialize capture while CS2
-        // is still returning to its exclusive fullscreen display mode.
-        MarkCrashStage(CrashStage::WaitMode);
-        unsigned stable=0;UINT lastW=0,lastH=0;
-        const ULONGLONG deadline=GetTickCount64()+3000;
-        while(stable<3){
-            if(tracked.Exited()||g_userStopRequested.load(std::memory_order_acquire))return SessionOutcome::Stop;
-            DWORD pid=0;HWND fg=GetForegroundWindow();if(fg)GetWindowThreadProcessId(fg,&pid);
-            RECT c{};MONITORINFO m{sizeof(m)};
-            if(pid==game.pid&&!IsIconic(game.window)&&GetClientRect(game.window,&c)&&
-                GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&m)&&
-                c.right-c.left==m.rcMonitor.right-m.rcMonitor.left&&
-                c.bottom-c.top==m.rcMonitor.bottom-m.rcMonitor.top&&c.right>0&&c.bottom>0){
-                UINT w=UINT(c.right-c.left),h=UINT(c.bottom-c.top);
-                stable=(w==lastW&&h==lastH)?stable+1:1;lastW=w;lastH=h;
-            }else stable=0;
-            if(stable>=3)break;
-            if(GetTickCount64()>=deadline)throw Error("Native fullscreen mode did not settle; focus game at matching display resolution");
-            Sleep(20);
-        }
-        OverlayWindow overlay;overlay.Init(game.window);'''),
- ('        CudaDriver cuda;\n        CaptureCuda capture(cuda); capture.Init(game.pid);\n        if(overlay.width!=gameW||overlay.height!=gameH)',
-  '''        if(overlay.width!=gameW||overlay.height!=gameH)'''),
- ('        VkDevices dx; dx.Init(overlay.hwnd,gameW,gameH,cuda);\n        CudaPipeline gpu(cuda,capture); gpu.Init(dx);',
+ ('        CudaDriver cuda;\n        CaptureCuda capture(cuda); capture.Init(game.pid);\n        VkDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height,cuda);\n        CudaPipeline gpu(cuda,capture); gpu.Init(dx);',
   '''        MarkCrashStage(CrashStage::Cuda);
         CudaDriver cuda;
         MarkCrashStage(CrashStage::CaptureInit);
         CaptureCuda capture(cuda); capture.Init(game.pid);
         MarkCrashStage(CrashStage::VulkanInit);
-        VkDevices dx; dx.Init(overlay.hwnd,gameW,gameH,cuda);
+        VkDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height,cuda);
         MarkCrashStage(CrashStage::PipelineInit);
         CudaPipeline gpu(cuda,capture); gpu.Init(dx);'''),
  ('        std::thread producer([&]{\n            try{',
@@ -239,5 +148,17 @@ edit('src/native_live.h',[
  ('        N(fg_ngx_experiment::record_real','        MarkCrashStage(CrashStage::NgxEvaluate);\n        N(fg_ngx_experiment::record_real'),
 ])
 with (fg/'README.md').open('a',encoding='utf-8') as f:
-    f.write('\n## Startup and crash isolation\nWait for matching focused game/monitor dimensions for three consecutive checks before allocating CUDA, NvFBC or Vulkan resources. A shared memory breadcrumb records the latest engine/capture/flow stage, with a best-effort exception address if the worker faults. No continuous disk logging, no game process modification. If a crash recurs, copy the expanded FG error or the Windows Application Error event.\\n')
-print('Native fullscreen startup synchronization and crash-only stage reporting applied.')
+    f.write('\n## Startup and crash isolation\nV15-style independent game and display dimensions, with shared memory crash breadcrumbs. A shared memory breadcrumb records the latest engine/capture/flow stage, with a best-effort exception address if the worker faults. No continuous disk logging, no game process modification. If a crash recurs, copy the expanded FG error or the Windows Application Error event.\\n')
+print('Crash-only stage reporting applied.')
+
+# Preserve the adaptive build's V15 game-resolution normalization and standard
+# monitor-sized WSI. On matching display modes the original shader is 1:1.
+# Do not explicitly disable Reflex during swapchain destruction; swapchain
+# lifetime ends anyway. This isolates the suspected vendor cleanup call.
+edit('src/vulkan_presenter.h',[
+ ('if(swap&&setSleep)setSleep(device,swap,nullptr);',
+  '/* Reflex state belongs to the destroyed swapchain; no redundant driver call. */'),
+])
+with (fg/'README.md').open('a',encoding='utf-8') as f:
+    f.write('\n## V15-compatible resolution recovery\nRestored adaptive baseline game-sized normalization and the independent logical monitor-sized Vulkan surface. Native NvOFA bypasses percentage calculations and staging resizing. The final shader/NGX blit is one-to-one when game and logical monitor mode agree; otherwise the original V15-style final fullscreen stretch is retained. No experimental WSI extensions, no strict mismatch rejection, no forced display changes. Removed redundant Reflex disable call during swapchain destruction to isolate the reported teardown fault. Reflex + Boost remains enabled during presentation. GPU runtime verification required.\n')
+print('Restored V15-compatible native processing and monitor presentation; retained direct native NvOFA.')
