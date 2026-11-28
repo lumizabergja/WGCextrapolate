@@ -162,3 +162,29 @@ edit('src/vulkan_presenter.h',[
 with (fg/'README.md').open('a',encoding='utf-8') as f:
     f.write('\n## V15-compatible resolution recovery\nRestored adaptive baseline game-sized normalization and the independent logical monitor-sized Vulkan surface. Native NvOFA bypasses percentage calculations and staging resizing. The final shader/NGX blit is one-to-one when game and logical monitor mode agree; otherwise the original V15-style final fullscreen stretch is retained. No experimental WSI extensions, no strict mismatch rejection, no forced display changes. Removed redundant Reflex disable call during swapchain destruction to isolate the reported teardown fault. Reflex + Boost remains enabled during presentation. GPU runtime verification required.\n')
 print('Restored V15-compatible native processing and monitor presentation; retained direct native NvOFA.')
+
+# Preserve captured color. Never reduce a driver-scaled capture to game-client
+# size and then stretch it a second time. The native source is the actual
+# NvFBC buffer, not a reconstructed lower-resolution image.
+edit('src/main.cpp',[
+ ('                    if(usable)gpu.NormalizeCapture(available,gameW,gameH);',
+  '                    // Preserve NvFBC pixels and pitch. No capture normalization.'),
+ ('Status(L"Native source: "+std::to_wstring(incoming.width)+L"x"+std::to_wstring(incoming.height));',
+  '''Status(L"Native source: "+std::to_wstring(incoming.width)+L"x"+std::to_wstring(incoming.height)+
+                        L" | game "+std::to_wstring(gameW)+L"x"+std::to_wstring(gameH)+
+                        L" | output "+std::to_wstring(dx.vk.extent.width)+L"x"+std::to_wstring(dx.vk.extent.height));'''),
+])
+# The existing renderFrame kernel performs a bit-exact BGRA copy at zero
+# horizon and equal dimensions. The existing Vulkan shader reads exactly one
+# pixel at matching extents. Preserve these two paths and all FG/NGX math.
+# Prefer a normal SDR swapchain with no sRGB attachment conversion; keep the
+# original supported-format selection if the preferred color space is absent.
+edit('src/vulkan_presenter.h',[
+ ('auto it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_B8G8R8A8_UNORM||f.format==VK_FORMAT_R8G8B8A8_UNORM;});',
+  '''auto it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_B8G8R8A8_UNORM&&f.colorSpace==VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;});
+        if(it==fs.end())it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_R8G8B8A8_UNORM&&f.colorSpace==VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;});
+        if(it==fs.end())it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_B8G8R8A8_UNORM||f.format==VK_FORMAT_R8G8B8A8_UNORM;});'''),
+])
+with (fg/'README.md').open('a',encoding='utf-8') as f:
+    f.write('\n## Color-preserving native capture (supersedes earlier normalization)\nNvFBC output pixels, dimensions and pitch are now used unchanged for CUDA extrapolation and Native NvOFA. No downscale to game client dimensions. The title reports capture/game/Vulkan output extents. Equal source/output dimensions are a one-to-one copy for unwarped real frames; if the driver returns a pre-scaled image, FG cannot recover the original game framebuffer. If source and output differ, the existing final fullscreen scaling remains necessary. A preferred ordinary SDR UNORM swapchain avoids accidental selection of a nonstandard color space when SDR is available. No sharpening or added color transformations. No changes to adaptive Reflex 2, timing or reduced-resolution NvOFA. Windows compilation and target display verification required.\\n')
+print('Removed capture normalization; preserved exact equal-size real-frame color path.')
