@@ -188,3 +188,117 @@ edit('src/vulkan_presenter.h',[
 with (fg/'README.md').open('a',encoding='utf-8') as f:
     f.write('\n## Color-preserving native capture (supersedes earlier normalization)\nNvFBC output pixels, dimensions and pitch are now used unchanged for CUDA extrapolation and Native NvOFA. No downscale to game client dimensions. The title reports capture/game/Vulkan output extents. Equal source/output dimensions are a one-to-one copy for unwarped real frames; if the driver returns a pre-scaled image, FG cannot recover the original game framebuffer. If source and output differ, the existing final fullscreen scaling remains necessary. A preferred ordinary SDR UNORM swapchain avoids accidental selection of a nonstandard color space when SDR is available. No sharpening or added color transformations. No changes to adaptive Reflex 2, timing or reduced-resolution NvOFA. Windows compilation and target display verification required.\\n')
 print('Removed capture normalization; preserved exact equal-size real-frame color path.')
+
+# Strict native path, preflight BEFORE Vulkan allocation and use native transfer
+# rather than a fullscreen graphics shader for unwarped frames.
+edit('src/main.cpp',[
+ ('        OverlayWindow overlay;overlay.Init(game.window);',
+  '''        MarkCrashStage(CrashStage::WaitMode);
+        unsigned stable=0;UINT lastW=0,lastH=0;
+        const ULONGLONG deadline=GetTickCount64()+3000;
+        while(stable<3){
+            if(tracked.Exited()||g_userStopRequested.load(std::memory_order_acquire))return SessionOutcome::Stop;
+            DWORD pid=0;HWND fg=GetForegroundWindow();if(fg)GetWindowThreadProcessId(fg,&pid);
+            RECT c{};MONITORINFO m{sizeof(m)};
+            if(pid==game.pid&&!IsIconic(game.window)&&GetClientRect(game.window,&c)&&
+                GetMonitorInfoW(MonitorFromWindow(game.window,MONITOR_DEFAULTTONEAREST),&m)&&
+                c.right-c.left==m.rcMonitor.right-m.rcMonitor.left&&
+                c.bottom-c.top==m.rcMonitor.bottom-m.rcMonitor.top&&c.right>0&&c.bottom>0){
+                UINT w=UINT(c.right-c.left),h=UINT(c.bottom-c.top);
+                stable=(w==lastW&&h==lastH)?stable+1:1;lastW=w;lastH=h;
+            }else stable=0;
+            if(stable>=3)break;
+            if(GetTickCount64()>=deadline){
+                Status(L"FG error: Native pixel mode needs game client and Windows logical display at the same resolution. Game "+
+                    std::to_wstring(c.right-c.left)+L"x"+std::to_wstring(c.bottom-c.top)+L"; monitor "+
+                    std::to_wstring(m.rcMonitor.right-m.rcMonitor.left)+L"x"+std::to_wstring(m.rcMonitor.bottom-m.rcMonitor.top)+
+                    L". Set the matching display resolution and NVIDIA full-screen GPU scaling before starting.");
+                return SessionOutcome::Stop;
+            }
+            Sleep(20);
+        }
+        OverlayWindow overlay;overlay.Init(game.window);'''),
+ ('        MarkCrashStage(CrashStage::VulkanInit);\n        VkDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height,cuda);',
+  '''        // Preflight one actual capture before creating any Vulkan object.
+        if(overlay.width!=gameW||overlay.height!=gameH){
+            Status(L"FG error: Fullscreen mode changed during startup; retry at matching native resolution.");
+            return SessionOutcome::Stop;
+        }
+        MarkCrashStage(CrashStage::CaptureGrab);
+        bool gotNative=false;
+        const ULONGLONG captureDeadline=GetTickCount64()+1500;
+        while(GetTickCount64()<captureDeadline&&!tracked.Exited()&&!g_userStopRequested.load()){
+            if(capture.GrabSlot(0)){gotNative=true;break;}
+            Sleep(1);
+        }
+        if(tracked.Exited()||g_userStopRequested.load())return SessionOutcome::Stop;
+        if(!gotNative){
+            Status(L"FG error: NvFBC did not return a usable native capture during startup.");
+            return SessionOutcome::Stop;
+        }
+        const auto& initial=capture.frames[0];
+        if(initial.width!=gameW||initial.height!=gameH){
+            Status(L"FG error: Native capture mismatch. NvFBC "+std::to_wstring(initial.width)+L"x"+std::to_wstring(initial.height)+
+                L"; game "+std::to_wstring(gameW)+L"x"+std::to_wstring(gameH)+
+                L". FG will not resize captured pixels.");
+            return SessionOutcome::Stop;
+        }
+        cuda.check(cuda.syncStream(nullptr),"Complete native capture preflight");
+        MarkCrashStage(CrashStage::VulkanInit);
+        VkDevices dx; dx.Init(overlay.hwnd,overlay.width,overlay.height,cuda);'''),
+ ('                    overlay.SetVisible(false);\n                    // Only the display surface changes; preserve native source resources.\n                    dx.vk.Resize(overlay.width,overlay.height);',
+  '''                    overlay.SetVisible(false);
+                    if(overlay.width!=gameW||overlay.height!=gameH)return SessionOutcome::Recreate;
+                    dx.vk.Resize(overlay.width,overlay.height);'''),
+ ('            overlay.SetVisible(focused);',
+  '            if(!focused)overlay.SetVisible(false);'),
+ ('                const auto& incoming=capture.frames[next];',
+  '''                const auto& incoming=capture.frames[next];
+                if(incoming.width!=gameW||incoming.height!=gameH||
+                   dx.vk.extent.width!=gameW||dx.vk.extent.height!=gameH){
+                    overlay.SetVisible(false);
+                    return SessionOutcome::Recreate;
+                }'''),
+ ('                    realFramePending=false;\n                    // Measure',
+  '                    overlay.SetVisible(true);\n                    realFramePending=false;\n                    // Measure'),
+])
+edit('src/vulkan_presenter.h',[
+ ('e.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;',
+  'e.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT;'),
+ ('if(warpEnabled && !(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT))throw Error("Native Frame Warp requires swapchain transfer destination");',
+  'if(!(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT))throw Error("Native pixel copy requires swapchain transfer destination");'),
+ ('sc.imageUsage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;if(warpEnabled)sc.imageUsage|=VK_IMAGE_USAGE_TRANSFER_DST_BIT;',
+  'sc.imageUsage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;'),
+ ('if(it==fs.end())it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_R8G8B8A8_UNORM&&f.colorSpace==VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;});\n        if(it==fs.end())it=std::find_if(fs.begin(),fs.end(),[](auto f){return f.format==VK_FORMAT_B8G8R8A8_UNORM||f.format==VK_FORMAT_R8G8B8A8_UNORM;});if(it==fs.end())throw Error("No UNORM swapchain format");',
+  'if(it==fs.end())throw Error("Native pixel copy requires BGRA8 UNORM SDR swapchain");'),
+ ('b.srcAccessMask=acquire?0:VK_ACCESS_SHADER_READ_BIT;b.dstAccessMask=acquire?VK_ACCESS_SHADER_READ_BIT:0;',
+  'b.srcAccessMask=acquire?0:(VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_TRANSFER_READ_BIT);b.dstAccessMask=acquire?(VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_TRANSFER_READ_BIT):0;'),
+ ('acquire?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,acquire?VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT:VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT',
+  'acquire?VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT:(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT),acquire?(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT):VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT'),
+ ('const bool warp=ShouldRecordNativeLatewarp(kind,warpEnabled);VkRenderPassBeginInfo rb',
+  '''const bool warp=ShouldRecordNativeLatewarp(kind,warpEnabled);
+        if(sourceExtent.width!=extent.width||sourceExtent.height!=extent.height||format!=VK_FORMAT_B8G8R8A8_UNORM)
+            throw Error("Native copy requires equal source and swapchain BGRA extents");
+        if(!warp){
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+            b.image=images[ix];b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
+            VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+            copy.imageExtent={extent.width,extent.height,1};
+            vkCmdCopyBufferToImage(cmd,output,images[ix],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+            b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=0;
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&b);
+        }else{
+        VkRenderPassBeginInfo rb'''),
+ ('if(warp)native.Record(cmd,images[ix],extent.width,extent.height);',
+  'native.Record(cmd,images[ix],extent.width,extent.height);\n        }'),
+ ('VkPipelineStageFlags stages[]={warp?VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};',
+  'VkPipelineStageFlags stages[]={warp?VK_PIPELINE_STAGE_ALL_COMMANDS_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};'),
+])
+with (fg/'README.md').open('a',encoding='utf-8') as f:
+    f.write('\n## Strict native pixel copy\nThis branch requires the actual game client, logical fullscreen monitor mode and NvFBC capture dimensions to match. Preflight checks capture before Vulkan startup; no display mode changes and no resizing fallback. BGRA8 SDR unwarped frames (real or generated) are copied from the shared CUDA output buffer directly into the same-size Vulkan swapchain image using vkCmdCopyBufferToImage. No final shader, bilinear filter, or channel swizzle is used in this route. Unwarped real frames retain the existing bit-exact CUDA source copy. Native NvOFA still converts to its required luma input with no resizing. NGX real-frame warp retains its own offscreen input and output format conversion; generated frames still extrapolate and therefore are not identical to source pixels. This cannot guarantee identical monitor output if the game and overlay have different OS/driver color or scanout paths. GPU and visual testing required.\n')
+print('Strict native BGRA transfer path and preflight applied.')
