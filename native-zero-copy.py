@@ -238,3 +238,100 @@ void main(){
 with (fg/'README.md').open('a',encoding='utf-8') as f:
     f.write('\n## Native zero-copy capture experiment\nNvFBC writes directly into persistent Vulkan-exported, CUDA-mapped device-local capture buffers. Real frames bypass the CUDA render kernel and are sampled directly from the same pitched allocation by Vulkan. Generated frames are computed directly into the existing shared output allocation. No intermediate real-frame copy, vkCmdCopyBufferToImage, capture normalization, or shader resizing. Native NvOFA uses direct captured dimensions; its required luma staging remains. The actual game, captured source and logical monitor-sized swapchain must match or FG stops without fallback. CUDA/Vulkan ownership is transferred with the existing timeline semaphore; flow starts only after real-frame submission and waits for ownership return. This changes flow scheduling and may affect generated-frame cadence. Native NGX still uses its own required color/depth/output processing and final blit; approximate depth is normally unavailable for the freshly submitted real frame. Standard Vulkan still renders into a separate presentable swapchain image, not direct physical scanout of NvFBC memory. The legacy Windows NvFBC runtime has not been verified to accept Vulkan-imported CUDA addresses. Failure is explicit; no copied capture fallback. GPU testing required.\n')
 print('Native shared capture allocations and direct real-frame Vulkan reading applied.')
+
+# Capture dimensions are authoritative; the HWND is only a presentation surface.
+# A native-size swapchain on Win32 needs a supported present-scaling extension
+# when the actual surface extent differs. Do not shader-scale or copy instead.
+edit('src/main.cpp',[
+ ('                    if(overlay.width!=gameW||overlay.height!=gameH)return SessionOutcome::Recreate;\n                    // Only the display surface changes; preserve native source resources.\n                    dx.vk.Resize(overlay.width,overlay.height);',
+  '''                    // Resize the native-size swapchain only after capture has established its extent.
+                    if(dx.vk.swap)dx.vk.Resize(dx.vk.sourceExtent.width,dx.vk.sourceExtent.height);'''),
+ ('''                if(incoming.width!=gameW||incoming.height!=gameH||
+                   dx.vk.extent.width!=gameW||dx.vk.extent.height!=gameH){
+                    overlay.SetVisible(false);
+                    Status(L"FG error: Zero-copy native extent mismatch: capture "+std::to_wstring(incoming.width)+L"x"+std::to_wstring(incoming.height)+
+                        L"; game "+std::to_wstring(gameW)+L"x"+std::to_wstring(gameH)+
+                        L"; Vulkan "+std::to_wstring(dx.vk.extent.width)+L"x"+std::to_wstring(dx.vk.extent.height));
+                    return SessionOutcome::Stop;
+                }''',
+  '''                // Never compare the source against the stretched HWND dimensions.
+                if(!incoming.width||!incoming.height)throw Error("Invalid native capture extent");'''),
+ ('                    MarkCrashStage(CrashStage::OutputAlloc);\n                    gpu.CreateOutputs(dx,incoming.width,incoming.height);',
+  '''                    MarkCrashStage(CrashStage::VulkanInit);
+                    dx.vk.MakeSwap(incoming.width,incoming.height);
+                    MarkCrashStage(CrashStage::OutputAlloc);
+                    gpu.CreateOutputs(dx,incoming.width,incoming.height);'''),
+])
+edit('src/vulkan_presenter.h',[
+ ('    bool windowedExclusiveControl=false;',
+  '''    bool windowedExclusiveControl=false;
+    bool surfaceScalingAvailable=false,swapScalingAvailable=false;'''),
+ ('        VkInstanceCreateInfo ic{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};',
+  '''        surfaceScalingAvailable=Has(iex,VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)&&Has(iex,VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+        if(surfaceScalingAvailable&&std::none_of(ie.begin(),ie.end(),[](const char* s){return !strcmp(s,VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);}))
+            ie.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+        VkInstanceCreateInfo ic{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};'''),
+ ('        float priority=1;VkDeviceQueueCreateInfo qi',
+  '''        VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT scalingFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
+        if(surfaceScalingAvailable&&Has(ex,VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)){
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext=&scalingFeature;vkGetPhysicalDeviceFeatures2(physical,&query);
+            if(scalingFeature.swapchainMaintenance1){
+                swapScalingAvailable=true;pid.pNext=&scalingFeature;
+                if(std::none_of(de.begin(),de.end(),[](const char* s){return !strcmp(s,VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);}))
+                    de.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+            }
+        }
+        float priority=1;VkDeviceQueueCreateInfo qi'''),
+ ('        MakeSwap(w,h);\n    }\n    VkImageView View',
+  '''        // Native capture has not yet reported its dimensions. Create only
+        // the Vulkan device and resources needed to import the capture slots.
+        (void)w;(void)h;
+    }
+    VkImageView View'''),
+ ('extent=caps.currentExtent.width==UINT32_MAX?VkExtent2D{std::clamp(w,caps.minImageExtent.width,caps.maxImageExtent.width),std::clamp(h,caps.minImageExtent.height,caps.maxImageExtent.height)}:caps.currentExtent;if(!extent.width||!extent.height)throw Error("Vulkan surface minimized");',
+  '''const auto surfaceExtent=caps.currentExtent.width==UINT32_MAX?VkExtent2D{w,h}:caps.currentExtent;
+        if(!surfaceExtent.width||!surfaceExtent.height||!w||!h)throw Error("Vulkan surface minimized or source invalid");
+        extent={w,h};
+        const bool needsScaling=extent.width!=surfaceExtent.width||extent.height!=surfaceExtent.height;'''),
+ ('        uint32_t count=std::max(2u,caps.minImageCount);',
+  '''        VkSwapchainPresentScalingCreateInfoEXT scaling{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT};
+        if(needsScaling){
+            // On Win32 the ordinary swapchain extent must equal the HWND.
+            // This optional extension allows the presentation engine to
+            // stretch a native-sized image without an FG shader/copy pass.
+            if(!swapScalingAvailable)throw std::runtime_error("Native "+std::to_string(w)+"x"+std::to_string(h)+
+                " capture confirmed; driver lacks Vulkan present scaling. Set Windows display to that resolution with NVIDIA GPU full-screen scaling.");
+            auto getCaps=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+                vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+            if(!getCaps)throw Error("Vulkan present scaling capability query missing");
+            bool supported=false;
+            for(auto candidate:{VK_PRESENT_MODE_IMMEDIATE_KHR,VK_PRESENT_MODE_MAILBOX_KHR}){
+                if(std::find(modes.begin(),modes.end(),candidate)==modes.end())continue;
+                VkSurfacePresentModeEXT queryMode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};queryMode.presentMode=candidate;
+                VkPhysicalDeviceSurfaceInfo2KHR query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+                query.surface=surface;query.pNext=&queryMode;
+                VkSurfaceFullScreenExclusiveInfoEXT queryExclusive{VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
+                queryExclusive.fullScreenExclusive=VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+                if(windowedExclusiveControl)queryMode.pNext=&queryExclusive;
+                VkSurfacePresentScalingCapabilitiesEXT scaleCaps{VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT};
+                VkSurfaceCapabilities2KHR result{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};result.pNext=&scaleCaps;
+                if(getCaps(physical,&query,&result)!=VK_SUCCESS)continue;
+                if(!(scaleCaps.supportedPresentScaling&VK_PRESENT_SCALING_STRETCH_BIT_EXT))continue;
+                if(extent.width<scaleCaps.minScaledImageExtent.width||extent.height<scaleCaps.minScaledImageExtent.height||
+                   extent.width>scaleCaps.maxScaledImageExtent.width||extent.height>scaleCaps.maxScaledImageExtent.height)continue;
+                mode=candidate;caps=result.surfaceCapabilities;supported=true;break;
+            }
+            if(!supported)throw std::runtime_error("Native "+std::to_string(w)+"x"+std::to_string(h)+
+                " capture confirmed; no low-latency fullscreen stretch supported. Set Windows display to capture resolution with NVIDIA GPU full-screen scaling.");
+            scaling.scalingBehavior=VK_PRESENT_SCALING_STRETCH_BIT_EXT;
+        }else if(w<caps.minImageExtent.width||h<caps.minImageExtent.height||w>caps.maxImageExtent.width||h>caps.maxImageExtent.height)
+            throw Error("Native extent outside Vulkan surface limits");
+        uint32_t count=std::max(2u,caps.minImageCount);'''),
+ ('        if(windowedExclusiveControl)ll.pNext=&exclusive;',
+  '''        if(windowedExclusiveControl)ll.pNext=&exclusive;
+        if(needsScaling){scaling.pNext=ll.pNext;ll.pNext=&scaling;}'''),
+])
+with (fg/'README.md').open('a',encoding='utf-8') as f:
+    f.write('\n## Capture-authoritative native swapchain\nThe first actual NvFBC capture determines all native image extents. The HWND is independent and may be 1920x1080 while capture is 1280x960. Vulkan swapchain creation is deferred until capture dimensions are known. When they differ from the Win32 surface, query EXT surface/swapchain maintenance1 for stretch support and valid native extents in immediate or mailbox mode. If supported, the presentation engine stretches the native swapchain image; otherwise fail explicitly and request a matching Windows logical display mode. No application pixel resizing, copy fallback or automatic Windows display mode change. Driver-side scaling may still involve internal compositor work and does not guarantee direct scanout. No change to shared capture buffers or real-frame direct read.\\n')
+print('Capture-authoritative native swapchain and capability-checked driver stretch applied.')
